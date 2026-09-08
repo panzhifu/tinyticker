@@ -27,7 +27,8 @@ pub struct Config {
     pub color_paused: u32,
     /// 计时结束数字颜色。
     pub color_done: u32,
-    /// 窗口缩放倍数（滚轮调节，0.25-4.0）。
+    /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 app.rs 滚轮 clamp 范围保持一致）。
+    /// 下限 0.5 是因窗口按 LOGICAL_SIZE×zoom 计算，再小会裁切数字。
     pub zoom: f32,
     /// 番茄钟专注时长（秒）。
     pub pomo_work: u32,
@@ -134,7 +135,7 @@ impl Config {
                 }
                 "zoom" => {
                     if let Ok(z) = value.parse::<f32>()
-                        && (0.25..=4.0).contains(&z)
+                        && (0.5..=3.0).contains(&z)
                     {
                         cfg.zoom = z;
                     }
