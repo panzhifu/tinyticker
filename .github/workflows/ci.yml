@@ -18,10 +18,13 @@ jobs:
         with:
           components: clippy
 
+      # libxcb1-dev / libwayland-dev 是链接期依赖（softbuffer 的 X11 后端与
+      # wayland-client 在编译时需要 .so 符号链接，不是纯 dlopen）
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libdbus-1-dev libxkbcommon-dev
+          sudo apt-get install -y pkg-config libx11-dev libxcb1-dev libwayland-dev \
+                                  libxkbcommon-dev libdbus-1-dev
 
       # 两个 feature 组合都过一遍：默认（Wayland + X11）与 Wayland 极小版
       - name: 构建（Wayland + X11）
