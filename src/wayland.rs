@@ -14,7 +14,9 @@ use memmap2::MmapMut;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use wayland_client::backend::{Backend, ObjectId};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{wl_buffer, wl_registry, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use winit::window::Window;
 
@@ -28,9 +30,14 @@ pub struct WaylandSurface {
     event_queue: Mutex<EventQueue<State>>,
     qh: QueueHandle<State>,
     shm: wl_shm::WlShm,
+    /// 建输入区域用（wl_compositor.create_region）。
+    compositor: wl_compositor::WlCompositor,
     surface: wl_surface::WlSurface,
+    /// 当前生效的输入区域；None 表示整窗接收输入。
+    input_region: Option<wl_region::WlRegion>,
     /// 当前尺寸的 shm pool 与双缓冲；首次 resize 前为 None。
-    pool: Option<Pool>,    /// 前台 buffer（合成器正在显示的那个）的下标。
+    pool: Option<Pool>,
+    /// 前台 buffer（合成器正在显示的那个）的下标。
     front: usize,
     /// 事件分发状态（release 标记通过 Arc 与本结构共享）。
     state: State,
@@ -87,6 +94,31 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
     }
 }
 
+// wl_compositor / wl_region 无事件，仅需满足 bind 的 trait 约束
+impl Dispatch<wl_compositor::WlCompositor, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_compositor::WlCompositor,
+        _: wl_compositor::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<wl_buffer::WlBuffer, usize> for State {
     fn event(
         state: &mut Self,
@@ -119,6 +151,8 @@ impl WaylandSurface {
         let (globals, event_queue) = registry_queue_init::<State>(&conn)?;
         let qh = event_queue.handle();
         let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        // create_region 自 v1 起可用；上限取 4 兼容所有现代合成器
+        let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=4, ())?;
 
         // 从裸指针恢复 winit 创建的 wl_surface
         let surface_id = unsafe {
@@ -131,7 +165,9 @@ impl WaylandSurface {
             event_queue: Mutex::new(event_queue),
             qh,
             shm,
+            compositor,
             surface,
+            input_region: None,
             pool: None,
             front: 0,
             state: State {
@@ -246,6 +282,25 @@ impl PixelSurface for WaylandSurface {
         }
         self.surface.commit();
 
+        let _ = self.event_queue.lock().unwrap().flush();
+    }
+
+    fn set_input_region(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        // 先建好新区域再切换引用，最后销毁旧区域（避免 surface 短暂引用已销毁对象）
+        let new_region = rect.map(|(x, y, w, h)| {
+            let region = self.compositor.create_region(&self.qh, ());
+            region.add(x, y, w, h);
+            region
+        });
+        self.surface.set_input_region(new_region.as_ref());
+        if let Some(old) = self.input_region.take() {
+            old.destroy();
+        }
+        self.input_region = new_region;
+
+        // 输入区域随下一次 commit 生效；这里显式提交一次，
+        // 保证暂停（不重绘）时区域也能立即更新。
+        self.surface.commit();
         let _ = self.event_queue.lock().unwrap().flush();
     }
 }

@@ -30,6 +30,9 @@ pub struct Config {
     /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 app.rs 滚轮 clamp 范围保持一致）。
     /// 下限 0.5 是因窗口按 LOGICAL_SIZE×zoom 计算，再小会裁切数字。
     pub zoom: f32,
+    /// 透明区域是否让鼠标穿透：开启后只有文字范围接收点击（不再挡住下方窗口），
+    /// 代价是拖动必须点中文字；关闭（默认）则整个矩形都可拖动。
+    pub click_through: bool,
     /// 番茄钟专注时长（秒）。
     pub pomo_work: u32,
     /// 番茄钟休息时长（秒）。
@@ -52,6 +55,7 @@ impl Default for Config {
             color_paused: rgb(255, 200, 80),
             color_done: rgb(80, 220, 120),
             zoom: 1.0,
+            click_through: false,
             pomo_work: 1500,
             pomo_break: 300,
             on_finish: None,
@@ -140,6 +144,12 @@ impl Config {
                         cfg.zoom = z;
                     }
                 }
+                "click_through" => {
+                    cfg.click_through = matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes" | "on"
+                    );
+                }
                 "pomo_work" => {
                     if let Some(s) = parse_duration(value) {
                         cfg.pomo_work = s;
@@ -187,6 +197,7 @@ impl Config {
         out.push_str(&format!("mode = {}\n", self.mode.name()));
         out.push_str(&format!("bg_alpha = {}\n", self.bg_alpha));
         out.push_str(&format!("zoom = {:.2}\n", self.zoom));
+        out.push_str(&format!("click_through = {}\n", self.click_through));
         out.push_str(&format!("pomo_work = {}\n", self.pomo_work));
         out.push_str(&format!("pomo_break = {}\n", self.pomo_break));
         if let Some(cmd) = &self.on_finish {
@@ -243,6 +254,23 @@ mod tests {
         assert_eq!(cfg.color_bg, 0x332211);
         assert_eq!(cfg.mode, Mode::Countdown);
         assert_eq!(cfg.window_pos, None); // 只有 x 没有 y → 不生效
+    }
+
+    #[test]
+    fn click_through_parses_boolean_aliases() {
+        for on in ["true", "1", "yes", "on", "TRUE", "Yes"] {
+            assert!(
+                Config::from_str(&format!("click_through = {on}\n")).click_through,
+                "{on} 应解析为 true"
+            );
+        }
+        for off in ["false", "0", "no", "off", "", "whatever"] {
+            assert!(
+                !Config::from_str(&format!("click_through = {off}\n")).click_through,
+                "{off} 应解析为 false"
+            );
+        }
+        assert!(!Config::default().click_through); // 默认整窗可拖动
     }
 
     #[test]

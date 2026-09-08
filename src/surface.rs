@@ -21,6 +21,13 @@ pub trait PixelSurface {
     /// 取一帧缓冲交给 `paint` 绘制（写入预乘 0xAARRGGBB 像素），
     /// 闭包返回后立即呈现到屏幕；初始化失败时静默跳过本帧。
     fn draw_frame(&mut self, paint: &mut dyn FnMut(&mut [u32]));
+
+    /// 限制接收鼠标输入的区域（surface 坐标：`x, y, w, h`）；
+    /// `None` 表示恢复整窗接收输入。
+    ///
+    /// 透明窗口用它把点击区收缩到文字范围，避免整块矩形挡住下方窗口。
+    /// 不支持的后端（X11）静默忽略。
+    fn set_input_region(&mut self, rect: Option<(i32, i32, i32, i32)>);
 }
 
 /// 按窗口所在的显示协议创建呈现后端。
@@ -70,4 +77,8 @@ impl PixelSurface for SoftbufferSurface {
         // present 消费 buffer，把缓冲内容写入窗口
         let _ = buffer.present();
     }
+
+    // X11 下裁剪输入区域需要 XShape 扩展（softbuffer 不提供），
+    // 保持整窗可点：拖动与右键关闭仍然可用。
+    fn set_input_region(&mut self, _rect: Option<(i32, i32, i32, i32)>) {}
 }

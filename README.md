@@ -68,6 +68,8 @@ duration = 1500        # 倒计时总时长（秒），支持 "25m" 写法
 mode = countdown       # countdown | stopwatch | pomodoro | clock
 bg_alpha = 0           # 背景不透明度 0-255：0 全透明（只剩文字），255 不透明
 zoom = 1.0             # 窗口缩放倍数 0.5-3.0（滚轮调节）
+click_through = false  # 鼠标穿透：true 则只有文字处可点（不挡下方窗口），
+                       # 但拖动也要点中文字；false（默认）整窗可拖动
 pomo_work = 1500       # 番茄钟专注时长（秒）
 pomo_break = 300       # 番茄钟休息时长（秒）
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）
@@ -111,7 +113,7 @@ src/
 ## 已知限制
 
 - 内置字体仅 ASCII，不支持中文等非 ASCII 字符显示
-- 全透明模式下窗口输入区域仍是整个矩形，会拦截下方窗口的鼠标事件
+- 鼠标穿透为可选项：默认整窗接收输入（好拖动），开启 `click_through` 后只有文字可点——二者不可兼得
 - 无全局快捷键（Wayland 无统一协议）
 - Wayland 下置顶与窗口自定位依赖合成器规则
 

@@ -24,8 +24,12 @@ use crate::tray::{self, Command};
 /// 逻辑画布大小（参考值；实际像素缓冲跟随窗口物理尺寸 × 缩放系数）。
 const LOGICAL_SIZE: (u32, u32) = (200, 100);
 
-/// 重绘间隔（约 30fps，秒级变化足够，还省电）。
-const DRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// 轮询间隔：处理托盘命令与计时的心跳（也驱动重绘）。
+///
+/// 显示内容是秒级变化的，30fps 毫无意义；200ms 既能让托盘点击在
+/// 一次眨眼内响应，又把空转开销降到 1/6。真正的省电靠 `last_frame`
+/// 脏检查——内容没变时连 shm 都不提交。
+const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct App {
     rx: Receiver<Command>,
@@ -38,6 +42,10 @@ pub struct App {
     buffer_size: (u32, u32), // 像素缓冲尺寸（物理像素）
     font_scale: u32,         // 字形缩放倍数（DPI × 缩放倍数，至少 1）
     zoom: f32,               // 滚轮缩放倍数（持久化）
+    /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 缩放）；用于跳过无变化的重绘。
+    last_frame: Option<(String, String, u32, u32, u32)>,
+    /// 当前生效的输入区域（surface 坐标），避免重复下发。
+    last_input_region: Option<(i32, i32, i32, i32)>,
 }
 
 impl App {
@@ -63,6 +71,8 @@ impl App {
             surface: None,
             buffer_size: LOGICAL_SIZE,
             font_scale: 1,
+            last_frame: None,
+            last_input_region: None,
         }
     }
 
@@ -100,10 +110,10 @@ impl App {
     }
 
     /// 绘制一帧（CPU 写预乘 ARGB 缓冲，Wayland 走 shm、X11 走 softbuffer）。
+    ///
+    /// 内容未变化（文本 / 状态 / 尺寸 / 缩放指纹相同）时整帧跳过，连 shm
+    /// 都不提交——常驻挂件下绝大多数帧都会被这里拦下。
     fn draw(&mut self) {
-        let Some(surface) = &mut self.surface else {
-            return;
-        };
         let (bw, bh) = self.buffer_size;
         let scale = self.font_scale;
 
@@ -142,6 +152,13 @@ impl App {
             render::format_time(self.timer.display_secs())
         };
 
+        // 内容指纹：没变就不重绘
+        let frame_key = (text.clone(), status.clone(), bw, bh, scale);
+        if self.last_frame.as_ref() == Some(&frame_key) {
+            return;
+        }
+        self.last_frame = Some(frame_key);
+
         // 布局：数字行 8x8 × (scale*2)，状态行 8x8 × scale，垂直居中
         let num_scale = scale * 2;
         let num_h = 8 * num_scale;
@@ -151,13 +168,52 @@ impl App {
         let y_num = ((bh as i32 - total_h) / 2).max(0);
         let y_status = y_num + num_h as i32 + gap;
 
-        surface.draw_frame(&mut |buf| {
-            let mut canvas = render::Canvas::new(buf, bw, bh);
-            // 半透明背景（bg_alpha 可在配置文件调整，0 = 完全透明只剩文字）
-            canvas.fill(bg);
-            canvas.draw_text_centered(y_num, &text, num_color, num_scale);
-            canvas.draw_text_centered(y_status, &status, status_color, scale);
-        });
+        {
+            let Some(surface) = &mut self.surface else {
+                return;
+            };
+            surface.draw_frame(&mut |buf| {
+                let mut canvas = render::Canvas::new(buf, bw, bh);
+                // 半透明背景（bg_alpha 可在配置文件调整，0 = 完全透明只剩文字）
+                canvas.fill(bg);
+                canvas.draw_text_centered(y_num, &text, num_color, num_scale);
+                canvas.draw_text_centered(y_status, &status, status_color, scale);
+            });
+        }
+
+        // 输入区域：默认整窗接收（拖动更顺手）；开启 click_through 后
+        // 收缩到两行文字的包围盒，透明处不再拦截鼠标，代价是拖动要点中文字。
+        let target = if self.config.click_through {
+            let text_w = text.len() as u32 * 8 * num_scale;
+            let status_w = status.len() as u32 * 8 * scale;
+            let x_num = bw.saturating_sub(text_w) / 2;
+            let x_status = bw.saturating_sub(status_w) / 2;
+            let left = x_num.min(x_status);
+            let right = (x_num + text_w).max(x_status + status_w).min(bw);
+            let top = y_num as u32;
+            let bottom = (y_status.max(0) as u32 + status_h).min(bh);
+
+            // 物理像素 → surface 坐标（winit 会设置 buffer_scale = scale_factor）
+            let sf = self
+                .window
+                .as_ref()
+                .map_or(1.0, |w| w.scale_factor() as f32)
+                .max(1.0);
+            Some((
+                (left as f32 / sf).floor() as i32,
+                (top as f32 / sf).floor() as i32,
+                ((right.saturating_sub(left)) as f32 / sf).ceil().max(1.0) as i32,
+                ((bottom.saturating_sub(top)) as f32 / sf).ceil().max(1.0) as i32,
+            ))
+        } else {
+            None
+        };
+        if self.last_input_region != target {
+            if let Some(surface) = &mut self.surface {
+                surface.set_input_region(target);
+            }
+            self.last_input_region = target;
+        }
     }
 
     /// 每帧更新：命令、计时、结束事件、绘制；随后约定下一次唤醒。
