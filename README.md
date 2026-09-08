@@ -2,7 +2,9 @@
 
 极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，内置 8x8 位图字体，单二进制约 1 MB，无任何运行时字体或 UI 依赖。
 
-![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.4.0-brightgreen)
+![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.4.1-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
+
+发布产物经 UPX 压缩：**约 0.6 MB**（Wayland 版）/ 0.8 MB（通用版）。未压缩为 1.1 / 1.6 MB。
 
 ## 功能
 
@@ -10,7 +12,7 @@
   - **倒计时**：归零自动停止、变绿显示 `DONE`
   - **秒表**：从 0 正计时
   - **番茄钟**：专注 / 休息自动轮转并累计轮数，每阶段结束提醒
-  - **时钟挂件**：实时显示本地时间 `HH:MM:SS`
+  - **时钟挂件**：实时显示本地时间，`HH:MM:SS` 或 12 小时制 `hh:mm:ss AM`
 - **无边框透明悬浮窗**：逐像素预乘 ARGB，`bg_alpha` 从 0（全透明，只剩文字）到 255（不透明）自由调节
 - **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–3.0，自动持久化）
 - **时长输入**：相对时长 `25m` / `1h30m` / `90`，或**绝对时刻** `14:30`（已过则算明天）
@@ -27,6 +29,8 @@
 cargo build --release                          # Wayland + X11 通用版（约 1.6 MB）
 cargo build --release --no-default-features    # 仅 Wayland 极小版（约 1.1 MB）
 ```
+
+也可直接从 [Releases](https://github.com/panzhifu/tinyticker/releases) 下载预编译二进制（UPX 压缩，约 0.6–0.8 MB），下载后 `chmod +x` 即可运行。打 tag 会自动触发构建与上传。
 
 ## 用法
 
@@ -70,6 +74,7 @@ bg_alpha = 0           # 背景不透明度 0-255：0 全透明（只剩文字�
 zoom = 1.0             # 窗口缩放倍数 0.5-3.0（滚轮调节）
 click_through = false  # 鼠标穿透：true 则只有文字处可点（不挡下方窗口），
                        # 但拖动也要点中文字；false（默认）整窗可拖动
+clock_12h = false      # 时钟挂件用 12 小时制（带 AM/PM）；false 为 24 小时制
 pomo_work = 1500       # 番茄钟专注时长（秒）
 pomo_break = 300       # 番茄钟休息时长（秒）
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）

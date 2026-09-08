@@ -13,9 +13,21 @@ pub fn now_hms() -> (u32, u32, u32) {
     }
 }
 
-/// 格式化为 `"HH:MM:SS"`。
-pub fn format_hms(h: u32, m: u32, s: u32) -> String {
-    format!("{h:02}:{m:02}:{s:02}")
+/// 格式化时间；`use_12h` 为 true 时输出 12 小时制并带 AM/PM。
+///
+/// - 24 小时制：`"HH:MM:SS"`（8 字符）
+/// - 12 小时制：`"hh:mm:ss AM"`（11 字符，仍容纳于 200px 宽的默认窗口）
+pub fn format_hms(h: u32, m: u32, s: u32, use_12h: bool) -> String {
+    if !use_12h {
+        return format!("{h:02}:{m:02}:{s:02}");
+    }
+    let (h12, suffix) = match h {
+        0 => (12, "AM"),  // 午夜
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"), // 正午
+        _ => (h - 12, "PM"),
+    };
+    format!("{h12:02}:{m:02}:{s:02} {suffix}")
 }
 
 #[cfg(test)]
@@ -23,10 +35,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hms_formatting() {
-        assert_eq!(format_hms(0, 0, 0), "00:00:00");
-        assert_eq!(format_hms(9, 5, 3), "09:05:03");
-        assert_eq!(format_hms(23, 59, 59), "23:59:59");
+    fn hms_formatting_24h() {
+        assert_eq!(format_hms(0, 0, 0, false), "00:00:00");
+        assert_eq!(format_hms(9, 5, 3, false), "09:05:03");
+        assert_eq!(format_hms(23, 59, 59, false), "23:59:59");
+    }
+
+    #[test]
+    fn hms_formatting_12h() {
+        // 午夜与正午是 12 小时制最容易错的两个点
+        assert_eq!(format_hms(0, 0, 0, true), "12:00:00 AM");
+        assert_eq!(format_hms(12, 30, 0, true), "12:30:00 PM");
+        assert_eq!(format_hms(9, 5, 3, true), "09:05:03 AM");
+        assert_eq!(format_hms(13, 5, 3, true), "01:05:03 PM");
+        assert_eq!(format_hms(23, 59, 59, true), "11:59:59 PM");
     }
 
     #[test]

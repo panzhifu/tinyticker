@@ -147,7 +147,7 @@ impl App {
         // 时钟模式实时读取本地时间；其余模式显示计时秒数
         let text = if self.timer.mode == Mode::Clock {
             let (h, m, s) = clock::now_hms();
-            clock::format_hms(h, m, s)
+            clock::format_hms(h, m, s, self.config.clock_12h)
         } else {
             render::format_time(self.timer.display_secs())
         };

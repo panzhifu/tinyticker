@@ -33,6 +33,8 @@ pub struct Config {
     /// 透明区域是否让鼠标穿透：开启后只有文字范围接收点击（不再挡住下方窗口），
     /// 代价是拖动必须点中文字；关闭（默认）则整个矩形都可拖动。
     pub click_through: bool,
+    /// 时钟挂件是否用 12 小时制（带 AM/PM）；false 为 24 小时制。
+    pub clock_12h: bool,
     /// 番茄钟专注时长（秒）。
     pub pomo_work: u32,
     /// 番茄钟休息时长（秒）。
@@ -56,6 +58,7 @@ impl Default for Config {
             color_done: rgb(80, 220, 120),
             zoom: 1.0,
             click_through: false,
+            clock_12h: false,
             pomo_work: 1500,
             pomo_break: 300,
             on_finish: None,
@@ -150,6 +153,12 @@ impl Config {
                         "true" | "1" | "yes" | "on"
                     );
                 }
+                "clock_12h" => {
+                    cfg.clock_12h = matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes" | "on"
+                    );
+                }
                 "pomo_work" => {
                     if let Some(s) = parse_duration(value) {
                         cfg.pomo_work = s;
@@ -198,6 +207,7 @@ impl Config {
         out.push_str(&format!("bg_alpha = {}\n", self.bg_alpha));
         out.push_str(&format!("zoom = {:.2}\n", self.zoom));
         out.push_str(&format!("click_through = {}\n", self.click_through));
+        out.push_str(&format!("clock_12h = {}\n", self.clock_12h));
         out.push_str(&format!("pomo_work = {}\n", self.pomo_work));
         out.push_str(&format!("pomo_break = {}\n", self.pomo_break));
         if let Some(cmd) = &self.on_finish {

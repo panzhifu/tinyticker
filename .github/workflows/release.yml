@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装系统依赖与 UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libdbus-1-dev libxkbcommon-dev upx-ucl
+
+      - name: 构建两个版本
+        run: |
+          cargo build --release
+          cp target/release/tinyticker tinyticker-x86_64-unknown-linux-gnu
+          cargo build --release --no-default-features
+          cp target/release/tinyticker tinyticker-wayland-x86_64-unknown-linux-gnu
+
+      # UPX 对 Rust 二进制通常再压掉 40-50%；首次启动多几毫秒解压时间
+      - name: UPX 压缩
+        run: |
+          upx --lzma --best tinyticker-x86_64-unknown-linux-gnu
+          upx --lzma --best tinyticker-wayland-x86_64-unknown-linux-gnu
+
+      - name: 体积报告
+        run: ls -lh tinyticker-* | awk '{printf "%-46s %s\n", $9, $5}'
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tinyticker-x86_64-unknown-linux-gnu
+            tinyticker-wayland-x86_64-unknown-linux-gnu
+          generate_release_notes: true
+          body: |
+            两个产物均为 UPX 压缩版（`--lzma --best`），下载后直接 `chmod +x` 即可运行。
+
+            - `tinyticker-x86_64-unknown-linux-gnu`：Wayland + X11 通用版
+            - `tinyticker-wayland-x86_64-unknown-linux-gnu`：仅 Wayland，体积更小
+
+            不确定选哪个：niri / Sway / Hyprland / KWin 等 Wayland 会话用 Wayland 版；X11 会话用通用版。
+
+            若偏好未压缩的二进制（避免少数环境对加壳程序的告警），请自行 `cargo build --release`。
