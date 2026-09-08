@@ -1,0 +1,4 @@
+/target
+
+# 本地 AI 会话数据（WorkBuddy 工作目录），不进版本库
+/.workbuddy/

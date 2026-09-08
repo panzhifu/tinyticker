@@ -1,0 +1,40 @@
+[package]
+name = "tinyticker"
+version = "0.4.0"
+edition = "2024"
+license = "MIT"
+description = "极简悬浮倒计时 / 秒表"
+
+[dependencies]
+ldtray = "0.1.2"
+# 本地时区转换（localtime_r）；libc 已在依赖树中，近乎零体积成本
+libc = "0.2"
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
+] }
+# Wayland 呈现走自研 ARGB shm 路径（softbuffer 的 Wayland 后端硬编码 XRGB，无透明能力）
+wayland-client = "0.31"
+memmap2 = "0.9"
+bytemuck = "1"
+rustix = { version = "0.38", features = ["fs"] }
+raw-window-handle = "0.6"
+
+# X11 呈现走 softbuffer（depth-32 visual 下 alpha 字节直通）
+softbuffer = { version = "0.4", optional = true, default-features = false, features = [
+    "x11",
+] }
+
+# 默认构建额外包含 X11 后端（通用版）
+# Wayland 极小版: cargo build --release --no-default-features
+[features]
+default = ["x11"]
+x11 = ["dep:softbuffer", "winit/x11"]
+
+[profile.release]
+strip = true          # 去除调试符号与符号表
+lto = true            # 链接期优化
+codegen-units = 1     # 单编译单元
+opt-level = "z"       # 优化体积
+panic = "abort"       # 不生成 unwind 代码
