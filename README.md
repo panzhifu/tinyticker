@@ -4,7 +4,7 @@
 
 ![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.4.1-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
 
-发布产物经 UPX 压缩：**约 0.6 MB**（Wayland 版）/ 0.8 MB（通用版）。未压缩为 1.1 / 1.6 MB。
+发布产物经 UPX 压缩（v0.4.1 实测）：**Wayland 版 0.38 MB**、通用版（Wayland + X11）0.50 MB。未压缩为 1.1 / 1.6 MB。
 
 ## 功能
 
