@@ -18,6 +18,7 @@
 - **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–3.0，自动持久化）
 - **时长输入**：相对时长 `25m` / `1h30m` / `90`，或**绝对时刻** `14:30`（已过则算明天）
 - **托盘控制**：开始 / 暂停 / 重置；「时长预设」二级菜单（1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）；四模式切换；退出
+- **托盘图标会走**：`tray_icon` 选真实时表盘（指针按本地时间摆），或 CPU / 内存 / 电量的水位占用表——读 `/proc/stat`、`/proc/meminfo`、`/sys/class/power_supply`，每秒重绘并发 `NewIcon`
 - **结束动作**：桌面通知（带「再来一次」按钮）+ 可选 `on_finish` shell 命令（锁屏、关机、放音乐等）
 - **配置持久化**：时长、模式、配色、透明度、缩放、番茄钟时长、结束命令、窗口位置，退出时自动写回
 - **走时不漂移**：以整数秒为基准推进，休眠恢复或高负载后自动补齐整秒
@@ -115,6 +116,9 @@ zoom = 1.0             # 窗口缩放倍数 0.5-3.0（滚轮调节）
 click_through = false  # 鼠标穿透：true 则只有文字处可点（不挡下方窗口），
                        # 但拖动也要点中文字；false（默认）整窗可拖动
 clock_12h = false      # 时钟挂件用 12 小时制（带 AM/PM）；false 为 24 小时制
+tray_icon = clock      # 托盘图标：clock 真实时表盘 | cpu | memory | battery 水位占用表
+                       # 后三者每秒重绘，颜色按 <60% 绿 / <85% 黄 / 其余红分级；
+                       # 充电中一律绿，没有电池选 battery 则显示空心环
 pomo_work = 1500       # 番茄钟专注时长（秒）
 pomo_break = 300       # 番茄钟休息时长（秒）
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）
@@ -147,11 +151,12 @@ src/
 │              #   XPutImage 软渲染 + 拖动/滚轮/右键 + 点击穿透（libXext SHAPE），仅 `x11` feature
 ├── widget.rs  # 与后端无关的挂件核心（计时推进、帧内容与布局）
 ├── clock.rs   # 本地时间读取（自研 TZif + POSIX 规则解析，不依赖 C 库时区 API）
+├── sysinfo.rs # 系统状态采样（CPU 差分 / MemAvailable / 电量），只读 /proc 与 /sys
 ├── timer.rs   # 计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟），含走时补齐
 ├── render.rs  # 像素画布、8x8 字形渲染、时间格式化
 ├── config.rs  # 配置持久化（纯 std 文件 IO）
 ├── parse.rs   # 相对时长与绝对时刻解析
-├── tray.rs    # 自研托盘：StatusNotifierItem + dbusmenu 菜单 + 通知 + 程序化时钟图标
+├── tray.rs    # 自研托盘：StatusNotifierItem + dbusmenu 菜单 + 通知 + 每秒重绘的图标
 └── font8x8.rs # 内置 ASCII 位图字体
 
 packaging/   # 随 release 发布的 freedesktop 资产

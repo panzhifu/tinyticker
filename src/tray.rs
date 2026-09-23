@@ -19,9 +19,11 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
+use crate::sysinfo;
 use crate::timer::Mode;
 
 /// 托盘 → 主窗口的命令。
@@ -35,6 +37,40 @@ pub enum Command {
     /// 切换计时模式（重置计时）。
     SetMode(Mode),
     Quit,
+}
+
+/// 托盘图标显示什么，对应配置项 `tray_icon`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconMode {
+    /// 真实时表盘：指针按当前本地时间摆放。
+    Clock,
+    /// 水位表 = CPU 占用（两次 /proc/stat 采样的差分）。
+    Cpu,
+    /// 水位表 = 内存占用（MemTotal - MemAvailable）。
+    Memory,
+    /// 水位表 = 剩余电量；没有电池时显示空心盘。
+    Battery,
+}
+
+impl IconMode {
+    pub fn from_name(name: &str) -> Option<IconMode> {
+        match name {
+            "clock" => Some(IconMode::Clock),
+            "cpu" => Some(IconMode::Cpu),
+            "memory" => Some(IconMode::Memory),
+            "battery" => Some(IconMode::Battery),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            IconMode::Clock => "clock",
+            IconMode::Cpu => "cpu",
+            IconMode::Memory => "memory",
+            IconMode::Battery => "battery",
+        }
+    }
 }
 
 const ITEM_PATH: &CStr = c"/StatusNotifierItem";
@@ -150,33 +186,124 @@ fn build_nodes() -> Vec<Node> {
 /// 32x32 时钟图标（深色表盘 + 白色表圈和指针），输出 ARGB32 网络字节序。
 ///
 /// 与悬浮窗的位图字体同一取向：不引入任何图片资源文件。
-fn clock_pixmap() -> (i32, i32, Vec<u8>) {
-    const S: usize = 32;
-    const CENTER: f32 = 15.5;
+fn clock_pixmap(now: (u32, u32, u32)) -> (i32, i32, Vec<u8>) {
+    let mut px = face();
+    let (h, m, _) = now;
+    // 表盘位置以「分钟格」为单位：时针含分钟分量，否则一小时里指针会跳一下
+    hand(&mut px, dial_dir((h % 12) as f32 * 5.0 + m as f32 / 12.0), 8.0);
+    hand(&mut px, dial_dir(m as f32), 12.0);
+    (S as i32, S as i32, px)
+}
+
+/// 32x32 表盘底：白色圆环 + 深色填充，圆外全透明。
+fn face() -> Vec<u8> {
     let mut px = vec![0u8; S * S * 4]; // 圆外全透明
     for y in 0..S {
         for x in 0..S {
-            let dx = x as f32 - CENTER;
-            let dy = y as f32 - CENTER;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist > 15.0 {
+            let (dx, dy) = (x as f32 - CENTER, y as f32 - CENTER);
+            if dist(dx, dy) > 15.0 {
                 continue;
             }
-            let (r, g, b) = if dist > 12.5 { (255, 255, 255) } else { (15, 15, 20) };
+            let (r, g, b) = if dist(dx, dy) > 12.5 { (255, 255, 255) } else { DARK };
             put(&mut px, x, y, r, g, b);
         }
     }
-    // 指针（白色，2px）：分针向上、时针向右
-    for y in 7..=16 {
-        put(&mut px, 15, y, 255, 255, 255);
-        put(&mut px, 16, y, 255, 255, 255);
+    px
+}
+
+/// 60 个整分钟方向的单位向量（0 = 12 点，顺时针），×4096 定点。
+///
+/// 用固定 6° 增量旋转累加生成，而不是调 `sin`/`cos`：后者会让我们去链 libm，
+/// 而本项目的卖点是 `ldd` 里只有 libc 与 libgcc_s。所选整数 (4074, 428) 的模长
+/// 比 4096 大 0.01%，转满一圈累计误差不到 1 像素。
+const DIAL: [(i32, i32); 60] = {
+    let mut t = [(0i32, 0i32); 60];
+    let (mut x, mut y) = (0i32, -4096i32); // 12 点方向：屏幕 y 轴向下，故取负
+    let mut i = 0;
+    while i < 60 {
+        t[i] = (x, y);
+        let (nx, ny) = ((x * 4074 - y * 428) >> 12, (x * 428 + y * 4074) >> 12);
+        (x, y) = (nx, ny);
+        i += 1;
     }
-    for x in 16..=23 {
-        put(&mut px, x, 15, 255, 255, 255);
-        put(&mut px, x, 16, 255, 255, 255);
+    t
+};
+
+/// 第 60 格回到起点，因此 `pos` 可取任意 [0, 60) 的实数，相邻两格线性插值。
+fn dial_dir(pos: f32) -> (f32, f32) {
+    let lo = pos.floor() as usize % 60;
+    let hi = (lo + 1) % 60;
+    let f = pos - pos.floor();
+    let (a, b) = (DIAL[lo], DIAL[hi]);
+    (
+        (a.0 as f32 + (b.0 - a.0) as f32 * f) / 4096.0,
+        (a.1 as f32 + (b.1 - a.1) as f32 * f) / 4096.0,
+    )
+}
+
+/// 从圆心沿单位向量 `(sx, sy)` 画一条 `len` 长的 2px 指针。
+fn hand(px: &mut [u8], (sx, sy): (f32, f32), len: f32) {
+    for step in 0..(len * 2.0) as usize {
+        let t = step as f32 / 2.0;
+        // 2px 粗：沿指针方向再错开半像素画一次
+        put(px, (CENTER + sx * t) as usize, (CENTER + sy * t) as usize, 255, 255, 255);
+        put(px, (CENTER + sx * (t + 0.5)) as usize, (CENTER + sy * (t + 0.5)) as usize, 255, 255, 255);
+    }
+}
+
+/// 占用表：深色内盘自底向上填到与 `percent` 对应的水位线，颜色按阈值分级。
+/// 没有电池的机器选电池档时显示空心盘，与「0%」区分开。
+fn gauge_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Vec<u8>) {
+    let mut px = face();
+    if let Some(p) = percent {
+        // 充电中一律绿色：20% 的红色会让人以为快没电，而实际在涨
+        let (r, g, b) = if charging { (80, 220, 120) } else { level_color(p) };
+        // 水位线的 y 偏移：0% 在顶端（不填充），100% 在底端（填满内盘）
+        let line = 12.5 - p as f32 * 0.25;
+        for y in 0..S {
+            for x in 0..S {
+                let (dx, dy) = (x as f32 - CENTER, y as f32 - CENTER);
+                if dist(dx, dy) > 12.5 || dy < line {
+                    continue;
+                }
+                put(&mut px, x, y, r, g, b);
+            }
+        }
     }
     (S as i32, S as i32, px)
 }
+
+/// 按 `mode` 生成当前该显示的图标。
+fn icon_pixmap(
+    mode: IconMode,
+    src: &sysinfo::Sources,
+    now: (u32, u32, u32),
+) -> (i32, i32, Vec<u8>) {
+    match mode {
+        IconMode::Clock => clock_pixmap(now),
+        IconMode::Cpu => gauge_pixmap(Some(src.cpu), false),
+        IconMode::Memory => gauge_pixmap(Some(src.mem), false),
+        IconMode::Battery => {
+            gauge_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
+        }
+    }
+}
+
+fn dist(dx: f32, dy: f32) -> f32 {
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn level_color(percent: u8) -> (u8, u8, u8) {
+    match percent {
+        0..=59 => (80, 220, 120),
+        60..=84 => (255, 200, 80),
+        _ => (240, 90, 90),
+    }
+}
+
+const S: usize = 32;
+const CENTER: f32 = 15.5;
+const DARK: (u8, u8, u8) = (15, 15, 20);
 
 /// SNI 的 IconPixmap 是网络字节序（大端）的 A,R,G,B 四字节。
 fn put(px: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
@@ -197,10 +324,10 @@ pub struct TrayHandle {
 }
 
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
-pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>) {
+pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, icon: IconMode) {
     thread::spawn(move || {
         let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
-        match run(cmd_tx, note_rx, handle_tx, note_tx) {
+        match run(cmd_tx, note_rx, handle_tx, note_tx, icon) {
             Ok(()) => {}
             Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
         }
@@ -216,11 +343,13 @@ pub fn notify(handle: &TrayHandle, body: &str, action: &str) {
 // 线程主体
 // ---------------------------------------------------------------------------
 
+
 fn run(
     cmd_tx: Sender<Command>,
     note_rx: Receiver<Note>,
     handle_tx: Sender<TrayHandle>,
     note_tx: Sender<Note>,
+    icon: IconMode,
 ) -> Result<(), String> {
     let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
     let mut err = DBusError::zeroed();
@@ -228,7 +357,8 @@ fn run(
     if conn.is_null() {
         return Err(format!("连不上会话总线: {}", err.describe()));
     }
-    let (_, _, pixmap) = clock_pixmap();
+    let mut sampler = sysinfo::Sampler::new();
+    let (_, _, pixmap) = icon_pixmap(icon, &sampler.sample(), crate::clock::now_hms());
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
@@ -269,15 +399,49 @@ fn run(
         return Ok(());
     }
 
-    // 派发循环：200ms 醒一次，顺带把待发通知送出去
+    // 派发循环：200ms 醒一次，顺带把待发通知送出去、按秒刷新托盘图标
+    let mut icon_at = Instant::now();
     loop {
         while let Ok(note) = note_rx.try_recv() {
             unsafe { send_notification(dbus, conn, &note) };
+        }
+        if icon_at.elapsed() >= ICON_EVERY {
+            icon_at = Instant::now();
+            let (_, _, px) = icon_pixmap(icon, &sampler.sample(), crate::clock::now_hms());
+            // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
+            let changed = unsafe {
+                let server = &mut *server;
+                if server.pixmap == px {
+                    false
+                } else {
+                    server.pixmap = px;
+                    true
+                }
+            };
+            // 像素真变了才发信号：宿主收到 NewIcon 会立刻回读 IconPixmap
+            if changed {
+                unsafe { emit_new_icon(dbus, conn) };
+            }
         }
         if unsafe { (dbus.dbus_connection_read_write_dispatch)(conn, 200) } != d::TRUE {
             return Ok(()); // 连接断了（多数是退出登录）
         }
     }
+}
+
+/// `org.kde.StatusNotifierItem.NewIcon`：不声明刷新，宿主会一直显示启动时那份缓存。
+unsafe fn emit_new_icon(dbus: &DBus, conn: *mut d::DBusConnection) {
+    let msg = (dbus.dbus_message_new_signal)(
+        ITEM_PATH.as_ptr(),
+        ITEM_IFACE.as_ptr(),
+        c"NewIcon".as_ptr(),
+    );
+    if msg.is_null() {
+        return;
+    }
+    (dbus.dbus_connection_send)(conn, msg, std::ptr::null_mut());
+    (dbus.dbus_connection_flush)(conn);
+    (dbus.dbus_message_unref)(msg);
 }
 
 /// `org.freedesktop.Notifications.Notify`：带一个「再来一次」按钮。
@@ -530,6 +694,8 @@ unsafe fn write_pixmap(dbus: &DBus, it: *mut DBusMessageIter, server: &Server) {
 
 const PIX_W: i32 = 32;
 const PIX_H: i32 = 32;
+/// 图标刷新间隔：分针一秒走 6 度，1 秒足够；再快只是多读 /proc。
+const ICON_EVERY: Duration = Duration::from_secs(1);
 
 unsafe fn write_sni_property(dbus: &DBus, it: *mut DBusMessageIter, server: &Server, name: &str) {
     match name {
@@ -907,4 +1073,80 @@ unsafe fn reply_error(dbus: &DBus, conn: *mut d::DBusConnection, call: *mut DBus
         (dbus.dbus_message_unref)(msg);
     }
     d::HANDLED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 占用表里水位填充的像素数（排除白色圆环与深色底）。
+    fn filled(px: &[u8]) -> usize {
+        const RING: (u8, u8, u8) = (255, 255, 255);
+        px.chunks(4)
+            .filter(|p| p[0] != 0 && !matches!((p[1], p[2], p[3]), RING | DARK))
+            .count()
+    }
+
+    #[test]
+    fn gauge_fills_monotonically() {
+        let counts = [0u8, 25, 50, 75, 100].map(|p| filled(&gauge_pixmap(Some(p), false).2));
+        assert!(counts.windows(2).all(|w| w[0] < w[1]), "水位应随占用率单调上升: {counts:?}");
+        // 100% 时整个内盘被填满（内盘半径 12.5）
+        assert!(counts[4] > 450, "满盘像素过少: {}", counts[4]);
+        // 0% 只剩水位线那一条缝
+        assert!(counts[0] < 10, "0% 不该有明显填充: {}", counts[0]);
+        // 25% 的水位在内盘下沿到圆心之间
+        assert!(counts[1] > counts[0] && counts[1] < counts[2]);
+    }
+
+    #[test]
+    fn dial_table_matches_true_trig() {
+        // 表本身是定点增量旋转的产物；拿真三角函数对一遍，误差按 1px（半径 12）内算。
+        // 只在测试里用 sin/cos——它们不会进 release 二进制，libm 因此仍不在 ldd 里。
+        for i in 0..60 {
+            let deg = i as f32 * 6.0;
+            let ideal = (deg.to_radians().sin(), -deg.to_radians().cos());
+            let got = dial_dir(i as f32);
+            assert!(
+                (got.0 - ideal.0).abs() < 0.01 && (got.1 - ideal.1).abs() < 0.01,
+                "第 {i} 格偏了: {got:?} vs {ideal:?}"
+            );
+            let len = (got.0 * got.0 + got.1 * got.1).sqrt();
+            assert!((len - 1.0).abs() < 0.01, "第 {i} 格不是单位向量: {len}");
+        }
+        // 四个正点方向必须落在轴上
+        assert_eq!(dial_dir(0.0), (0.0, -1.0));
+        assert!(dial_dir(15.0).0 > 0.99 && dial_dir(15.0).1.abs() < 0.01);
+        assert!(dial_dir(30.0).1 > 0.99 && dial_dir(30.0).0.abs() < 0.01);
+        assert!(dial_dir(45.0).0 < -0.99 && dial_dir(45.0).1.abs() < 0.01);
+        // 插值必须单调：同一象限里序号越大 x 越大
+        for i in 0..14 {
+            assert!(dial_dir(i as f32 + 0.5).0 > dial_dir(i as f32).0);
+        }
+    }
+
+    #[test]
+    fn empty_battery_shows_hollow_face() {
+        // 没有电池的机器选 battery 档：只有表盘，不画饼
+        assert_eq!(filled(&gauge_pixmap(None, false).2), 0);
+    }
+
+    #[test]
+    fn clock_hands_stay_inside_the_face() {
+        // 任一时刻都不该越出内盘或 panic（put 不做边界检查，越界即 panic）
+        for m in (0..60).chain([59]) {
+            for h in [0u32, 3, 6, 9, 12, 18, 23] {
+                let px = clock_pixmap((h, m, 0)).2;
+                assert_eq!(px.len(), S * S * 4);
+            }
+        }
+    }
+
+    #[test]
+    fn icon_mode_names_roundtrip() {
+        for m in [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery] {
+            assert_eq!(IconMode::from_name(m.name()), Some(m));
+        }
+        assert_eq!(IconMode::from_name("disk"), None);
+    }
 }

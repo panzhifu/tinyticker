@@ -174,6 +174,7 @@ dbus_bindings! {
         *const c_char, *const c_char, *const c_char, *const c_char
     ) -> *mut DBusMessage;
     fn dbus_message_new_method_return(*mut DBusMessage) -> *mut DBusMessage;
+    fn dbus_message_new_signal(*const c_char, *const c_char, *const c_char) -> *mut DBusMessage;
     fn dbus_message_unref(*mut DBusMessage);
     fn dbus_message_get_type(*mut DBusMessage) -> c_int;
     fn dbus_message_get_member(*mut DBusMessage) -> *const c_char;

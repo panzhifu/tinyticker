@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use crate::parse::parse_duration;
 use crate::render::{parse_color, rgb};
 use crate::timer::Mode;
+use crate::tray::IconMode;
 
 const CONFIG_FILE: &str = "config.conf";
 
@@ -30,7 +31,7 @@ pub struct Config {
     pub color_paused: u32,
     /// 计时结束数字颜色。
     pub color_done: u32,
-    /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 app.rs 滚轮 clamp 范围保持一致）。
+    /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 `Widget::zoom_by` 的 clamp 范围保持一致）。
     /// 下限 0.5 是因窗口按 LOGICAL_SIZE×zoom 计算，再小会裁切数字。
     pub zoom: f32,
     /// 透明区域是否让鼠标穿透：开启后只有文字范围接收点击（不再挡住下方窗口），
@@ -38,6 +39,8 @@ pub struct Config {
     pub click_through: bool,
     /// 时钟挂件是否用 12 小时制（带 AM/PM）；false 为 24 小时制。
     pub clock_12h: bool,
+    /// 托盘图标显示什么：真实时表盘，或 CPU / 内存 / 电量的水位占用表。
+    pub tray_icon: IconMode,
     /// 番茄钟专注时长（秒）。
     pub pomo_work: u32,
     /// 番茄钟休息时长（秒）。
@@ -62,6 +65,7 @@ impl Default for Config {
             zoom: 1.0,
             click_through: false,
             clock_12h: false,
+            tray_icon: IconMode::Clock,
             pomo_work: 1500,
             pomo_break: 300,
             on_finish: None,
@@ -143,6 +147,11 @@ impl Config {
                         cfg.mode = mode;
                     }
                 }
+                "tray_icon" => {
+                    if let Some(m) = IconMode::from_name(value) {
+                        cfg.tray_icon = m;
+                    }
+                }
                 "bg_alpha" => {
                     if let Ok(a) = value.parse::<u8>() {
                         cfg.bg_alpha = a;
@@ -210,6 +219,7 @@ impl Config {
         out.push_str(&format!("zoom = {:.2}\n", self.zoom));
         out.push_str(&format!("click_through = {}\n", self.click_through));
         out.push_str(&format!("clock_12h = {}\n", self.clock_12h));
+        out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
         out.push_str(&format!("pomo_work = {}\n", self.pomo_work));
         out.push_str(&format!("pomo_break = {}\n", self.pomo_break));
         if let Some(cmd) = &self.on_finish {
@@ -243,6 +253,7 @@ mod tests {
             color_done: 0xAABBCC,
             bg_alpha: 120,
             zoom: 1.75,
+            tray_icon: IconMode::Battery,
             pomo_work: 1800,
             pomo_break: 600,
             on_finish: Some("loginctl lock-session".into()),

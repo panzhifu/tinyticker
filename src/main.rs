@@ -6,11 +6,12 @@
 //! - `widget`  与后端无关的挂件核心（计时推进、帧内容与布局）
 //! - `sys`     系统 API 声明层（dlopen + FFI，无第三方 crate）
 //! - `clock`   本地时间读取（时钟挂件模式）
+//! - `sysinfo` 系统状态采样（CPU / 内存 / 电量，读 /proc 与 /sys）
 //! - `timer`   计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟）
 //! - `render`  像素绘制与时间格式化
 //! - `config`  配置持久化
 //! - `parse`   时间解析（"1h30m" 相对 / "14:30" 绝对）
-//! - `tray`    托盘菜单与通知
+//! - `tray`    托盘图标、菜单与通知
 //! - `font8x8` 内置 8x8 位图字体
 
 mod clock;
@@ -19,6 +20,7 @@ mod font8x8; // 8x8 位图字体（来源: https://github.com/dhepper/font8x8, M
 mod parse;
 mod render;
 mod sys;
+mod sysinfo;
 mod timer;
 mod tray;
 mod widget;
@@ -110,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - handle_tx: 托盘线程就绪后把 TrayHandle 发给主窗口（发通知用）
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (handle_tx, handle_rx) = mpsc::channel();
-    tray::spawn(cmd_tx, handle_tx);
+    tray::spawn(cmd_tx, handle_tx, config.tray_icon);
 
     run_backend(&cmd_rx, &handle_rx, config, autostart)
 }
