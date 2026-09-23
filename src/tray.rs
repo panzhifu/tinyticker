@@ -32,6 +32,8 @@ use crate::timer::Mode;
 pub enum Command {
     Start,
     Pause,
+    /// 运行中则暂停，否则开始——托盘图标左键（SNI `Activate`）用。
+    Toggle,
     Reset,
     /// 快速预设：设置倒计时时长，重置并立即开始。
     Preset(u32),
@@ -596,8 +598,17 @@ unsafe extern "C" fn on_message(
         "GetAll" if iface == props_i => {
             reply(dbus, conn, msg, |db, it| write_props_all(db, it, server))
         }
-        // 三击都只回成功：ItemIsMenu=true，宿主自己弹 /MenuBar
-        "Activate" | "SecondaryActivate" | "ContextMenu" if path == item_p && iface == item_i => {
+        // 左键 = 开始/暂停，中键 = 重置，右键 = 让宿主弹 /MenuBar。
+        // 这三个方法在 ITEM_XML 里一直都有声明，此前一律只回成功。
+        "Activate" if path == item_p && iface == item_i => {
+            let _ = server.cmd_tx.send(Command::Toggle);
+            reply(dbus, conn, msg, |_, _| {})
+        }
+        "SecondaryActivate" if path == item_p && iface == item_i => {
+            let _ = server.cmd_tx.send(Command::Reset);
+            reply(dbus, conn, msg, |_, _| {})
+        }
+        "ContextMenu" if path == item_p && iface == item_i => {
             reply(dbus, conn, msg, |_, _| {})
         }
         // 滚轮缩放：ITEM_XML 里声明了 Scroll，就得真的接住，否则宿主收不到回复。
@@ -750,7 +761,10 @@ unsafe fn write_sni_property(dbus: &DBus, it: *mut DBusMessageIter, server: &Ser
         "Title" => variant_str(dbus, it, "TinyTicker"),
         "Status" => variant_str(dbus, it, "Active"),
         "IconName" => variant_str(dbus, it, ""),
-        "ItemIsMenu" => variant_bool(dbus, it, true),
+        // 规范里 ItemIsMenu=true 是给「只有右键菜单、没有自己的激活行为」的项用的；
+        // 宿主据此把左键也直接吞成弹菜单，Activate 就永远到不了我们这里。既然左键
+        // 现在真的有事做（开始/暂停），这里必须报 false。
+        "ItemIsMenu" => variant_bool(dbus, it, false),
         "Menu" => variant_objpath(dbus, it, "/MenuBar"),
         "IconPixmap" => {
             let mut v = match open(dbus, it, d::T_VARIANT, Some(c"a(iiay)")) {

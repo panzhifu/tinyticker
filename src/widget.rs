@@ -111,6 +111,13 @@ impl Widget {
         match cmd {
             Command::Start => self.timer.start(),
             Command::Pause => self.timer.pause(),
+            Command::Toggle => {
+                if self.timer.running {
+                    self.timer.pause();
+                } else {
+                    self.timer.start();
+                }
+            }
             Command::Reset => self.timer.reset(),
             Command::Preset(secs) => self.timer.start_countdown(secs),
             Command::SetMode(mode) => self.timer.set_mode(mode),
@@ -140,10 +147,10 @@ impl Widget {
         false
     }
 
-    /// 外观变了：帧指纹只含文本与尺寸、不含颜色，所以必须强制重绘一次；
-    /// 同时立刻写回配置——菜单点击是明确意图，不该因为进程被 kill 而丢掉。
+    /// 外观变了：强制重绘一次，并立刻写回配置——菜单点击是明确意图，
+    /// 不该因为进程被 kill 而丢掉。
     fn persist_appearance(&mut self) {
-        self.last_frame = None;
+        self.invalidate();
         self.config.save();
     }
 
@@ -255,10 +262,8 @@ impl Widget {
         })
     }
 
-    /// 让下一帧强制重绘。X11 的 `Expose`（窗口被揭开后像素已丢）需要，
-    /// 内容本身没变时 `build_frame` 的脏检查会把重绘吃掉。
-    /// Wayland 侧合成器自己保留内容，用不到。
-    #[cfg(feature = "x11")]
+    /// 让下一帧强制重绘。两个用途：X11 的 `Expose`（窗口被揭开后像素已丢），
+    /// 以及改了颜色/透明度之后——帧指纹只含文本与尺寸，不清它就会把这次重绘吃掉。
     pub fn invalidate(&mut self) {
         self.last_frame = None;
     }
@@ -272,5 +277,48 @@ impl Widget {
             self.config.window_pos = Some((x, y));
         }
         self.config.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn toggle_flips_running_and_back() {
+        let mut w = Widget::new(Config::default(), false);
+        assert!(!w.timer.running);
+        w.handle_cmd(Command::Toggle);
+        assert!(w.timer.running);
+        w.handle_cmd(Command::Toggle);
+        assert!(!w.timer.running);
+    }
+
+    #[test]
+    fn toggle_restarts_a_finished_countdown() {
+        let cfg = Config { duration_secs: 2, ..Config::default() };
+        let mut w = Widget::new(cfg, true);
+        let t0 = Instant::now();
+        w.timer.tick_at(t0);
+        w.timer.tick_at(t0 + Duration::from_secs(3));
+        assert!(w.timer.is_done() && !w.timer.running);
+        w.handle_cmd(Command::Toggle);
+        assert!(w.timer.running, "结束后左键应当重新开始，而不是停在 DONE");
+        assert!(!w.timer.is_done());
+    }
+
+    /// 外观命令带磁盘写（`config.save()`），不适合在单测里走；这里只测它的另一半：
+    /// 改颜色必须 invalidate 才能到屏幕上。
+    #[test]
+    fn color_change_needs_an_invalidate_to_reach_the_screen() {
+        let mut w = Widget::new(Config::default(), false);
+        assert!(w.build_frame(200, 100, 2).is_some(), "第一帧总要画");
+        assert!(w.build_frame(200, 100, 2).is_none(), "内容没变就该跳过这一帧");
+        // 只改透明度：指纹（文本/状态/尺寸/字号）完全不变
+        w.config.bg_alpha = 200;
+        assert!(w.build_frame(200, 100, 2).is_none(), "指纹不含颜色，不 invalidate 就会被吃掉");
+        w.invalidate();
+        assert!(w.build_frame(200, 100, 2).is_some());
     }
 }

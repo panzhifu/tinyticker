@@ -205,7 +205,8 @@ impl Timer {
         self.tick_at(Instant::now());
     }
 
-    fn tick_at(&mut self, now: Instant) {
+    /// 推进到给定时刻；`maybe_tick` 注入真实时间，测试里注入假时间。
+    pub(crate) fn tick_at(&mut self, now: Instant) {
         let Some(last) = self.last_tick.get() else {
             self.last_tick.set(Some(now)); // 首次调用仅建立基准
             return;
