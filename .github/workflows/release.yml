@@ -15,44 +15,74 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 链接期依赖（非 dlopen）：x11rb 除 libxcb 外还要 render / shape / xfixes
-      # 等扩展的 .so，wayland-client 需要 libwayland-client.so。
-      - name: 安装系统依赖与 UPX
+      # 构建不需要任何 X11 / Wayland / D-Bus 的 -dev 包：三边都是运行时 dlopen，
+      # 编译期只有 std。UPX 用来压发布产物。
+      - name: 安装 UPX
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
-                                  libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
-                                  libwayland-dev libxkbcommon-dev libdbus-1-dev upx-ucl
+          sudo apt-get install -y upx-ucl
+
+      # 产物名带版本号：下载 URL 不可变，AUR / 发行版打包才能固定 sha256
+      - name: 计算版本号
+        run: echo "VER=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
       - name: 构建两个版本
         run: |
           cargo build --release
-          cp target/release/tinyticker tinyticker-x86_64-unknown-linux-gnu
+          cp target/release/tinyticker "tinyticker-$VER-x86_64-unknown-linux-gnu"
           cargo build --release --no-default-features
-          cp target/release/tinyticker tinyticker-wayland-x86_64-unknown-linux-gnu
+          cp target/release/tinyticker "tinyticker-$VER-wayland-x86_64-unknown-linux-gnu"
 
       # UPX 对 Rust 二进制通常再压掉 40-50%；首次启动多几毫秒解压时间
       - name: UPX 压缩
         run: |
-          upx --lzma --best tinyticker-x86_64-unknown-linux-gnu
-          upx --lzma --best tinyticker-wayland-x86_64-unknown-linux-gnu
+          upx --lzma --best "tinyticker-$VER-x86_64-unknown-linux-gnu"
+          upx --lzma --best "tinyticker-$VER-wayland-x86_64-unknown-linux-gnu"
 
       - name: 体积报告
-        run: ls -lh tinyticker-* | awk '{printf "%-46s %s\n", $9, $5}'
+        run: ls -lh "tinyticker-$VER-"* | awk '{printf "%-52s %s\n", $9, $5}'
+
+      # freedesktop 元数据随 release 一起出，打包者不必 clone 仓库
+      - name: 收集桌面资产
+        run: cp packaging/io.github.panzhifu.tinyticker.desktop \
+                packaging/io.github.panzhifu.tinyticker.svg \
+                packaging/io.github.panzhifu.tinyticker.metainfo.xml .
+
+      - name: 生成校验和
+        run: |
+          sha256sum "tinyticker-$VER-x86_64-unknown-linux-gnu" \
+                    "tinyticker-$VER-wayland-x86_64-unknown-linux-gnu" \
+                    io.github.panzhifu.tinyticker.desktop \
+                    io.github.panzhifu.tinyticker.svg \
+                    io.github.panzhifu.tinyticker.metainfo.xml > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            tinyticker-x86_64-unknown-linux-gnu
-            tinyticker-wayland-x86_64-unknown-linux-gnu
+            tinyticker-*-x86_64-unknown-linux-gnu
+            io.github.panzhifu.tinyticker.desktop
+            io.github.panzhifu.tinyticker.svg
+            io.github.panzhifu.tinyticker.metainfo.xml
+            SHA256SUMS.txt
           generate_release_notes: true
           body: |
-            两个产物均为 UPX 压缩版（`--lzma --best`），下载后直接 `chmod +x` 即可运行。
+            两个产物均为 UPX 压缩版（`--lzma --best`），下载后用 `SHA256SUMS.txt` 校验：
 
-            - `tinyticker-x86_64-unknown-linux-gnu`：Wayland + X11 通用版
-            - `tinyticker-wayland-x86_64-unknown-linux-gnu`：仅 Wayland，体积更小
+            ```sh
+            TAG=${{ github.ref_name }}
+            BASE=https://github.com/panzhifu/tinyticker/releases/download/$TAG
+            curl -fLO "$BASE/tinyticker-${TAG#v}-x86_64-unknown-linux-gnu"
+            curl -fLO "$BASE/SHA256SUMS.txt"
+            sha256sum -c --ignore-missing SHA256SUMS.txt
+            install -Dm755 "tinyticker-${TAG#v}-x86_64-unknown-linux-gnu" ~/.local/bin/tinyticker
+            ```
 
-            不确定选哪个：niri / Sway / Hyprland / KWin 等 Wayland 会话用 Wayland 版；X11 会话用通用版。
+            选哪个：niri / Sway / Hyprland / KWin 等 Wayland 会话用 Wayland 版（更小）；
+            X11 会话必须用通用版（Wayland 版没有 X11 后端）。
+
+            不确定就用通用版。`SHA256SUMS.txt` 里同时覆盖桌面资产，
+            只下二进制时 `--ignore-missing` 会跳过其余条目。
 
             若偏好未压缩的二进制（避免少数环境对加壳程序的告警），请自行 `cargo build --release`。

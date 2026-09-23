@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=TinyTicker
+Name[zh_CN]=极简悬浮计时器
+GenericName=Timer
+GenericName[zh_CN]=计时器
+Comment=Minimal floating countdown, stopwatch, pomodoro and clock widget
+Comment[zh_CN]=极简悬浮倒计时 / 秒表 / 番茄钟 / 时钟挂件
+Icon=io.github.panzhifu.tinyticker
+Exec=tinyticker
+Terminal=false
+Categories=Utility;Clock;
+Keywords=countdown;timer;stopwatch;pomodoro;clock;番茄钟;倒计时;计时器;时钟;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.panzhifu.tinyticker</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>TinyTicker</name>
+  <summary>Minimal floating countdown, stopwatch, pomodoro and clock widget</summary>
+  <developer id="io.github.panzhifu">
+    <name>panzhifu</name>
+  </developer>
+
+  <description>
+    <p>
+      TinyTicker 是用纯 CPU 软渲染的极简悬浮计时器，内置 8x8 位图字体，
+      单二进制 0.5 MB 且零第三方依赖，无任何运行时字体或 UI 依赖。
+      无边框透明悬浮窗，逐像素预乘 ARGB。
+    </p>
+    <p>TinyTicker 提供四种模式：倒计时、秒表、番茄钟（专注/休息自动轮转）、时钟挂件（12/24 小时制）。</p>
+    <ul>
+      <li>Wayland 上走 layer-shell 的 overlay 层，网页视频全屏时依然可见</li>
+      <li>左键拖动、右键关闭、滚轮缩放；系统托盘可开始 / 暂停 / 重置 / 时长预设</li>
+      <li>时长支持相对写法 25m / 1h30m，也支持绝对时刻 14:30</li>
+      <li>计时结束发桌面通知，并可执行自定义命令（锁屏、关机等）</li>
+      <li>走时以整数秒为基准，休眠恢复或高负载后自动补齐，不漂移</li>
+    </ul>
+  </description>
+
+  <categories>
+    <category>Utility</category>
+    <category>Clock</category>
+  </categories>
+  <keywords>
+    <keyword>countdown</keyword>
+    <keyword>timer</keyword>
+    <keyword>stopwatch</keyword>
+    <keyword>pomodoro</keyword>
+    <keyword>clock</keyword>
+    <keyword>倒计时</keyword>
+    <keyword>番茄钟</keyword>
+    <keyword>悬浮窗</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/panzhifu/tinyticker</url>
+  <url type="bugtracker">https://github.com/panzhifu/tinyticker/issues</url>
+  <url type="vcs-browser">https://github.com/panzhifu/tinyticker</url>
+
+  <launchable type="desktop-id">io.github.panzhifu.tinyticker.desktop</launchable>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.5.0" date="2026-09-23">
+      <url>https://github.com/panzhifu/tinyticker/releases/tag/v0.5.0</url>
+      <description>
+        <p>去掉全部第三方 crate：Wayland / X11 / D-Bus 改为运行时 dlopen 系统库，
+        自研 layer-shell 置顶、X11 客户端、托盘与 TZif 时区读取。</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-09-09">
+      <url>https://github.com/panzhifu/tinyticker/releases/tag/v0.4.1</url>
+      <description>
+        <p>12/24 小时制时钟挂件，以及 CI 与自动发布。</p>
+      </description>
+    </release>
+  </releases>
+
+  <custom>
+    <value key="LFS-provided-by">GitHub Releases</value>
+  </custom>
+</component>

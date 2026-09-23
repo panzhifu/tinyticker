@@ -18,14 +18,19 @@ jobs:
         with:
           components: clippy
 
-      # 链接期依赖（非 dlopen）：x11rb 除 libxcb 外还要 render / shape / xfixes
-      # 等扩展的 .so，wayland-client 需要 libwayland-client.so。
-      - name: 安装系统依赖
+      # 构建不需要任何 X11 / Wayland / D-Bus 的 -dev 包：三边都是运行时 dlopen，
+      # 编译期只有 std。这里装的只是校验 packaging/ 资产的元数据工具。
+      - name: 安装资产校验工具
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
-                                  libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
-                                  libwayland-dev libxkbcommon-dev libdbus-1-dev
+          sudo apt-get install -y desktop-file-utils libxml2-utils appstream
+
+      # 打包资产随 release 一起发布，坏了会污染发行版元数据，所以在这里挡住
+      - name: 校验打包资产
+        run: |
+          desktop-file-validate packaging/io.github.panzhifu.tinyticker.desktop
+          appstreamcli validate --no-color packaging/io.github.panzhifu.tinyticker.metainfo.xml
+          xmllint --noout packaging/io.github.panzhifu.tinyticker.svg
 
       # 两个 feature 组合都过一遍：默认（Wayland + X11）与 Wayland 极小版
       - name: 构建（Wayland + X11）
