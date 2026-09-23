@@ -21,6 +21,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::{ALPHA_STEPS, PALETTES};
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::sysinfo;
@@ -36,6 +37,12 @@ pub enum Command {
     Preset(u32),
     /// 切换计时模式（重置计时）。
     SetMode(Mode),
+    /// 滚轮缩放：`dy` 为带符号格数，与悬浮窗上的滚轮同义。
+    ZoomBy(i32),
+    /// 设置背景不透明度（0-255）；文字始终不透明。
+    SetAlpha(u8),
+    /// 套用 `config::PALETTES` 的第 i 套配色。
+    SetPalette(usize),
     Quit,
 }
 
@@ -100,7 +107,7 @@ const PRESETS: [(&str, u32); 6] = [
 // 菜单模型：启动时摊平成 id 索引的节点表
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Root,
     Button,
@@ -130,6 +137,16 @@ struct Server {
     pixmap: Vec<u8>,
 }
 
+/// 往节点表追加一个节点并登记为根菜单的一项，返回它的 id。
+///
+/// 用函数而不是闭包：闭包会一直占住 `n` 的可变借用，而下面还要按下标往子菜单里塞孩子。
+fn push_top(n: &mut Vec<Node>, root: &mut Vec<i32>, node: Node) -> i32 {
+    let id = n.len() as i32;
+    n.push(node);
+    root.push(id);
+    id
+}
+
 fn build_nodes() -> Vec<Node> {
     let button = |label: &str, command: Command| Node {
         kind: Kind::Button,
@@ -137,32 +154,36 @@ fn build_nodes() -> Vec<Node> {
         command: Some(command),
         children: Vec::new(),
     };
+    let separator = || Node {
+        kind: Kind::Separator,
+        label: String::new(),
+        command: None,
+        children: Vec::new(),
+    };
+    let submenu = |label: &str| Node {
+        kind: Kind::Submenu,
+        label: label.into(),
+        command: None,
+        children: Vec::new(),
+    };
+
     let mut n = vec![Node {
         kind: Kind::Root,
         label: String::new(),
         command: None,
         children: Vec::new(),
     }];
-    n.push(button("▶ 开始", Command::Start));
-    n.push(button("⏸ 暂停", Command::Pause));
-    n.push(button("⟳ 重置", Command::Reset));
-    n.push(Node { kind: Kind::Separator, label: String::new(), command: None, children: Vec::new() });
-    let presets = n.len() as i32;
-    n.push(Node {
-        kind: Kind::Submenu,
-        label: "时长预设".into(),
-        command: None,
-        children: Vec::new(),
-    });
-    let modes = n.len() as i32;
-    n.push(Node {
-        kind: Kind::Submenu,
-        label: "模式".into(),
-        command: None,
-        children: Vec::new(),
-    });
-    n.push(Node { kind: Kind::Separator, label: String::new(), command: None, children: Vec::new() });
-    n.push(button("✕ 退出", Command::Quit));
+    let mut root = Vec::new();
+    push_top(&mut n, &mut root, button("▶ 开始", Command::Start));
+    push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
+    push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
+    push_top(&mut n, &mut root, separator());
+    let presets = push_top(&mut n, &mut root, submenu("时长预设"));
+    let modes = push_top(&mut n, &mut root, submenu("模式"));
+    let look = push_top(&mut n, &mut root, submenu("外观"));
+    push_top(&mut n, &mut root, separator());
+    push_top(&mut n, &mut root, button("✕ 退出", Command::Quit));
+
     for (label, secs) in PRESETS {
         let id = n.len() as i32;
         n.push(button(&format!("⏱ {label}"), Command::Preset(secs)));
@@ -178,8 +199,25 @@ fn build_nodes() -> Vec<Node> {
         n.push(button(label, Command::SetMode(mode)));
         n[modes as usize].children.push(id);
     }
+    // 外观：透明度与配色各一个二级子菜单
+    let alpha = n.len() as i32;
+    n.push(submenu("背景透明度"));
+    n[look as usize].children.push(alpha);
+    let palette = n.len() as i32;
+    n.push(submenu("配色预设"));
+    n[look as usize].children.push(palette);
+    for (label, value) in ALPHA_STEPS {
+        let id = n.len() as i32;
+        n.push(button(label, Command::SetAlpha(value)));
+        n[alpha as usize].children.push(id);
+    }
+    for (i, p) in PALETTES.iter().enumerate() {
+        let id = n.len() as i32;
+        n.push(button(p.name, Command::SetPalette(i)));
+        n[palette as usize].children.push(id);
+    }
     // 根节点的子项顺序即菜单顺序
-    n[0].children = (1..=8).collect();
+    n[0].children = root;
     n
 }
 
@@ -560,6 +598,14 @@ unsafe extern "C" fn on_message(
         }
         // 三击都只回成功：ItemIsMenu=true，宿主自己弹 /MenuBar
         "Activate" | "SecondaryActivate" | "ContextMenu" if path == item_p && iface == item_i => {
+            reply(dbus, conn, msg, |_, _| {})
+        }
+        // 滚轮缩放：ITEM_XML 里声明了 Scroll，就得真的接住，否则宿主收不到回复。
+        // 悬浮窗太小、又常开着点击穿透，在托盘图标上滚反而是更顺手的一条路。
+        "Scroll" if path == item_p && iface == item_i => {
+            if let Some(delta) = read_scroll(dbus, args) {
+                let _ = server.cmd_tx.send(Command::ZoomBy(delta));
+            }
             reply(dbus, conn, msg, |_, _| {})
         }
         "GetLayout" if path == menu_p && iface == menu_i => {
@@ -947,6 +993,14 @@ unsafe fn read_event(dbus: &DBus, args: *mut DBusMessageIter) -> Option<i32> {
     (event == "clicked").then_some(id)
 }
 
+/// `Scroll(i delta, s orientation)`：只认纵向，横向暂无可缩放的东西。
+/// 规范里 delta 为正 = 向上滚，与悬浮窗滚轮的「上=放大」同向。
+unsafe fn read_scroll(dbus: &DBus, args: *mut DBusMessageIter) -> Option<i32> {
+    let delta = read_i32(dbus, args);
+    (dbus.dbus_message_iter_next)(args);
+    (read_str(dbus, args) == "vertical").then_some(delta)
+}
+
 /// `GetGroupProperties(ai ids, as names)` → 读 ids。
 unsafe fn read_ids(dbus: &DBus, args: *mut DBusMessageIter) -> Vec<i32> {
     let mut out = Vec::new();
@@ -1148,5 +1202,63 @@ mod tests {
             assert_eq!(IconMode::from_name(m.name()), Some(m));
         }
         assert_eq!(IconMode::from_name("disk"), None);
+    }
+
+    #[test]
+    fn menu_nodes_are_well_formed() {
+        let n = build_nodes();
+        assert_eq!(n[0].kind, Kind::Root);
+        for (id, node) in n.iter().enumerate().skip(1) {
+            match node.kind {
+                Kind::Button => {
+                    assert!(node.command.is_some(), "按钮 {id} 没绑命令");
+                    assert!(!node.label.is_empty(), "按钮 {id} 没有标签");
+                    assert!(node.children.is_empty(), "按钮 {id} 不该有孩子");
+                }
+                Kind::Separator => {
+                    assert!(node.command.is_none() && node.children.is_empty());
+                }
+                Kind::Submenu => {
+                    assert!(!node.children.is_empty(), "子菜单 {id} 是空的");
+                    assert!(node.command.is_none(), "子菜单 {id} 不该绑命令");
+                }
+                Kind::Root => panic!("只有 0 号节点是 Root"),
+            }
+            for c in &node.children {
+                assert!((*c as usize) < n.len(), "{id} 的孩子 {c} 越界");
+                assert_ne!(*c, id as i32, "{id} 把自己列为孩子");
+            }
+        }
+        // 手工算下标挂孩子，最容易错的就是同一个 id 被登记两次
+        let mut seen: Vec<i32> = n.iter().flat_map(|x| x.children.clone()).collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "有节点被挂了两个父亲");
+    }
+
+    #[test]
+    fn appearance_submenu_reaches_every_preset() {
+        let n = build_nodes();
+        let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
+        assert_eq!(look.children.len(), 2, "外观下应当是 透明度 + 配色 两个子菜单");
+        let kids = |parent: i32| -> Vec<Option<Command>> {
+            n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
+        };
+        let (alpha_id, palette_id) = (look.children[0], look.children[1]);
+        assert_eq!(n[alpha_id as usize].label, "背景透明度");
+        assert_eq!(n[palette_id as usize].label, "配色预设");
+
+        let alpha = kids(alpha_id);
+        assert_eq!(alpha.len(), ALPHA_STEPS.len());
+        for (k, cmd) in alpha.iter().enumerate() {
+            assert_eq!(*cmd, Some(Command::SetAlpha(ALPHA_STEPS[k].1)), "第 {k} 档透明度接错");
+        }
+        let palette = kids(palette_id);
+        assert_eq!(palette.len(), PALETTES.len());
+        for (k, id) in n[palette_id as usize].children.iter().enumerate() {
+            assert_eq!(n[*id as usize].command, Some(Command::SetPalette(k)));
+            assert_eq!(n[*id as usize].label, PALETTES[k].name, "菜单标签与预设对不上");
+        }
     }
 }

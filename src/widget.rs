@@ -1,15 +1,15 @@
 //! 与显示后端无关的挂件核心：计时推进、结束事件、帧内容与布局。
 //!
-//! 后端（winit 窗口 / Wayland layer-shell）只负责尺寸、缩放、输入事件与呈现，
-//! 一帧的内容由 [`Widget::build_frame`] 产出；内容未变化时返回 `None`，
-//! 后端据此整帧跳过（连 shm 都不提交）。
+//! 后端（`wl` 的 layer-shell / `x11` 的 override-redirect）只负责尺寸、缩放、
+//! 输入事件与呈现，一帧的内容由 [`Widget::build_frame`] 产出；内容未变化时返回
+//! `None`，后端据此整帧跳过（连 shm 都不提交）。
 
 use std::time::Duration;
 
 use crate::tray::TrayHandle;
 
 use crate::clock;
-use crate::config::Config;
+use crate::config::{Config, PALETTES};
 use crate::render::{self, premultiply, Canvas};
 use crate::timer::{Finished, Mode, Phase, Timer};
 use crate::tray::{self, Command};
@@ -114,9 +114,37 @@ impl Widget {
             Command::Reset => self.timer.reset(),
             Command::Preset(secs) => self.timer.start_countdown(secs),
             Command::SetMode(mode) => self.timer.set_mode(mode),
+            Command::ZoomBy(dy) => {
+                if self.zoom_by(dy as f32) {
+                    self.config.zoom = self.zoom;
+                    self.persist_appearance();
+                }
+            }
+            Command::SetAlpha(alpha) => {
+                if self.config.bg_alpha != alpha {
+                    self.config.bg_alpha = alpha;
+                    self.persist_appearance();
+                }
+            }
+            Command::SetPalette(i) => {
+                if let Some(p) = PALETTES.get(i) {
+                    self.config.color_bg = p.bg;
+                    self.config.color_running = p.running;
+                    self.config.color_paused = p.paused;
+                    self.config.color_done = p.done;
+                    self.persist_appearance();
+                }
+            }
             Command::Quit => return true,
         }
         false
+    }
+
+    /// 外观变了：帧指纹只含文本与尺寸、不含颜色，所以必须强制重绘一次；
+    /// 同时立刻写回配置——菜单点击是明确意图，不该因为进程被 kill 而丢掉。
+    fn persist_appearance(&mut self) {
+        self.last_frame = None;
+        self.config.save();
     }
 
     /// 推进计时，并处理本次产生的结束事件（通知 + on_finish 命令）。

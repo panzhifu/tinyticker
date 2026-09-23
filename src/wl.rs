@@ -541,17 +541,30 @@ client.commit();
             e.axis.take() / 10.0
         };
         e.axis.set(0.0);
-        if steps != 0.0 && self.widget.zoom_by(-steps as f32) {
-            self.logical = zoomed_logical(self.widget.zoom);
-            request(
-                &self.wl,
-                self.layer,
-                LAYER_SET_SIZE,
-                &[uint(self.logical.0), uint(self.logical.1)],
-            );
-            self.rebuild_buffers()?;
-            self.commit();
+        if steps != 0.0 {
+            self.widget.zoom_by(-steps as f32);
+            self.sync_zoom()?;
         }
+        Ok(())
+    }
+
+    /// 按当前 zoom 结算 surface 尺寸：悬浮窗滚轮与托盘 `Scroll` 都走这一条。
+    /// 尺寸没变（已顶到 clamp 边界，或还没 configure）就整段跳过，免得白折腾 shm。
+    fn sync_zoom(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let want = zoomed_logical(self.widget.zoom);
+        if !self.configured || want == self.logical {
+            return Ok(());
+        }
+        self.logical = want;
+        request(
+            &self.wl,
+            self.layer,
+            LAYER_SET_SIZE,
+            &[uint(self.logical.0), uint(self.logical.1)],
+        );
+        // rebuild_buffers 会按新的 self.logical 重算 viewport 目标尺寸与 font_scale
+        self.rebuild_buffers()?;
+        self.commit();
         Ok(())
     }
 
@@ -647,9 +660,11 @@ client.commit();
             if self.quit {
                 break;
             }
+            // 托盘命令也可能改 zoom（图标上的 Scroll），尺寸统一在这里结算
+            self.sync_zoom()?;
             self.widget.tick();
-self.apply_events()?;
-self.render();
+            self.apply_events()?;
+            self.render();
 
             let deadline = Instant::now() + DRAW_INTERVAL;
             unsafe { (self.wl.flush)(self.display) };

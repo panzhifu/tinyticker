@@ -14,6 +14,38 @@ use crate::tray::IconMode;
 
 const CONFIG_FILE: &str = "config.conf";
 
+/// 托盘「外观 → 配色」子菜单套用的一组四色。
+///
+/// 只给预设、不做调色板：本项目没有对话框，改色要么点预设要么编辑配置文件。
+pub struct Palette {
+    pub name: &'static str,
+    pub bg: u32,
+    pub running: u32,
+    pub paused: u32,
+    pub done: u32,
+}
+
+/// 覆盖暗色 / 亮色 / 高对比三类场景；第一项就是出厂默认。
+pub const PALETTES: [Palette; 6] = [
+    Palette { name: "默认", bg: 0x0F0F14, running: 0xFFFFFF, paused: 0xFFC850, done: 0x50DC78 },
+    Palette { name: "海洋", bg: 0x0A1420, running: 0x9AD4FF, paused: 0x5AA9FF, done: 0x7CF0C4 },
+    Palette { name: "落日", bg: 0x1A0F0A, running: 0xFFD28A, paused: 0xFF9E3D, done: 0xFF5C7A },
+    Palette { name: "紫罗兰", bg: 0x140A18, running: 0xE0B3FF, paused: 0xB366FF, done: 0x66FFB3 },
+    Palette { name: "高对比", bg: 0x000000, running: 0xFFFFFF, paused: 0xFFFF00, done: 0x00FF00 },
+    Palette { name: "纸白", bg: 0xF2F0EB, running: 0x1A1A1A, paused: 0x8A6D1A, done: 0x1F6F32 },
+];
+
+/// 托盘「外观 → 透明度」子菜单的档位（`bg_alpha`，0-255）。
+///
+/// 文字始终不透明，所以 0 档不是「看不见」而是「只剩文字」。
+pub const ALPHA_STEPS: [(&str, u8); 5] = [
+    ("全透明（只剩文字）", 0),
+    ("淡", 48),
+    ("中", 96),
+    ("浓", 160),
+    ("不透明", 255),
+];
+
 // zoom 为 f32（非 Eq），整体只做 PartialEq 比较
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -268,6 +300,40 @@ mod tests {
     fn garbage_falls_back_to_defaults() {
         let cfg = Config::from_str("这不是配置\nfoo=bar\nduration=abc\ncolor_bg=zzz\n");
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn palette_presets_are_distinct_and_in_gamut() {
+        assert_eq!(PALETTES[0].name, "默认");
+        // 第一套必须就是出厂默认，否则「默认」菜单项会改变外观
+        let d = Config::default();
+        assert_eq!(PALETTES[0].bg, d.color_bg);
+        assert_eq!(PALETTES[0].running, d.color_running);
+        assert_eq!(PALETTES[0].paused, d.color_paused);
+        assert_eq!(PALETTES[0].done, d.color_done);
+        for p in &PALETTES {
+            for c in [p.bg, p.running, p.paused, p.done] {
+                assert!(c <= 0xFFFFFF, "{} 的颜色超出 24 位: {c:#08x}", p.name);
+            }
+        }
+        // 名字不能重复，菜单里靠它辨认
+        for (i, a) in PALETTES.iter().enumerate() {
+            for b in &PALETTES[i + 1..] {
+                assert_ne!(a.name, b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_steps_ascend_and_roundtrip() {
+        assert_eq!(ALPHA_STEPS[0].1, 0);
+        assert_eq!(ALPHA_STEPS[ALPHA_STEPS.len() - 1].1, 255);
+        assert!(ALPHA_STEPS.windows(2).all(|w| w[0].1 < w[1].1));
+        // 每一档都得能被序列化-解析原样取回
+        for &(label, value) in &ALPHA_STEPS {
+            let cfg = Config::from_str(&format!("bg_alpha = {value}\n"));
+            assert_eq!(cfg.bg_alpha, value, "{label} 档没走通");
+        }
     }
 
     #[test]
