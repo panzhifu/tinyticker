@@ -12,7 +12,7 @@ use crate::clock;
 use crate::config::{Config, PALETTES};
 use crate::render::{self, premultiply, Canvas};
 use crate::textsrc;
-use crate::timer::{Finished, Mode, Phase, Timer};
+use crate::timer::{Finished, Mode, Timer};
 use crate::tray::{self, Command};
 
 /// 逻辑画布大小（参考值；实际像素缓冲跟随窗口物理尺寸 × 缩放系数）。
@@ -99,7 +99,7 @@ impl Widget {
         // 趁 config 还没进结构体先把路径取走
         let text_src = textsrc::Source::new(config.text_source.as_deref());
         let mut timer = Timer::new(config.mode, config.duration_secs);
-        timer.set_pomo_durations(config.pomo_work, config.pomo_break);
+        timer.set_pomo(&config.pomo);
         if autostart {
             timer.start();
         }
@@ -183,6 +183,8 @@ impl Widget {
             Finished::Countdown => ("⏰ 计时结束", "再来一次"),
             Finished::PomodoroWork => ("🍅 专注完成，休息一下", "好的"),
             Finished::PomodoroBreak => ("☕ 休息结束，继续专注", "开始"),
+            Finished::PomodoroLongBreak => ("🌿 长休息结束，开始下一组", "开始"),
+            Finished::PomodoroAllDone => ("🎉 番茄钟全部完成", "再来一组"),
         };
         if let Some(handle) = &self.tray {
             tray::notify(handle, body, action);
@@ -217,15 +219,12 @@ impl Widget {
     /// 生成当前帧；内容与上一帧相同则返回 `None`（调用方据此跳过重绘）。
     pub fn build_frame(&mut self, width: u32, height: u32, scale: u32) -> Option<Frame> {
         let bg = premultiply(self.config.color_bg, self.config.bg_alpha);
-        // 状态行：番茄钟显示阶段与轮数，时钟模式固定 CLOCK
+        // 状态行：番茄钟显示阶段与组内序号（收工则显示 DONE），时钟模式固定 CLOCK
         let status = match self.timer.mode {
             Mode::Clock => "CLOCK".to_string(),
+            Mode::Pomodoro if self.timer.is_done() => "DONE".to_string(),
             Mode::Pomodoro => {
-                let (label, n) = if self.timer.phase == Phase::Work {
-                    ("WORK", self.timer.round + 1)
-                } else {
-                    ("BREAK", self.timer.round)
-                };
+                let (label, n) = self.timer.pomo_status();
                 format!("{label} {n}")
             }
             Mode::Stopwatch if self.timer.running => "RUNNING".to_string(),
@@ -330,6 +329,28 @@ mod tests {
         w.handle_cmd(Command::Toggle);
         assert!(w.timer.running, "结束后左键应当重新开始，而不是停在 DONE");
         assert!(!w.timer.is_done());
+    }
+
+    /// 状态行走 `Timer::pomo_status`，跑满组数后要换成 DONE。
+    #[test]
+    fn pomodoro_status_line_follows_the_phase_and_ends_at_done() {
+        use crate::timer::Pomo;
+        let cfg = Config {
+            mode: Mode::Pomodoro,
+            pomo: Pomo { work: 1, short_break: 1, long_break: 1, rounds: 1, cycles: 1 },
+            ..Config::default()
+        };
+        let mut w = Widget::new(cfg, true);
+        assert_eq!(w.build_frame(200, 100, 1).unwrap().status, "WORK 1");
+        let t0 = Instant::now();
+        w.timer.tick_at(t0);
+        w.timer.tick_at(t0 + Duration::from_secs(1));
+        assert_eq!(w.build_frame(200, 100, 1).unwrap().status, "LONG 1");
+        // 长休息走完就是最后一组的结尾：停住并显示 DONE
+        w.timer.tick_at(t0 + Duration::from_secs(2));
+        let frame = w.build_frame(200, 100, 1).expect("状态换了就该有新一帧");
+        assert_eq!(frame.status, "DONE");
+        assert!(!w.timer.running);
     }
 
     /// 外观命令带磁盘写（`config.save()`），不适合在单测里走；这里只测它的另一半：

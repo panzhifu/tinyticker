@@ -8,6 +8,7 @@
 //!
 //! 只做只读显示：不执行任何外部程序，所以「插件」这个词在这里比它听起来保守。
 
+use crate::config::expand_tilde;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -86,20 +87,6 @@ fn first_line(text: &str) -> &str {
         .map(|l| l.trim_matches(|c: char| c == '\r' || c == ' ' || c == '\t'))
         .find(|l| !l.is_empty() && l.chars().all(|c| !c.is_control()))
         .unwrap_or("")
-}
-
-/// 展开开头的 `~/`。std 不做这件事，而配置文件里手写绝对路径太难看。
-fn expand_tilde(raw: &str) -> PathBuf {
-    let raw = raw.trim();
-    let Some(rest) = raw.strip_prefix("~/").or_else(|| {
-        if raw == "~" { Some("") } else { None }
-    }) else {
-        return PathBuf::from(raw);
-    };
-    let Some(home) = std::env::var_os("HOME") else {
-        return PathBuf::from(raw);
-    };
-    if rest.is_empty() { PathBuf::from(home) } else { PathBuf::from(home).join(rest) }
 }
 
 #[cfg(test)]
@@ -211,15 +198,4 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn tilde_expansion_only_applies_at_the_front() {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let Some(home) = home else { return };
-        assert_eq!(expand_tilde("~/x/y"), home.join("x/y"));
-        assert_eq!(expand_tilde("~"), home);
-        assert_eq!(expand_tilde("  ~/a  "), home.join("a"));
-        // 中间出现 ~ 不展开
-        assert_eq!(expand_tilde("/tmp/~/a"), PathBuf::from("/tmp/~/a"));
-        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
-    }
 }

@@ -21,7 +21,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{ALPHA_STEPS, Config, PALETTES};
+use crate::config::{ALPHA_STEPS, Config, PALETTES, preset_label};
+use crate::gif;
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::sysinfo;
@@ -61,6 +62,8 @@ pub enum IconMode {
     Memory,
     /// 水位表 = 剩余电量；没有电池时显示空心盘。
     Battery,
+    /// 用户提供的 GIF 动图（`tray_gif`）。解不出时退回真实时表盘。
+    Gif,
 }
 
 impl IconMode {
@@ -70,6 +73,7 @@ impl IconMode {
             "cpu" => Some(IconMode::Cpu),
             "memory" => Some(IconMode::Memory),
             "battery" => Some(IconMode::Battery),
+            "gif" => Some(IconMode::Gif),
             _ => None,
         }
     }
@@ -80,6 +84,7 @@ impl IconMode {
             IconMode::Cpu => "cpu",
             IconMode::Memory => "memory",
             IconMode::Battery => "battery",
+            IconMode::Gif => "gif",
         }
     }
 }
@@ -96,16 +101,6 @@ const NOTIF_NAME: &CStr = c"org.freedesktop.Notifications";
 const NOTIF_PATH: &CStr = c"/org/freedesktop/Notifications";
 /// 通知按钮的动作标识，`ActionInvoked` 原样回传。
 const ACTION_RESTART: &str = "restart";
-
-/// 快速预设（标签, 秒）。
-const PRESETS: [(&str, u32); 6] = [
-    ("1 分钟", 60),
-    ("5 分钟", 300),
-    ("15 分钟", 900),
-    ("25 分钟", 1500),
-    ("45 分钟", 2700),
-    ("1 小时", 3600),
-];
 
 // ---------------------------------------------------------------------------
 // 菜单模型：启动时摊平成 id 索引的节点表
@@ -160,6 +155,8 @@ struct State {
     /// 配置里的四色恰好等于某套预设时才是 `Some`；用户手改过颜色就是 `None`
     palette: Option<usize>,
     icon: IconMode,
+    /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
+    gif: bool,
 }
 
 impl State {
@@ -174,7 +171,13 @@ impl State {
                     && p.done == cfg.color_done
             }),
             icon: cfg.tray_icon,
+            gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
         }
+    }
+
+    /// 这一项当前能不能点。
+    fn enabled(&self, cmd: Command) -> bool {
+        !matches!(cmd, Command::SetIcon(IconMode::Gif)) || self.gif
     }
 
     fn checked(&self, c: Check) -> bool {
@@ -228,7 +231,7 @@ fn push_top(n: &mut Vec<Node>, root: &mut Vec<i32>, node: Node) -> i32 {
     id
 }
 
-fn build_nodes() -> Vec<Node> {
+fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     let button = |label: &str, command: Command| Node {
         kind: Kind::Button,
         label: label.into(),
@@ -259,16 +262,16 @@ fn build_nodes() -> Vec<Node> {
     push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
     push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
     push_top(&mut n, &mut root, separator());
-    let presets = push_top(&mut n, &mut root, submenu("时长预设"));
+    let presets_menu = push_top(&mut n, &mut root, submenu("时长预设"));
     let modes = push_top(&mut n, &mut root, submenu("模式"));
     let look = push_top(&mut n, &mut root, submenu("外观"));
     push_top(&mut n, &mut root, separator());
     push_top(&mut n, &mut root, button("✕ 退出", Command::Quit));
 
-    for (label, secs) in PRESETS {
+    for secs in presets {
         let id = n.len() as i32;
-        n.push(button(&format!("⏱ {label}"), Command::Preset(secs)));
-        n[presets as usize].children.push(id);
+        n.push(button(&format!("⏱ {}", preset_label(*secs)), Command::Preset(*secs)));
+        n[presets_menu as usize].children.push(id);
     }
     for (label, mode) in [
         ("倒计时", Mode::Countdown),
@@ -305,6 +308,8 @@ fn build_nodes() -> Vec<Node> {
         ("CPU 占用", IconMode::Cpu),
         ("内存占用", IconMode::Memory),
         ("电池电量", IconMode::Battery),
+        // 没配路径就直说，否则点了只会静默退回表盘
+        (if gif_configured { "GIF 动图" } else { "GIF 动图（未配置 tray_gif）" }, IconMode::Gif),
     ] {
         let id = n.len() as i32;
         n.push(button(label, Command::SetIcon(m)));
@@ -410,6 +415,7 @@ fn icon_pixmap(
     mode: IconMode,
     src: &sysinfo::Sources,
     now: (u32, u32, u32),
+    player: &mut gif::Player,
 ) -> (i32, i32, Vec<u8>) {
     match mode {
         IconMode::Clock => clock_pixmap(now),
@@ -418,7 +424,32 @@ fn icon_pixmap(
         IconMode::Battery => {
             gauge_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
         }
+        // 动图解不出（没配 / 文件坏了）就退回真实时表盘，图标位不能空着
+        IconMode::Gif => match player.current().map(|(f, w, h)| gif_pixmap(f, w, h)) {
+            Some(px) => (S as i32, S as i32, px),
+            None => clock_pixmap(now),
+        },
     }
+}
+
+/// 把动图的一帧最近邻采样到 32x32 并转成 SNI 的 A,R,G,B 字节序。
+/// 尺寸固定成 32 是为了不动 `PIX_W`/`PIX_H`：宿主自己会再缩放，我们只保证一格一像素。
+fn gif_pixmap(frame: &gif::Frame, width: u16, height: u16) -> Vec<u8> {
+    let (fw, fh) = (usize::from(width), usize::from(height));
+    let mut px = vec![0u8; S * S * 4];
+    for y in 0..S {
+        for x in 0..S {
+            let sx = x * fw / S;
+            let sy = y * fh / S;
+            let o = (sy * fw + sx) * 4;
+            let i = (y * S + x) * 4;
+            px[i] = frame.rgba[o + 3];
+            px[i + 1] = frame.rgba[o];
+            px[i + 2] = frame.rgba[o + 1];
+            px[i + 3] = frame.rgba[o + 2];
+        }
+    }
+    px
 }
 
 fn dist(dx: f32, dy: f32) -> f32 {
@@ -457,12 +488,14 @@ pub struct TrayHandle {
 
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
 ///
-/// 配置只用来给菜单的勾选态和图标内容取初值，之后托盘自己镜像菜单点击的结果。
+/// 配置只用来给菜单的勾选态、图标内容和时长预设取初值，之后托盘自己镜像菜单点击的结果。
 pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Config) {
     let state = State::from_config(cfg);
+    let presets = cfg.presets.clone();
+    let gif_path = cfg.tray_gif.clone();
     thread::spawn(move || {
         let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
-        match run(cmd_tx, note_rx, handle_tx, note_tx, state) {
+        match run(cmd_tx, note_rx, handle_tx, note_tx, state, presets, gif_path) {
             Ok(()) => {}
             Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
         }
@@ -485,6 +518,8 @@ fn run(
     handle_tx: Sender<TrayHandle>,
     note_tx: Sender<Note>,
     state: State,
+    presets: Vec<u32>,
+    gif_path: Option<String>,
 ) -> Result<(), String> {
     let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
     let mut err = DBusError::zeroed();
@@ -493,11 +528,13 @@ fn run(
         return Err(format!("连不上会话总线: {}", err.describe()));
     }
     let mut sampler = sysinfo::Sampler::new();
-    let (_, _, pixmap) = icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms());
+    let mut player = gif::Player::new(gif_path.as_deref());
+    let (_, _, pixmap) =
+        icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms(), &mut player);
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
-        nodes: build_nodes(),
+        nodes: build_nodes(&presets, state.gif),
         pixmap,
         state: std::cell::RefCell::new(state),
     }));
@@ -537,29 +574,32 @@ fn run(
 
     // 派发循环：200ms 醒一次，顺带把待发通知送出去、按秒刷新托盘图标
     let mut icon_at = Instant::now();
+    let mut sources = sampler.sample();
     loop {
         while let Ok(note) = note_rx.try_recv() {
             unsafe { send_notification(dbus, conn, &note) };
         }
+        // 采样按秒，图标按派发节拍（200ms）：动图帧间隔可以短到几十毫秒
         if icon_at.elapsed() >= ICON_EVERY {
             icon_at = Instant::now();
-            // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
-            let mode = unsafe { (*server).state.borrow().icon };
-            let (_, _, px) = icon_pixmap(mode, &sampler.sample(), crate::clock::now_hms());
-            // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
-            let changed = unsafe {
-                let server = &mut *server;
-                if server.pixmap == px {
-                    false
-                } else {
-                    server.pixmap = px;
-                    true
-                }
-            };
-            // 像素真变了才发信号：宿主收到 NewIcon 会立刻回读 IconPixmap
-            if changed {
-                unsafe { emit_new_icon(dbus, conn) };
+            sources = sampler.sample();
+        }
+        // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
+        let mode = unsafe { (*server).state.borrow().icon };
+        let (_, _, px) = icon_pixmap(mode, &sources, crate::clock::now_hms(), &mut player);
+        // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
+        let changed = unsafe {
+            let server = &mut *server;
+            if server.pixmap == px {
+                false
+            } else {
+                server.pixmap = px;
+                true
             }
+        };
+        // 像素真变了才发信号：宿主收到 NewIcon 会立刻回读 IconPixmap
+        if changed {
+            unsafe { emit_new_icon(dbus, conn) };
         }
         if unsafe { (dbus.dbus_connection_read_write_dispatch)(conn, 200) } != d::TRUE {
             return Ok(()); // 连接断了（多数是退出登录）
@@ -738,6 +778,8 @@ unsafe extern "C" fn on_message(
         "Event" if path == menu_p && iface == menu_i => {
             if let Some(id) = read_event(dbus, args)
                 && let Some(cmd) = server.nodes.get(id as usize).and_then(|n| n.command)
+                // 置灰的项（比如没配路径的 GIF 档）不该有动作，哪怕宿主还是发了 Event
+                && server.state.borrow().enabled(cmd)
             {
                 // 先镜像再转发：菜单的 checked 读的是这一份，不能等主窗口回话
                 server.state.borrow_mut().note(cmd);
@@ -968,18 +1010,22 @@ unsafe fn write_node_props(dbus: &DBus, it: *mut DBusMessageIter, server: &Serve
             ("label", Prop::Str(&node.label)),
             ("children-display", Prop::Str("submenu")),
         ],
-        Kind::Button => match node.command.and_then(Command::check) {
+        Kind::Button => {
+            let mut entries = vec![
+                ("label", Prop::Str(&node.label)),
+                (
+                    "enabled",
+                    Prop::Bool(
+                        node.command.is_none_or(|c| server.state.borrow().enabled(c)),
+                    ),
+                ),
+            ];
             // 单选组：把当前状态回灌成勾选，菜单才看得出「现在用的是哪一套」
-            Some(c) => vec![
-                ("label", Prop::Str(&node.label)),
-                ("enabled", Prop::Bool(true)),
-                ("checked", Prop::Bool(server.state.borrow().checked(c))),
-            ],
-            None => vec![
-                ("label", Prop::Str(&node.label)),
-                ("enabled", Prop::Bool(true)),
-            ],
-        },
+            if let Some(c) = node.command.and_then(Command::check) {
+                entries.push(("checked", Prop::Bool(server.state.borrow().checked(c))));
+            }
+            entries
+        }
     };
     for (key, value) in &entries {
         let mut de = match open(dbus, &mut arr, d::T_DICT_ENTRY, None) {
@@ -1071,7 +1117,12 @@ unsafe fn write_node_property(
     };
     match name {
         "label" => variant_str(dbus, it, &node.label),
-        "enabled" => variant_bool(dbus, it, node.kind == Kind::Button),
+        "enabled" => variant_bool(
+            dbus,
+            it,
+            node.kind == Kind::Button
+                && node.command.is_none_or(|c| server.state.borrow().enabled(c)),
+        ),
         "visible" => variant_bool(dbus, it, true),
         "children-display" => {
             variant_str(dbus, it, if node.kind == Kind::Submenu { "submenu" } else { "compound" })
@@ -1339,7 +1390,7 @@ mod tests {
 
     #[test]
     fn menu_nodes_are_well_formed() {
-        let n = build_nodes();
+        let n = build_nodes(&Config::default().presets, true);
         assert_eq!(n[0].kind, Kind::Root);
         for (id, node) in n.iter().enumerate().skip(1) {
             match node.kind {
@@ -1372,7 +1423,7 @@ mod tests {
 
     #[test]
     fn appearance_submenu_reaches_every_preset() {
-        let n = build_nodes();
+        let n = build_nodes(&Config::default().presets, true);
         let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
         assert_eq!(look.children.len(), 3, "外观下应是 透明度 + 配色 + 图标 三个子菜单");
         let acts = |parent: i32| -> Vec<Option<Command>> {
@@ -1400,17 +1451,61 @@ mod tests {
             assert_eq!(n[*id as usize].label, PALETTES[k].name, "菜单标签与预设对不上");
         }
         let icons = acts(icon_id);
-        assert_eq!(icons.len(), 4);
+        // 菜单里的图标项必须与 IconMode 的全部取值一一对应：加一档忘了登记就漏在这里
+        let expect =
+            [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery, IconMode::Gif];
+        assert_eq!(icons.len(), expect.len());
         for (k, id) in n[icon_id as usize].children.iter().enumerate() {
-            let expect = [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery][k];
-            assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect)));
+            assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect[k])));
         }
     }
 
+    /// 预设菜单要照配置生成：条数、秒数、标签都得对上。
+    #[test]
+    fn preset_submenu_follows_the_config_list() {
+        let n = build_nodes(&[90, 1500, 5400], true);
+        let submenu = n.iter().find(|x| x.label == "时长预设").expect("没有「时长预设」子菜单");
+        let items: Vec<(String, Option<Command>)> = submenu
+            .children
+            .iter()
+            .map(|i| (n[*i as usize].label.clone(), n[*i as usize].command))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("⏱ 1 分 30 秒".to_string(), Some(Command::Preset(90))),
+                ("⏱ 25 分".to_string(), Some(Command::Preset(1500))),
+                ("⏱ 1 小时 30 分".to_string(), Some(Command::Preset(5400))),
+            ]
+        );
+    }
+
     /// 只有单选组该带勾选；动作按钮（开始/暂停/退出/时长预设）不该画成圆点。
+    /// 没配 `tray_gif` 时 GIF 那一档该置灰并在标签上说明原因，其余档不受影响。
+    #[test]
+    fn gif_item_is_disabled_without_a_path() {
+        let cfg = Config::default();
+        let s = State::from_config(&cfg);
+        assert!(!s.enabled(Command::SetIcon(IconMode::Gif)), "没配路径该不可点");
+        assert!(s.enabled(Command::SetIcon(IconMode::Clock)));
+        assert!(s.enabled(Command::SetAlpha(96)), "非图标项不该被牵连");
+
+        let with = Config { tray_gif: Some("~/p/s.gif".into()), ..Config::default() };
+        assert!(State::from_config(&with).enabled(Command::SetIcon(IconMode::Gif)));
+        // 只有空白也算没配
+        let blank = Config { tray_gif: Some("   ".into()), ..Config::default() };
+        assert!(!State::from_config(&blank).enabled(Command::SetIcon(IconMode::Gif)));
+
+        let labelled = build_nodes(&cfg.presets, false);
+        let gif = labelled.iter().find(|x| x.label.starts_with("GIF 动图")).expect("菜单里该有 GIF 项");
+        assert!(gif.label.contains("tray_gif"), "标签该说明为什么不可用: {}", gif.label);
+        let ok = build_nodes(&cfg.presets, true);
+        assert_eq!(ok.iter().find(|x| x.label.starts_with("GIF")).unwrap().label, "GIF 动图");
+    }
+
     #[test]
     fn only_radio_items_are_checkable() {
-        let n = build_nodes();
+        let n = build_nodes(&Config::default().presets, true);
         for node in &n {
             let Some(cmd) = node.command else { continue };
             let checkable = cmd.check().is_some();

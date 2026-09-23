@@ -42,7 +42,31 @@ impl Mode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Work,
+    /// 短休息：常规轮次之间。
     Break,
+    /// 长休息：跑满 `Pomo::rounds` 轮专注后插入。
+    LongBreak,
+}
+
+/// 番茄钟的节奏参数（配置项 `pomo_*` 喂进来）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pomo {
+    /// 专注时长（秒）。
+    pub work: u32,
+    /// 短休息时长（秒）。
+    pub short_break: u32,
+    /// 长休息时长（秒）；0 = 不安排长休息，退回每轮短休息。
+    pub long_break: u32,
+    /// 每几轮专注后安排一次长休息，即一「组」的轮数。
+    pub rounds: u32,
+    /// 跑满几组后自动结束；0 = 不限，一直轮转。
+    pub cycles: u32,
+}
+
+impl Default for Pomo {
+    fn default() -> Self {
+        Self { work: 1500, short_break: 300, long_break: 900, rounds: 4, cycles: 0 }
+    }
 }
 
 /// 一次"计时结束"事件的来源（决定通知文案与是否执行 on_finish 命令）。
@@ -52,8 +76,12 @@ pub enum Finished {
     Countdown,
     /// 番茄钟专注阶段完成。
     PomodoroWork,
-    /// 番茄钟休息结束。
+    /// 短休息结束。
     PomodoroBreak,
+    /// 长休息结束，进入下一组。
+    PomodoroLongBreak,
+    /// 跑满设定的组数，整个番茄钟收工。
+    PomodoroAllDone,
 }
 
 /// 计时器核心状态。
@@ -67,11 +95,12 @@ pub struct Timer {
     finished: Option<Finished>, // 每次结束置位一次，由 take_finished 消费
     last_tick: Cell<Option<Instant>>,
     // 番茄钟状态
-    pub phase: Phase,
-    /// 已完成的专注轮数。
-    pub round: u32,
-    work_secs: u32,
-    break_secs: u32,
+    phase: Phase,
+    /// 已完成的专注轮数（跨组累加，组内位置由 `rounds` 取模得出）。
+    round: u32,
+    pomo: Pomo,
+    /// 跑满 `pomo.cycles` 组后置位，直到 reset / start 才清。
+    cycles_done: bool,
 }
 
 impl Timer {
@@ -85,8 +114,8 @@ impl Timer {
             last_tick: Cell::new(None),
             phase: Phase::Work,
             round: 0,
-            work_secs: 1500,
-            break_secs: 300,
+            pomo: Pomo::default(),
+            cycles_done: false,
         };
         t.reset();
         t
@@ -97,9 +126,13 @@ impl Timer {
         self.secs
     }
 
-    /// 倒计时是否已归零。
+    /// 计时是否已收工：倒计时归零，或番茄钟跑满设定的组数。
     pub fn is_done(&self) -> bool {
-        self.mode == Mode::Countdown && self.secs == 0
+        match self.mode {
+            Mode::Countdown => self.secs == 0,
+            Mode::Pomodoro => self.cycles_done,
+            _ => false,
+        }
     }
 
     pub fn start(&mut self) {
@@ -120,8 +153,9 @@ impl Timer {
             Mode::Stopwatch | Mode::Clock => self.secs = 0,
             Mode::Pomodoro => {
                 self.phase = Phase::Work;
-                self.secs = self.work_secs;
+                self.secs = self.pomo.work;
                 self.round = 0;
+                self.cycles_done = false;
             }
         }
         self.running = false;
@@ -146,12 +180,35 @@ impl Timer {
         self.reset();
     }
 
-    /// 设置番茄钟专注/休息时长（秒，至少 1）；番茄钟模式下重置。
-    pub fn set_pomo_durations(&mut self, work: u32, break_: u32) {
-        self.work_secs = work.max(1);
-        self.break_secs = break_.max(1);
+    /// 套用番茄钟节奏；番茄钟模式下重置。
+    ///
+    /// 时长与轮数下限取 1：为 0 会让阶段瞬间翻过去、一次心跳里发出多个结束事件。
+    /// `long_break` / `cycles` 的 0 是有意的开关（不安排长休息 / 不限组数），原样保留。
+    pub fn set_pomo(&mut self, pomo: &Pomo) {
+        self.pomo = Pomo {
+            work: pomo.work.max(1),
+            short_break: pomo.short_break.max(1),
+            long_break: pomo.long_break,
+            rounds: pomo.rounds.max(1),
+            cycles: pomo.cycles,
+        };
         if self.mode == Mode::Pomodoro {
             self.reset();
+        }
+    }
+
+    /// 状态行要显示的番茄阶段标签与序号。
+    ///
+    /// 标签固定 ASCII——渲染器只有 8x8 位图字体。序号数的是组内第几轮，
+    /// 长休息显示第几组，所以跑满一轮长休息后又会回到 `WORK 1`。
+    pub fn pomo_status(&self) -> (&'static str, u32) {
+        let rounds = self.pomo.rounds;
+        // 进入休息时本轮专注已计入 round，故组内位置要往前挪一格
+        let done = self.round.saturating_sub(1);
+        match self.phase {
+            Phase::Work => ("WORK", self.round % rounds + 1),
+            Phase::Break => ("BREAK", done % rounds + 1),
+            Phase::LongBreak => ("LONG", done / rounds + 1),
         }
     }
 
@@ -178,17 +235,43 @@ impl Timer {
                 if self.secs > 0 {
                     self.secs -= 1;
                 }
-                if self.secs == 0 {
-                    // 阶段结束：通知一次并自动进入下一阶段（保持运行）
-                    if self.phase == Phase::Work {
+                if self.secs > 0 {
+                    return;
+                }
+                // 阶段结束：通知一次并自动进入下一阶段（保持运行）
+                let rounds = self.pomo.rounds;
+                match self.phase {
+                    Phase::Work => {
                         self.round += 1;
                         self.finished = Some(Finished::PomodoroWork);
-                        self.phase = Phase::Break;
-                        self.secs = self.break_secs;
-                    } else {
-                        self.finished = Some(Finished::PomodoroBreak);
-                        self.phase = Phase::Work;
-                        self.secs = self.work_secs;
+                        // 组界上插长休息；关掉长休息时短休息就是组界
+                        if self.round.is_multiple_of(rounds) && self.pomo.long_break > 0 {
+                            self.phase = Phase::LongBreak;
+                            self.secs = self.pomo.long_break;
+                        } else {
+                            self.phase = Phase::Break;
+                            self.secs = self.pomo.short_break;
+                        }
+                    }
+                    Phase::Break | Phase::LongBreak => {
+                        let long = self.phase == Phase::LongBreak;
+                        // 长休息自己就是组界；关掉了就看 round 是否凑满一轮
+                        let at_boundary = long || self.round.is_multiple_of(rounds);
+                        // round 只算已完成专注，整除时正好是已跑完的组数
+                        let sets = self.round / rounds;
+                        if at_boundary && self.pomo.cycles > 0 && sets >= self.pomo.cycles {
+                            self.running = false;
+                            self.cycles_done = true;
+                            self.finished = Some(Finished::PomodoroAllDone);
+                        } else {
+                            self.phase = Phase::Work;
+                            self.secs = self.pomo.work;
+                            self.finished = Some(if long {
+                                Finished::PomodoroLongBreak
+                            } else {
+                                Finished::PomodoroBreak
+                            });
+                        }
                     }
                 }
             }
@@ -230,6 +313,11 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把计时推到 `t0` 之后 `secs` 秒（闭包做不到：它会把 `t` 借走）。
+    fn advance(t: &mut Timer, t0: Instant, secs: u64) {
+        t.tick_at(t0 + Duration::from_secs(secs));
+    }
 
     #[test]
     fn countdown_decreases_and_finishes_once() {
@@ -289,7 +377,7 @@ mod tests {
     #[test]
     fn pomodoro_cycles_phases_and_counts_rounds() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo_durations(2, 1);
+        t.set_pomo(&no_long_break(2, 1));
         t.start();
         let t0 = Instant::now();
         t.tick_at(t0); // 建立基准
@@ -311,10 +399,107 @@ mod tests {
         assert_eq!(t.take_finished(), Some(Finished::PomodoroBreak));
     }
 
+    /// 长休息关掉时，行为与只会短休息的旧版一致。
+    fn no_long_break(work: u32, short: u32) -> Pomo {
+        Pomo { work, short_break: short, long_break: 0, rounds: 4, cycles: 0 }
+    }
+
+    /// 跑满 rounds 轮专注插一次长休息，并在最后一组长休息后停住。
+    #[test]
+    fn pomodoro_inserts_long_break_and_stops_after_last_cycle() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        // 2 轮一组、跑 1 组：W2 B1 W2 B1(长) → 停
+        t.set_pomo(&Pomo { work: 2, short_break: 1, long_break: 3, rounds: 2, cycles: 1 });
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+
+        advance(&mut t, t0, 2); // 第 1 轮专注结束
+        assert_eq!((t.phase, t.secs), (Phase::Break, 1));
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroWork));
+        advance(&mut t, t0, 3); // 短休息结束
+        assert_eq!((t.phase, t.secs), (Phase::Work, 2));
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroBreak));
+        advance(&mut t, t0, 5); // 第 2 轮专注结束 → 凑满一轮，长休息
+        assert_eq!((t.phase, t.secs), (Phase::LongBreak, 3));
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroWork));
+        advance(&mut t, t0, 8); // 长休息结束，且已跑满 1 组 → 收工
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroAllDone));
+        assert!(!t.running);
+        assert!(t.is_done());
+        assert_eq!(t.secs, 0);
+    }
+
+    /// `cycles = 0` 是"不限"：长休息之后接着开下一组，序号回到 1。
+    #[test]
+    fn unlimited_pomodoro_keeps_looping_into_the_next_set() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 2, short_break: 1, long_break: 3, rounds: 2, cycles: 0 });
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        // 走完一整组：专注 2 + 短休 1 + 专注 2 + 长休 3 = 8 秒
+        t.tick_at(t0 + Duration::from_secs(8));
+        assert_eq!(t.phase, Phase::Work);
+        assert_eq!(t.round, 2);
+        assert!(t.running);
+        assert!(!t.is_done());
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroLongBreak));
+        assert_eq!(t.pomo_status(), ("WORK", 1), "新的一组该从 1 重新数");
+    }
+
+    /// 长休息被关掉时，收工判定得挂在组界的短休息上，否则永远停不下来。
+    #[test]
+    fn cycles_still_bite_with_long_break_disabled() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 2, cycles: 1 });
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        // W1 B1 W2 B2(组界) → 收工，共 4 秒
+        t.tick_at(t0 + Duration::from_secs(3));
+        assert!(t.running && !t.is_done(), "第 2 轮刚结束，短休息还没走完");
+        t.tick_at(t0 + Duration::from_secs(4));
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroAllDone));
+        assert!(t.is_done() && !t.running);
+    }
+
+    #[test]
+    fn pomo_status_numbers_follow_the_set() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 10, short_break: 10, long_break: 10, rounds: 2, cycles: 2 });
+        assert_eq!(t.pomo_status(), ("WORK", 1));
+        t.phase = Phase::Break;
+        t.round = 1;
+        assert_eq!(t.pomo_status(), ("BREAK", 1));
+        t.phase = Phase::LongBreak;
+        t.round = 2;
+        assert_eq!(t.pomo_status(), ("LONG", 1));
+        t.phase = Phase::Work;
+        assert_eq!(t.pomo_status(), ("WORK", 1), "第 3 轮是第 2 组的第 1 轮");
+        t.phase = Phase::LongBreak;
+        t.round = 4;
+        assert_eq!(t.pomo_status(), ("LONG", 2));
+    }
+
+    /// 番茄钟的 `is_done` 只在跑满组数后成立，中途休息结束不算结束。
+    #[test]
+    fn pomodoro_is_not_done_until_cycles_run_out() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 2, cycles: 1 });
+        assert!(!t.is_done());
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        t.tick_at(t0 + Duration::from_secs(1));
+        assert!(!t.is_done(), "刚结束一轮专注不该算收工");
+        assert!(t.running);
+    }
+
     #[test]
     fn pomodoro_reset_restarts_work_phase() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo_durations(600, 300);
+        t.set_pomo(&no_long_break(600, 300));
         t.start();
         t.secs = 100; // 模拟专注进行到一半
         t.reset();
@@ -322,6 +507,33 @@ mod tests {
         assert_eq!(t.secs, 600);
         assert_eq!(t.round, 0);
         assert!(!t.running);
+    }
+
+    /// 收工后重置要能把「已跑满」这格也清掉，否则开始键会被 is_done 挡回来。
+    #[test]
+    fn finished_pomodoro_restarts_from_a_clean_set() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 1, cycles: 1 });
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        // W1 → 长休息 1s（rounds=1）→ 收工
+        t.tick_at(t0 + Duration::from_secs(2));
+        assert!(t.is_done() && !t.running);
+        t.start();
+        assert!(t.running);
+        assert!(!t.is_done());
+        assert_eq!(t.phase, Phase::Work);
+        assert_eq!(t.secs, 1);
+    }
+
+    /// 时长下限取 1：为 0 会让阶段在同一个心跳里连着翻，一次发出好几个结束事件。
+    #[test]
+    fn pomo_zero_durations_are_clamped_to_one_second() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        t.set_pomo(&Pomo { work: 0, short_break: 0, long_break: 0, rounds: 0, cycles: 0 });
+        assert_eq!(t.secs, 1, "番茄钟总时长不该被置成 0");
+        assert_eq!(t.pomo_status(), ("WORK", 1), "rounds=0 该被当作 1");
     }
 
     #[test]

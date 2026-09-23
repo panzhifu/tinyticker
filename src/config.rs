@@ -9,10 +9,63 @@ use std::path::PathBuf;
 
 use crate::parse::parse_duration;
 use crate::render::{parse_color, rgb};
-use crate::timer::Mode;
+use crate::timer::{Mode, Pomo};
 use crate::tray::IconMode;
 
 const CONFIG_FILE: &str = "config.conf";
+
+/// 单段时长的上限：24 小时。再长更可能是写错了单位而不是有意为之。
+const MAX_SPAN: u32 = 86_400;
+
+/// 出厂时长预设（秒）。菜单标签由 [`preset_label`] 现算，不再手写。
+pub const DEFAULT_PRESETS: [u32; 6] = [60, 300, 900, 1500, 2700, 3600];
+
+/// 预设条数上限：菜单再长就该分页了，而我们不分页。
+const MAX_PRESETS: usize = 24;
+
+/// 番茄钟轮数与组数的上限，免得一个手滑配出几千轮。
+const MAX_ROUNDS: u32 = 100;
+
+/// `presets = 25m 45m 1h` → 秒数列表。
+///
+/// 逗号或空格分隔均可。任一段非法（解析不出、为 0、超过 24 小时）或总段数超限，
+/// 整条作废并回落到默认值——静默丢掉一项会让菜单悄悄少一格，更难查。
+/// 因为空格就是分隔符，带空格的写法（`"1h 30m"`）不能用作单段，写 `"1h30m"`。
+fn parse_preset_list(value: &str) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for token in value.split([',', ' ', '\t']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let secs = parse_duration(token).filter(|s| *s > 0 && *s <= MAX_SPAN)?;
+        out.push(secs);
+    }
+    (!out.is_empty() && out.len() <= MAX_PRESETS).then_some(out)
+}
+
+/// 番茄钟的时长键：越界（含 0，`long_break` / `cycles` 除外）返回 `None` 让调用方回落。
+fn parse_span(value: &str, min: u32) -> Option<u32> {
+    parse_duration(value).filter(|s| (min..=MAX_SPAN).contains(s))
+}
+
+/// 把秒数写成菜单上的中文时长。
+///
+/// 只念非零的位：`3600 → "1 小时"`、`5400 → "1 小时 30 分"`、`90 → "1 分 30 秒"`。
+pub fn preset_label(secs: u32) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    let mut parts = Vec::new();
+    if h > 0 {
+        parts.push(format!("{h} 小时"));
+    }
+    if m > 0 {
+        parts.push(format!("{m} 分"));
+    }
+    if s > 0 || parts.is_empty() {
+        parts.push(format!("{s} 秒"));
+    }
+    parts.join(" ")
+}
 
 /// 托盘「外观 → 配色」子菜单套用的一组四色。
 ///
@@ -71,12 +124,14 @@ pub struct Config {
     pub click_through: bool,
     /// 时钟挂件是否用 12 小时制（带 AM/PM）；false 为 24 小时制。
     pub clock_12h: bool,
-    /// 托盘图标显示什么：真实时表盘，或 CPU / 内存 / 电量的水位占用表。
+    /// 托盘图标显示什么：真实时表盘、CPU / 内存 / 电量的水位占用表，或动图。
     pub tray_icon: IconMode,
-    /// 番茄钟专注时长（秒）。
-    pub pomo_work: u32,
-    /// 番茄钟休息时长（秒）。
-    pub pomo_break: u32,
+    /// 动图图标的路径（`tray_icon = gif` 时才有意义）。支持开头的 `~/`。
+    pub tray_gif: Option<String>,
+    /// 番茄钟节奏（专注 / 短休 / 长休 / 每几轮一长休 / 跑几组）。
+    pub pomo: Pomo,
+    /// 托盘「时长预设」子菜单的档位（秒，按配置顺序），点击即重置并开始。
+    pub presets: Vec<u32>,
     /// 倒计时归零 / 番茄钟专注完成时执行的命令（经 `sh -c` 解释）。
     /// 例如锁屏 `loginctl lock-session`、关机 `systemctl poweroff`。
     pub on_finish: Option<String>,
@@ -101,13 +156,27 @@ impl Default for Config {
             click_through: false,
             clock_12h: false,
             tray_icon: IconMode::Clock,
-            pomo_work: 1500,
-            pomo_break: 300,
+            tray_gif: None,
+            pomo: Pomo::default(),
+            presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
             text_source: None,
             window_pos: None,
         }
     }
+}
+
+/// 展开配置里开头的 `~/`。std 不做这件事，而让用户在配置文件里写绝对路径太难看。
+/// 中间出现的 `~` 不展开；`HOME` 不在时原样返回。
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix("~/").or(if raw == "~" { Some("") } else { None }) else {
+        return PathBuf::from(raw);
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return PathBuf::from(raw);
+    };
+    if rest.is_empty() { PathBuf::from(home) } else { PathBuf::from(home).join(rest) }
 }
 
 /// 环境变量值只有是非空绝对路径时才算数：相对路径会让配置跟着当前工作目录漂移。
@@ -188,6 +257,11 @@ impl Config {
                         cfg.tray_icon = m;
                     }
                 }
+                "tray_gif" => {
+                    if !value.is_empty() {
+                        cfg.tray_gif = Some(value.to_string());
+                    }
+                }
                 "bg_alpha" => {
                     if let Ok(a) = value.parse::<u8>() {
                         cfg.bg_alpha = a;
@@ -211,14 +285,39 @@ impl Config {
                         cfg.clock_12h = on;
                     }
                 }
+                "presets" => {
+                    if let Some(list) = parse_preset_list(value) {
+                        cfg.presets = list;
+                    }
+                }
                 "pomo_work" => {
-                    if let Some(s) = parse_duration(value) {
-                        cfg.pomo_work = s;
+                    if let Some(s) = parse_span(value, 1) {
+                        cfg.pomo.work = s;
                     }
                 }
                 "pomo_break" => {
-                    if let Some(s) = parse_duration(value) {
-                        cfg.pomo_break = s;
+                    if let Some(s) = parse_span(value, 1) {
+                        cfg.pomo.short_break = s;
+                    }
+                }
+                "pomo_long_break" => {
+                    // 0 是合法值：不安排长休息
+                    if let Some(s) = parse_span(value, 0) {
+                        cfg.pomo.long_break = s;
+                    }
+                }
+                "pomo_rounds" => {
+                    // 一轮至少一轮
+                    if let Ok(n) = value.parse::<u32>()
+                        && (1..=MAX_ROUNDS).contains(&n)
+                    {
+                        cfg.pomo.rounds = n;
+                    }
+                }
+                "pomo_cycles" => {
+                    // 0 是合法值：不限组数，一直轮转
+                    if let Ok(n) = value.parse::<u32>() && n <= MAX_ROUNDS {
+                        cfg.pomo.cycles = n;
                     }
                 }
                 "on_finish" => {
@@ -255,14 +354,22 @@ impl Config {
     fn serialize(&self) -> String {
         let mut out = String::from("# tinyticker 配置（手动编辑后重启生效）\n");
         out.push_str(&format!("duration = {}\n", self.duration_secs));
+        let presets: Vec<String> = self.presets.iter().map(u32::to_string).collect();
+        out.push_str(&format!("presets = {}\n", presets.join(", ")));
         out.push_str(&format!("mode = {}\n", self.mode.name()));
         out.push_str(&format!("bg_alpha = {}\n", self.bg_alpha));
         out.push_str(&format!("zoom = {:.2}\n", self.zoom));
         out.push_str(&format!("click_through = {}\n", self.click_through));
         out.push_str(&format!("clock_12h = {}\n", self.clock_12h));
         out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
-        out.push_str(&format!("pomo_work = {}\n", self.pomo_work));
-        out.push_str(&format!("pomo_break = {}\n", self.pomo_break));
+        if let Some(path) = &self.tray_gif {
+            out.push_str(&format!("tray_gif = {path}\n"));
+        }
+        out.push_str(&format!("pomo_work = {}\n", self.pomo.work));
+        out.push_str(&format!("pomo_break = {}\n", self.pomo.short_break));
+        out.push_str(&format!("pomo_long_break = {}\n", self.pomo.long_break));
+        out.push_str(&format!("pomo_rounds = {}\n", self.pomo.rounds));
+        out.push_str(&format!("pomo_cycles = {}\n", self.pomo.cycles));
         if let Some(cmd) = &self.on_finish {
             out.push_str(&format!("on_finish = {cmd}\n"));
         }
@@ -297,9 +404,10 @@ mod tests {
             color_done: 0xAABBCC,
             bg_alpha: 120,
             zoom: 1.75,
-            tray_icon: IconMode::Battery,
-            pomo_work: 1800,
-            pomo_break: 600,
+            tray_icon: IconMode::Gif,
+            tray_gif: Some("~/pics/spin.gif".into()),
+            pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 },
+            presets: vec![90, 600, 5400],
             on_finish: Some("loginctl lock-session".into()),
             text_source: Some("~/tmp/tinyticker-out.txt".into()),
             window_pos: Some((-10, 200)),
@@ -313,6 +421,16 @@ mod tests {
     fn garbage_falls_back_to_defaults() {
         let cfg = Config::from_str("这不是配置\nfoo=bar\nduration=abc\ncolor_bg=zzz\n");
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn tilde_expansion_only_applies_at_the_front() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        assert_eq!(expand_tilde("~/x/y"), home.join("x/y"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("  ~/a  "), home.join("a"));
+        assert_eq!(expand_tilde("/tmp/~/a"), PathBuf::from("/tmp/~/a"));
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
     }
 
     #[test]
@@ -356,6 +474,91 @@ mod tests {
         assert_eq!(cfg.color_bg, 0x332211);
         assert_eq!(cfg.mode, Mode::Countdown);
         assert_eq!(cfg.window_pos, None); // 只有 x 没有 y → 不生效
+    }
+
+    /// 预设既认逗号也认空格；序列化后要能原样读回。
+    #[test]
+    fn presets_parse_both_separators_and_roundtrip() {
+        assert_eq!(Config::from_str("presets = 1m,5m,1h\n").presets, vec![60, 300, 3600]);
+        assert_eq!(Config::from_str("presets = 90 300\n").presets, vec![90, 300]);
+        let cfg = Config { presets: vec![90, 5400], ..Config::default() };
+        assert_eq!(Config::from_str(&cfg.serialize()).presets, cfg.presets);
+        // 出厂那几档必须原样写回，否则升级一次配置就把用户菜单换了
+        let d = Config::default();
+        assert_eq!(Config::from_str(&d.serialize()).presets, DEFAULT_PRESETS.to_vec());
+    }
+
+    /// 一段非法就整条作废：宁可回到默认 6 档，也不要一个悄悄少了一格的菜单。
+    #[test]
+    fn one_bad_preset_token_rejects_the_whole_line() {
+        let bad = [
+            "presets = 1m,abc\n", // 解析不出
+            "presets = 1m,0\n",   // 0 秒的预设没有意义
+            "presets = 1m,25h\n", // 超过 24 小时
+            "presets = ,,\n",     // 一段都不剩
+        ];
+        for line in bad {
+            assert_eq!(
+                Config::from_str(line).presets,
+                DEFAULT_PRESETS.to_vec(),
+                "非法预设没被整条拒绝: {line}"
+            );
+        }
+        // 条数超限同样整条作废
+        let too_many = format!("presets = {}\n", vec!["1m"; MAX_PRESETS + 1].join(","));
+        assert_eq!(Config::from_str(&too_many).presets, DEFAULT_PRESETS.to_vec());
+        assert_eq!(
+            Config::from_str(&format!("presets = {}\n", vec!["1m"; MAX_PRESETS].join(",")))
+                .presets
+                .len(),
+            MAX_PRESETS,
+            "刚好 24 段该收"
+        );
+    }
+
+    /// 空格是分隔符，所以 "1h 30m" 是两段而不是一小时半——连写请用 "1h30m"。
+    #[test]
+    fn spaces_split_presets_rather_than_compose() {
+        assert_eq!(Config::from_str("presets = 1h 30m\n").presets, vec![3600, 1800]);
+        assert_eq!(Config::from_str("presets = 1h30m\n").presets, vec![5400]);
+    }
+
+    #[test]
+    fn preset_label_reads_like_chinese() {
+        let cases = [
+            (45, "45 秒"),
+            (60, "1 分"),
+            (90, "1 分 30 秒"),
+            (300, "5 分"),
+            (1500, "25 分"),
+            (3600, "1 小时"),
+            (5400, "1 小时 30 分"),
+            (86_400, "24 小时"),
+        ];
+        for (secs, want) in cases {
+            assert_eq!(preset_label(secs), want, "{secs} 秒的标签不对");
+        }
+    }
+
+    /// 番茄钟默认值：4 轮一长休、不限组数——不限是为了保住旧版"永远轮转"的行为。
+    #[test]
+    fn pomo_defaults_keep_the_old_endless_behavior() {
+        let p = Pomo::default();
+        assert_eq!((p.work, p.short_break), (1500, 300));
+        assert_eq!((p.rounds, p.cycles, p.long_break), (4, 0, 900));
+        assert_eq!(Config::default().pomo, p);
+    }
+
+    #[test]
+    fn pomo_new_keys_parse_and_reject_out_of_range() {
+        let cfg = Config::from_str("pomo_long_break = 20m\npomo_rounds = 6\npomo_cycles = 2\n");
+        assert_eq!((cfg.pomo.long_break, cfg.pomo.rounds, cfg.pomo.cycles), (1200, 6, 2));
+        // long_break = 0 是"关闭"、cycles = 0 是"不限"，都得收
+        let off = Config::from_str("pomo_long_break = 0\npomo_cycles = 0\n");
+        assert_eq!((off.pomo.long_break, off.pomo.cycles), (0, 0));
+        // rounds = 0 会除零似地数不出组，超限和越界的时长一样都该拒
+        let bad = Config::from_str("pomo_rounds = 0\npomo_cycles = 101\npomo_long_break = 25h\n");
+        assert_eq!(bad.pomo, Pomo::default());
     }
 
     #[test]
