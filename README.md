@@ -1,10 +1,10 @@
 # TinyTicker
 
-极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，内置 8x8 位图字体，单二进制约 1 MB，无任何运行时字体或 UI 依赖。
+极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，内置 8x8 位图字体，单二进制 0.5 MB，零第三方 crate，无任何运行时字体或 UI 依赖。
 
-![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.4.1-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
+![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.5.0-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
 
-发布产物经 UPX 压缩（v0.4.1 实测）：**Wayland 版 0.38 MB**、通用版（Wayland + X11）0.50 MB。未压缩为 1.1 / 1.6 MB。
+未压缩体积：**Wayland 极小版 0.47 MB**、通用版（Wayland + X11）0.48 MB——X11 后端只多 9 KB。UPX 压缩后的发布产物体积待下次发版按 CI 实测更新（v0.4.1 为 0.38 / 0.50 MB）。
 
 ## 功能
 
@@ -14,6 +14,7 @@
   - **番茄钟**：专注 / 休息自动轮转并累计轮数，每阶段结束提醒
   - **时钟挂件**：实时显示本地时间，`HH:MM:SS` 或 12 小时制 `hh:mm:ss AM`
 - **无边框透明悬浮窗**：逐像素预乘 ARGB，`bg_alpha` 从 0（全透明，只剩文字）到 255（不透明）自由调节
+- **浮在全屏窗口之上**：Wayland 上走 layer-shell 的 overlay 层，网页视频全屏时依然可见（协议限制下这是唯一办法）；X11 走 `_NET_WM_STATE_ABOVE`
 - **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–3.0，自动持久化）
 - **时长输入**：相对时长 `25m` / `1h30m` / `90`，或**绝对时刻** `14:30`（已过则算明天）
 - **托盘控制**：开始 / 暂停 / 重置；「时长预设」二级菜单（1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）；四模式切换；退出
@@ -21,16 +22,48 @@
 - **配置持久化**：时长、模式、配色、透明度、缩放、番茄钟时长、结束命令、窗口位置，退出时自动写回
 - **走时不漂移**：以整数秒为基准推进，休眠恢复或高负载后自动补齐整秒
 
-## 构建
+## 安装
 
-依赖：Rust 1.88+（edition 2024 + let-chains），Linux。
+只发布 Linux x86_64。产物名带版本号（自 v0.5.0 起；更早的版本沿用不带版本的旧名），
+URL 不可变，可直接校验：
 
 ```sh
-cargo build --release                          # Wayland + X11 通用版（约 1.6 MB）
-cargo build --release --no-default-features    # 仅 Wayland 极小版（约 1.1 MB）
+TAG=v0.5.0                                   # 换成 Releases 页面里的版本
+BASE=https://github.com/panzhifu/tinyticker/releases/download/$TAG
+curl -fLO "$BASE/tinyticker-${TAG#v}-x86_64-unknown-linux-gnu"
+curl -fLO "$BASE/SHA256SUMS.txt"
+sha256sum -c --ignore-missing SHA256SUMS.txt
+install -Dm755 "tinyticker-${TAG#v}-x86_64-unknown-linux-gnu" ~/.local/bin/tinyticker
 ```
 
-也可直接从 [Releases](https://github.com/panzhifu/tinyticker/releases) 下载预编译二进制（UPX 压缩，约 0.6–0.8 MB），下载后 `chmod +x` 即可运行。打 tag 会自动触发构建与上传。
+上面是 **Wayland + X11 通用版**（拿不准就用它）。Wayland 会话还可以用更小的极小版，
+把文件名换成 `tinyticker-${TAG#v}-wayland-x86_64-unknown-linux-gnu`——它没有 X11 后端，
+X11 会话下无法运行。
+
+桌面集成（可选，让应用菜单能搜到、可开机自启）：
+
+```sh
+APP_ID=io.github.panzhifu.tinyticker
+for f in "$APP_ID.desktop" "$APP_ID.svg" "$APP_ID.metainfo.xml"; do curl -fLO "$BASE/$f"; done
+install -Dm644 "$APP_ID.desktop"      ~/.local/share/applications/"$APP_ID".desktop
+install -Dm644 "$APP_ID.svg"          ~/.local/share/icons/hicolor/scalable/apps/"$APP_ID".svg
+install -Dm644 "$APP_ID.metainfo.xml" ~/.local/share/metainfo/"$APP_ID".metainfo.xml
+mkdir -p ~/.config/autostart && cp "$APP_ID.desktop" ~/.config/autostart/   # 开机自启
+```
+
+系统级安装把 `~/.local` 换成 `/usr/local`（需 root）即可。校验和只保证「下载没被篡改」，
+产物尚未做发布签名，需要强信任链的话请自行 `cargo build --release`。
+
+## 构建
+
+依赖：Rust 1.88+（edition 2024 + let-chains），Linux。不需要任何 X11 / Wayland / D-Bus 的 `-dev` 包——三边都是运行时 `dlopen` 发行版自带的共享库。
+
+```sh
+cargo build --release                          # Wayland + X11 通用版（约 0.48 MB）
+cargo build --release --no-default-features    # 仅 Wayland 极小版（约 0.47 MB）
+```
+
+也可直接从 [Releases](https://github.com/panzhifu/tinyticker/releases) 下载预编译二进制（见上一节，UPX 压缩）。打 tag 会自动触发构建、校验和生成与上传。
 
 ## 用法
 
@@ -65,7 +98,14 @@ tinyticker -k           # 桌面时钟挂件
 
 ## 配置
 
-文件路径：`$XDG_CONFIG_HOME/tinyticker/config.conf`（默认 `~/.config/tinyticker/config.conf`），退出时自动写回，也可手动编辑后重启生效：
+配置文件退出时自动写回，也可手动编辑后重启生效：
+
+```
+$XDG_CONFIG_HOME/tinyticker/config.conf      # 该变量缺失或不是绝对路径时
+~/.config/tinyticker/config.conf             # 退回 $HOME/.config
+```
+
+实际解析出的路径可由 `tinyticker -h` 查看。本项目只做 Linux，不再为其它系统的目录惯例保留代码。
 
 ```ini
 duration = 1500        # 倒计时总时长（秒），支持 "25m" 写法
@@ -78,49 +118,60 @@ clock_12h = false      # 时钟挂件用 12 小时制（带 AM/PM）；false 为
 pomo_work = 1500       # 番茄钟专注时长（秒）
 pomo_break = 300       # 番茄钟休息时长（秒）
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）
+                       # 经 sh -c 解释，例如锁屏 loginctl lock-session、关机 systemctl poweroff
 color_bg = 0f0f14      # 背景色（#RRGGBB / 0xRRGGBB / RRGGBB 均可）
 color_running = ffffff # 运行中
 color_paused = ffc850  # 暂停
 color_done = 50dc78    # 结束
-window_x = 100         # 窗口位置（成对出现才生效；Wayland 忽略）
+window_x = 100         # 窗口位置（逻辑像素，成对出现才生效；layer-shell 与 X11 生效）
 window_y = 200
 ```
 
-透明实现：Wayland 走自研 ARGB8888 shm 呈现（softbuffer 的 Wayland 后端硬编码 XRGB，无透明能力）；X11 走 softbuffer + depth-32 visual 的 alpha 字节直通（需合成器，如 picom）。两后端统一预乘 alpha 像素格式。
+透明实现：两后端统一预乘 alpha 的 0xAARRGGBB 像素。Wayland 走自研 ARGB8888 shm 呈现（softbuffer 的 Wayland 后端硬编码 XRGB，无透明能力，所以不用它）；X11 走 depth-32 TrueColor visual + `XPutImage`，alpha 字节直通合成器（需合成器，如 picom / KCompositor / Xwayland）。
 
-> Wayland 下窗口无法自行置顶或定位（协议限制），需合成器规则配合。niri 示例：
-> ```kdl
-> window-rule {
->     match title="TinyTicker"
->     open-floating true
-> }
-> ```
+> Wayland 上挂件走 layer-shell 的 overlay 层，自行置顶与定位，**不需要任何合成器规则**。
 
 ## 项目结构
 
 ```
 src/
-├── main.rs    # 入口：CLI 解析、通道装配
-├── app.rs     # 悬浮窗口（winit 事件循环 + 绘制调度）
-├── surface.rs # 呈现后端抽象 + X11 softbuffer 实现
-├── wayland.rs # Wayland ARGB shm 呈现（透明能力）
-├── clock.rs   # 本地时间读取（libc localtime_r，避免引入 chrono）
+├── main.rs    # 入口：CLI 解析、通道装配、按会话挑选窗口路径
+├── wl.rs      # Wayland 客户端：直调 libwayland-client，layer-shell overlay 层
+│              #   自研 ARGB shm 双缓冲 + 拖动/滚轮/右键 + 事件循环
+├── sys/       # 系统 API 声明层（dlopen + FFI，无第三方 crate）
+│   ├── mod.rs     # dlopen / dlsym 封装
+│   ├── wayland.rs # libwayland-client 声明 + 手写扩展协议接口描述符
+│   ├── dbus.rs    # libdbus-1 声明（消息迭代器 / vtable / 总线与连接）
+│   └── x11.rs     # libX11 / libXext 声明（事件 union 与结构体逐字段照 Xlib.h）
+├── x11.rs     # X11 客户端：直调 libX11，override-redirect ARGB 窗口
+│              #   XPutImage 软渲染 + 拖动/滚轮/右键 + 点击穿透（libXext SHAPE），仅 `x11` feature
+├── widget.rs  # 与后端无关的挂件核心（计时推进、帧内容与布局）
+├── clock.rs   # 本地时间读取（自研 TZif + POSIX 规则解析，不依赖 C 库时区 API）
 ├── timer.rs   # 计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟），含走时补齐
 ├── render.rs  # 像素画布、8x8 字形渲染、时间格式化
 ├── config.rs  # 配置持久化（纯 std 文件 IO）
 ├── parse.rs   # 相对时长与绝对时刻解析
-├── tray.rs    # 托盘菜单 / 通知 / 程序化时钟图标
+├── tray.rs    # 自研托盘：StatusNotifierItem + dbusmenu 菜单 + 通知 + 程序化时钟图标
 └── font8x8.rs # 内置 ASCII 位图字体
+
+packaging/   # 随 release 发布的 freedesktop 资产
+├── io.github.panzhifu.tinyticker.desktop      # 应用菜单入口
+├── io.github.panzhifu.tinyticker.svg          # 图标（与托盘图标同款）
+└── io.github.panzhifu.tinyticker.metainfo.xml # AppStream 元数据
 ```
 
-技术栈：[winit](https://crates.io/crates/winit)（窗口）、[wayland-client](https://crates.io/crates/wayland-client)（Wayland 呈现）、[softbuffer](https://crates.io/crates/softbuffer)（X11 呈现）、[ldtray](https://crates.io/crates/ldtray)（托盘与通知）。
+技术栈：Wayland 侧不用任何 Rust GUI/协议库——`src/sys/wayland.rs` 声明 libwayland-client 的 C API 并在运行时 dlopen，扩展协议（layer-shell / viewporter / fractional-scale / relative-pointer / cursor-shape）的接口描述符按协议 XML 手写。托盘与通知同理：`src/sys/dbus.rs` 声明 libdbus-1 的 C API，`src/tray.rs` 自己实现 StatusNotifierItem + com.canonical.dbusmenu + 通知发送。因此 **Wayland 极小版零第三方 crate，`ldd` 只有 libc 与 libgcc_s**。
+
+X11 侧同理：`src/sys/x11.rs` 逐字段照 `Xlib.h` 镜像 ABI，`src/x11.rs` 自己建 override-redirect 的 depth-32 ARGB 窗口、`XPutImage` 软渲染、`XShapeCombineRectangles` 做点击穿透，拖动靠 `XGrabPointer` + 根坐标。因此**两种构建都零第三方 crate**（`Cargo.lock` 里只有 tinyticker 自己），实测只硬链 `libc` 与 `libgcc_s`，X11 / Wayland / D-Bus 全部运行时 dlopen。
 
 ## 已知限制
 
 - 内置字体仅 ASCII，不支持中文等非 ASCII 字符显示
 - 鼠标穿透为可选项：默认整窗接收输入（好拖动），开启 `click_through` 后只有文字可点——二者不可兼得
 - 无全局快捷键（Wayland 无统一协议）
-- Wayland 下置顶与窗口自定位依赖合成器规则
+- 依赖 layer-shell：合成器不提供该协议时（如 GNOME 裸机）直接报错退出，不再退回普通窗口——退回也没意义，全屏会被盖住
+- X11 侧的透明需要合成器（picom / KWin / Xwayland）；没有合成器时背景会显示成不透明黑底。缩放系数取 `Xft.dpi / 96`，X11 没有分数缩放协议
+- layer-shell 路径的挂件位置受合成器 reserved 区域影响：顶部面板（exclusive zone）会把它往下推
 
 ## 致谢与许可
 

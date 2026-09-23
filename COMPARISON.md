@@ -1,7 +1,7 @@
 # tinyticker vs Catime 功能对比
 
-> 更新日期：2026-09-09
-> tinyticker 版本：**0.4.1**（四模式 + 12/24h 时钟 + 点击穿透 + 透明背景 + CI 自动化）
+> 更新日期：2026-09-23
+> tinyticker 版本：**0.5.0**（零第三方依赖重写：自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟）
 > Catime 版本：v1.4.0（参考 [GitHub - vladelaina/Catime](https://github.com/vladelaina/Catime)）
 
 ## 一、定位概览
@@ -9,9 +9,9 @@
 | | tinyticker | Catime |
 |---|---|---|
 | 定位 | 极简悬浮计时器（自用 / 学习向） | 功能完整的轻量计时工具箱 |
-| 平台 | Linux（Wayland 优先，X11 可选编译；Windows/macOS 理论可移植，未验证） | 仅 Windows |
-| 语言 / 技术栈 | Rust + winit + 自研 Wayland ARGB shm（X11 用 softbuffer）+ ldtray | 纯 C + Win32 API + GDI |
-| 二进制体积 | 1.12 MB（Wayland 版）/ 1.57 MB（含 X11），0.4.1 实测 | 995 KB（32 位） |
+| 平台 | Linux（Wayland 优先，X11 可选编译）；目标就是只做 Linux，不做跨平台移植 | 仅 Windows |
+| 语言 / 技术栈 | Rust + 自研 Wayland 客户端（layer-shell + ARGB shm，直调 libwayland-client）+ 自研 X11 客户端（override-redirect ARGB，直调 libX11）+ 自研托盘（直调 libdbus） | 纯 C + Win32 API + GDI |
+| 二进制体积 | 0.47 MB（Wayland 版）/ 0.48 MB（含 X11），0.5.0 实测（未压缩，UPX 后更小） | 995 KB（32 位） |
 | 许可 | MIT | Apache-2.0 |
 
 ## 二、功能对比表
@@ -21,16 +21,16 @@
 | **计时模式** | | |
 | 倒计时 | ✅（默认 60 秒，可配置） | ✅ |
 | 正计时 / 秒表 | ✅（0.2.0，托盘或 `-s` 切换） | ✅ |
-| 时钟显示 | ✅（0.4.0 `-k` 时钟挂件；0.4.1 `clock_12h` 可选 12 小时制带 AM/PM） | ✅（12/24h） |
+| 时钟显示 | ✅（0.4.0 `-k` 时钟挂件；0.4.1 `clock_12h` 可选 12 小时制带 AM/PM；0.5.0 起本地时间走自研 TZif + POSIX 规则解析，不再调 C 库时区 API） | ✅（12/24h） |
 | 番茄钟 | ✅（0.4.0，专注/休息自动轮转 + 轮数显示，`pomo_work` / `pomo_break` 可配） | ✅ |
 | **窗口行为** | | |
 | 无边框悬浮窗 | ✅ | ✅ |
 | 半透明背景 | ✅（0.3.0，逐像素 alpha：Wayland 自研 ARGB shm 呈现，X11 走 depth-32 visual；`bg_alpha` 0-255 可调） | ✅ |
-| 置顶 | ✅（X11/Win/macOS；Wayland 需合成器规则） | ✅ |
+| 置顶 | ✅（Wayland 走 layer-shell overlay 层，全屏之上仍可见；X11 走 `_NET_WM_STATE_ABOVE`） | ✅ |
 | 拖动移动 | ✅（左键 drag_window） | ✅（编辑模式拖动） |
-| 窗口位置记忆 | ✅（0.2.0，退出保存、启动恢复；Wayland 忽略） | ✅ |
-| 滚轮缩放 | ✅（0.4.0，`zoom` 0.25-4.0，自动持久化） | ✅ |
-| 点击穿透 | ✅（0.4.0，`click_through` 开启后仅文字接收输入；Wayland 后端，X11 需 XShape 故不支持） | ❌ |
+| 窗口位置记忆 | ✅（0.2.0 退出保存、启动恢复；0.5.0 起 Wayland 的 layer-shell 路径也生效，坐标统一存逻辑像素） | ✅ |
+| 滚轮缩放 | ✅（0.4.0，`zoom` 0.5-3.0，自动持久化） | ✅ |
+| 点击穿透 | ✅（0.4.0，`click_through` 开启后仅文字接收输入；Wayland 走 input region，0.5.0 起 X11 也支持（直调 libXext 的 `XShapeCombineRectangles`）） | ❌ |
 | **视觉自定义** | | |
 | 颜色自定义 | ✅（0.2.0，配置文件设置背景 + 运行/暂停/结束三态色） | ✅ 15 种预设 + 调色板 + 实时预览 |
 | 字体 | 内置 8x8 位图字体（仅 ASCII，不支持中文显示） | 多款内置等宽字体 + 自定义字体 + 字体精简工具 |
@@ -54,13 +54,13 @@
 | 配置持久化 | ✅（0.2.0 起，纯 std 手写格式；0.4.0 扩展为时长/模式/颜色/透明度/缩放/番茄钟/结束命令/窗口位置） | ✅ INI 文件 |
 | 插件系统 | ❌ | ✅（output.txt 文件通信） |
 | 国际化 | 无 UI 文本 | ✅ 多语言 |
-| 安装分发 | 手动编译 | winget / GitHub Releases |
+| 安装分发 | GitHub Releases（版本化产物名 + SHA256SUMS + freedesktop 元数据）；AUR 待建 | winget / GitHub Releases |
 
 ## 三、tinyticker 的差异化优势
 
-1. **真正的跨平台潜力**：一份代码覆盖 Wayland/X11，切 feature 即可编 Windows/macOS；Catime 永远只有 Windows。
+1. **零第三方依赖**：Wayland / X11 / D-Bus 全部运行时 dlopen 系统库，协议客户端、托盘、时区读取都是自研；`Cargo.lock` 里只有本项目自己一个包，构建不需要任何 `-dev` 包。
 2. **内存安全的 Rust 实现**：无 C 的 UB/内存泄漏风险（Catime 的 commit 历史中有多个 security hardening 修复）。
-3. **体积同量级**：1.1 MB（UPX 后 ~0.6 MB）对比 995 KB，还是 64 位 + 三个平台后端可选。
+3. **体积同量级**：0.48 MB（含 X11 后端；UPX 后待 CI 实测）对比 995 KB，且是 64 位 + Wayland/X11 双后端。
 4. **现代构建链**：cargo 管理，无手工 Makefile / build.bat 差异。
 
 ## 四、roadmap 完成情况
@@ -71,13 +71,13 @@
 |---|---|---|
 | ★★★ 配置持久化 | ✅ 0.2.0 | `~/.config/tinyticker/config.conf`，纯 std 手写行式格式，保存时长/模式/颜色/窗口位置 |
 | ★★★ 相对时间输入 | ✅ 0.2.0 | CLI 参数（`tinyticker 25m` / `1h30m` / `90`），解析器含溢出校验 |
-| ★★★ 计时结束提醒 | ✅ 0.2.0 | ldtray `TrayHandle::notify`，归零时由主线程推送，通知带「再来一次」按钮 |
+| ★★★ 计时结束提醒 | ✅ 0.2.0 | 自研 `tray::notify` 直调 `org.freedesktop.Notifications.Notify`，归零时由主线程推送，通知带「再来一次」按钮（`ActionInvoked` 走消息过滤器） |
 | ★★☆ 快速预设 | ✅ 0.2.0 | 托盘「时长预设」二级菜单，1/5/15/25/45/60 分钟，点击即开始 |
 | ★★☆ 秒表 / 正计时模式 | ✅ 0.2.0 | `Timer` 状态机双模式，托盘或 `-s` 切换，显示 m:ss / h:mm:ss |
 | ★★☆ 自定义颜色 | ✅ 0.2.0 | 配置文件四色键（背景 + 三态数字色），支持 `#RRGGBB` 等写法 |
 | ★☆☆ 半透明背景 | ✅ 0.3.0 | 原估"+4 MB（换 wgpu）"不成立：softbuffer 的 Wayland 后端硬编码 XRGB 才是唯一障碍。自研 ~250 行 ARGB shm 呈现（复用其连接管线），X11 走 depth-32 visual，体积零增量；Wayland 真机验证通过 |
 | ★☆☆ 番茄钟 | ✅ 0.4.0 | `Phase::Work/Break` 自动轮转 + `round` 计数，阶段结束发通知并自动进入下一阶段；时长走 `pomo_work` / `pomo_break`。预设与通知的基建复用，实际成本低于预估 |
-| ★☆☆ 滚轮缩放 | ✅ 0.4.0 | wheel 事件改 `zoom`（0.25-4.0），`font_scale = round(scale_factor × zoom)` —— 只调字形与布局而非窗口尺寸，绕开了 DPI 映射的复杂度 |
+| ★☆☆ 滚轮缩放 | ✅ 0.4.0 | wheel 事件改 `zoom`（0.5-3.0），`font_scale = round(scale_factor × zoom)` 并把窗口请求到 `LOGICAL_SIZE × zoom` |
 | ★☆☆ 绝对时间输入 | ✅ 0.4.0 | `parse_absolute("14:30")` → 距现在秒数（已过按明天算），成本确如预估为低 |
 | ★☆☆ 自定义结束命令 | ✅ 0.4.0 | 原清单未列，作为"锁屏/关机"的通用替代：`on_finish` 配置任意 shell，一条路径覆盖多个场景 |
 
@@ -85,15 +85,15 @@
 
 | 优先级 | 功能 | 说明 | 预估成本 |
 |---|---|---|---|
-| ★☆☆ | 托盘动画 / 系统状态 | ldtray 支持 set_icon，GIF 解码需引库 | 中高 |
+| ★☆☆ | 托盘动画 / 系统状态 | SNI 的 IconPixmap 本就逐帧可换，GIF 解码需引库 | 中高 |
 | ★☆☆ | 全局快捷键 | 需按桌面环境接入（KDE/Wayland 无统一协议） | 中高 |
 | ★☆☆ | 中文等非 ASCII 显示 | 内置 8x8 字体仅 ASCII，需内嵌 CJK 点阵（体积代价大） | 高 |
 
 ## 五、结论
 
 - **Catime**：功能密度极高的"成品工具箱"，适合直接日用（但仅 Windows）。
-- **tinyticker**：0.4.1 已是**可日用的完整计时器**——四模式（倒计时/秒表/番茄钟/时钟）、托盘预设、通知 + 自定义结束命令、配置持久化、透明背景、滚轮缩放、点击穿透齐备；与 Catime 的差距收窄到全局快捷键、非 ASCII（中文）字体显示两项（点击穿透反而领先 Catime），核心体验（悬浮 + 计时 + 提醒 + 记忆 + 透明）在 Linux 上完整。
+- **tinyticker**：0.5.0 已是**可日用的完整计时器**——四模式（倒计时/秒表/番茄钟/时钟）、托盘预设、通知 + 自定义结束命令、配置持久化、透明背景、滚轮缩放、点击穿透齐备；与 Catime 的差距收窄到全局快捷键、非 ASCII（中文）字体显示两项（点击穿透反而领先 Catime），核心体验（悬浮 + 计时 + 提醒 + 记忆 + 透明）在 Linux 上完整。
 
-差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透（后者为 Catime 所无）。
+差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透（后者为 Catime 所无），0.5.0 补上 Wayland 置顶与自定位（不再需要合成器规则）。
 
-> 体积验证：0.4.1 全部功能落地后，Wayland 版 1.12 MB / 含 X11 版 1.57 MB，与 0.3.0 基本持平（纯逻辑代码 + libc 的 `localtime_r`，未引入新依赖）。
+> 体积验证：Wayland 极小版 0.47 MB / 含 X11 通用版 0.48 MB（未压缩）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。
