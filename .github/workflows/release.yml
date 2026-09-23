@@ -44,9 +44,10 @@ jobs:
 
       # freedesktop 元数据随 release 一起出，打包者不必 clone 仓库
       - name: 收集桌面资产
-        run: cp packaging/io.github.panzhifu.tinyticker.desktop \
-                packaging/io.github.panzhifu.tinyticker.svg \
-                packaging/io.github.panzhifu.tinyticker.metainfo.xml .
+        run: |
+          cp packaging/io.github.panzhifu.tinyticker.desktop \
+             packaging/io.github.panzhifu.tinyticker.svg \
+             packaging/io.github.panzhifu.tinyticker.metainfo.xml .
 
       - name: 生成校验和
         run: |
