@@ -7,6 +7,7 @@
 //! - `sys`     系统 API 声明层（dlopen + FFI，无第三方 crate）
 //! - `clock`   本地时间读取（时钟挂件模式）
 //! - `sysinfo` 系统状态采样（CPU / 内存 / 电量，读 /proc 与 /sys）
+//! - `textsrc` 外部文本源（别的进程写的文件，显示在状态行上）
 //! - `timer`   计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟）
 //! - `render`  像素绘制与时间格式化
 //! - `config`  配置持久化
@@ -21,6 +22,7 @@ mod parse;
 mod render;
 mod sys;
 mod sysinfo;
+mod textsrc;
 mod timer;
 mod tray;
 mod widget;

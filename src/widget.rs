@@ -11,6 +11,7 @@ use crate::tray::TrayHandle;
 use crate::clock;
 use crate::config::{Config, PALETTES};
 use crate::render::{self, premultiply, Canvas};
+use crate::textsrc;
 use crate::timer::{Finished, Mode, Phase, Timer};
 use crate::tray::{self, Command};
 
@@ -23,6 +24,12 @@ pub const LOGICAL_SIZE: (u32, u32) = (200, 100);
 /// 一次眨眼内响应，又把空转开销降到 1/6。真正的省电靠 [`Widget::build_frame`]
 /// 的脏检查——内容没变时连 shm 都不提交。
 pub const DRAW_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 状态行在当前宽度下能放下多少个字符（8px 字形 × `scale`）。
+/// 外部文本可能很长，不截断的话居中的起点会被压到 0，右边直接被裁掉。
+fn status_budget(width: u32, scale: u32) -> usize {
+    (width as usize / (8 * scale.max(1)) as usize).max(1)
+}
 
 /// 一帧的完整内容与布局（buffer 物理像素坐标）。
 pub struct Frame {
@@ -80,6 +87,8 @@ pub struct Widget {
     /// 滚轮缩放倍数（0.5-3.0，持久化）。
     pub zoom: f32,
     tray: Option<TrayHandle>,
+    /// 外部文本源：配了 `text_source` 才碰文件系统
+    text_src: textsrc::Source,
     /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号）。
     last_frame: Option<(String, String, u32, u32, u32)>,
 }
@@ -87,6 +96,8 @@ pub struct Widget {
 impl Widget {
     pub fn new(config: Config, autostart: bool) -> Self {
         let zoom = config.zoom;
+        // 趁 config 还没进结构体先把路径取走
+        let text_src = textsrc::Source::new(config.text_source.as_deref());
         let mut timer = Timer::new(config.mode, config.duration_secs);
         timer.set_pomo_durations(config.pomo_work, config.pomo_break);
         if autostart {
@@ -97,6 +108,7 @@ impl Widget {
             timer,
             zoom,
             tray: None,
+            text_src,
             last_frame: None,
         }
     }
@@ -162,6 +174,7 @@ impl Widget {
 
     /// 推进计时，并处理本次产生的结束事件（通知 + on_finish 命令）。
     pub fn tick(&mut self) {
+        self.text_src.refresh();
         self.timer.maybe_tick();
         let Some(ev) = self.timer.take_finished() else {
             return;
@@ -227,6 +240,11 @@ impl Widget {
             _ if self.timer.is_done() => premultiply(self.config.color_done, 0xFF),
             _ if self.timer.running => premultiply(self.config.color_running, 0xFF),
             _ => premultiply(self.config.color_paused, 0xFF),
+        };
+        // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态
+        let status = match self.text_src.text() {
+            Some(external) => external.chars().take(status_budget(width, scale)).collect(),
+            None => status,
         };
         let status_color = premultiply(0xA0A0AA, 0xFF);
         // 时钟模式实时读取本地时间；其余模式显示计时秒数

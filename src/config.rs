@@ -80,6 +80,9 @@ pub struct Config {
     /// 倒计时归零 / 番茄钟专注完成时执行的命令（经 `sh -c` 解释）。
     /// 例如锁屏 `loginctl lock-session`、关机 `systemctl poweroff`。
     pub on_finish: Option<String>,
+    /// 外部文本源文件（可选）。非空时它的第一行会顶替状态行内容；
+    /// 支持开头的 `~/`。文件缺失/为空/超限时状态行回到挂件自己的内容。
+    pub text_source: Option<String>,
     /// 上次退出时的窗口位置（逻辑像素）：layer-shell 的 margin 与 X11 的窗口坐标。
     pub window_pos: Option<(i32, i32)>,
 }
@@ -101,6 +104,7 @@ impl Default for Config {
             pomo_work: 1500,
             pomo_break: 300,
             on_finish: None,
+            text_source: None,
             window_pos: None,
         }
     }
@@ -222,6 +226,11 @@ impl Config {
                         cfg.on_finish = Some(value.to_string());
                     }
                 }
+                "text_source" => {
+                    if !value.is_empty() {
+                        cfg.text_source = Some(value.to_string());
+                    }
+                }
                 "color_bg" | "color_running" | "color_paused" | "color_done" => {
                     if let Some(c) = parse_color(value) {
                         match key {
@@ -257,6 +266,9 @@ impl Config {
         if let Some(cmd) = &self.on_finish {
             out.push_str(&format!("on_finish = {cmd}\n"));
         }
+        if let Some(path) = &self.text_source {
+            out.push_str(&format!("text_source = {path}\n"));
+        }
         for (key, color) in [
             ("color_bg", self.color_bg),
             ("color_running", self.color_running),
@@ -289,6 +301,7 @@ mod tests {
             pomo_work: 1800,
             pomo_break: 600,
             on_finish: Some("loginctl lock-session".into()),
+            text_source: Some("~/tmp/tinyticker-out.txt".into()),
             window_pos: Some((-10, 200)),
             ..Config::default()
         };
