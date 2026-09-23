@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{ALPHA_STEPS, PALETTES};
+use crate::config::{ALPHA_STEPS, Config, PALETTES};
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::sysinfo;
@@ -45,6 +45,8 @@ pub enum Command {
     SetAlpha(u8),
     /// 套用 `config::PALETTES` 的第 i 套配色。
     SetPalette(usize),
+    /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
+    SetIcon(IconMode),
     Quit,
 }
 
@@ -124,6 +126,81 @@ struct Node {
     children: Vec<i32>,
 }
 
+impl Command {
+    /// 这一项在单选组里的选中判据；非单选项返回 `None`。
+    ///
+    /// 从命令本身推导而不是另存一份字段，加按钮时不可能忘记登记，也不会接错线。
+    fn check(self) -> Option<Check> {
+        match self {
+            Command::SetMode(m) => Some(Check::Mode(m)),
+            Command::SetAlpha(a) => Some(Check::Alpha(a)),
+            Command::SetPalette(i) => Some(Check::Palette(i)),
+            Command::SetIcon(m) => Some(Check::Icon(m)),
+            _ => None,
+        }
+    }
+}
+
+/// `checked` 取自托盘自持状态的哪一格。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Check {
+    Mode(Mode),
+    Alpha(u8),
+    Palette(usize),
+    Icon(IconMode),
+}
+
+/// 托盘自己维护的一份显示状态。
+///
+/// 菜单要显示「当前选中的是哪一项」，而这几项只有托盘会改（初值来自配置），
+/// 所以在发出命令的同时就地镜像一份，省掉主窗口 → 托盘的反向通道。
+struct State {
+    mode: Mode,
+    alpha: u8,
+    /// 配置里的四色恰好等于某套预设时才是 `Some`；用户手改过颜色就是 `None`
+    palette: Option<usize>,
+    icon: IconMode,
+}
+
+impl State {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            mode: cfg.mode,
+            alpha: cfg.bg_alpha,
+            palette: PALETTES.iter().position(|p| {
+                p.bg == cfg.color_bg
+                    && p.running == cfg.color_running
+                    && p.paused == cfg.color_paused
+                    && p.done == cfg.color_done
+            }),
+            icon: cfg.tray_icon,
+        }
+    }
+
+    fn checked(&self, c: Check) -> bool {
+        match c {
+            Check::Mode(m) => self.mode == m,
+            Check::Alpha(a) => self.alpha == a,
+            Check::Palette(i) => self.palette == Some(i),
+            Check::Icon(m) => self.icon == m,
+        }
+    }
+
+    /// 发出命令后同步镜像。只有会影响 `checked` 的命令在此登记，其余忽略。
+    fn note(&mut self, cmd: Command) {
+        match cmd {
+            Command::SetMode(m) => self.mode = m,
+            Command::SetAlpha(a) => {
+                self.alpha = a;
+                // 透明度不改变配色，但自定义过的配色不该再算命中任何预设
+            }
+            Command::SetPalette(i) => self.palette = Some(i),
+            Command::SetIcon(m) => self.icon = m,
+            _ => {}
+        }
+    }
+}
+
 /// 一条待发的通知。
 struct Note {
     body: String,
@@ -137,6 +214,8 @@ struct Server {
     nodes: Vec<Node>,
     /// 32x32 图标的 ARGB32 网络字节序像素
     pixmap: Vec<u8>,
+    /// 菜单 `checked` 与图标内容的依据。只在托盘线程上读写，`RefCell` 足够。
+    state: std::cell::RefCell<State>,
 }
 
 /// 往节点表追加一个节点并登记为根菜单的一项，返回它的 id。
@@ -201,13 +280,16 @@ fn build_nodes() -> Vec<Node> {
         n.push(button(label, Command::SetMode(mode)));
         n[modes as usize].children.push(id);
     }
-    // 外观：透明度与配色各一个二级子菜单
+    // 外观：透明度 / 配色 / 图标内容，各一个二级子菜单
     let alpha = n.len() as i32;
     n.push(submenu("背景透明度"));
     n[look as usize].children.push(alpha);
     let palette = n.len() as i32;
     n.push(submenu("配色预设"));
     n[look as usize].children.push(palette);
+    let icon = n.len() as i32;
+    n.push(submenu("图标内容"));
+    n[look as usize].children.push(icon);
     for (label, value) in ALPHA_STEPS {
         let id = n.len() as i32;
         n.push(button(label, Command::SetAlpha(value)));
@@ -217,6 +299,16 @@ fn build_nodes() -> Vec<Node> {
         let id = n.len() as i32;
         n.push(button(p.name, Command::SetPalette(i)));
         n[palette as usize].children.push(id);
+    }
+    for (label, m) in [
+        ("🕐 时钟表盘", IconMode::Clock),
+        ("CPU 占用", IconMode::Cpu),
+        ("内存占用", IconMode::Memory),
+        ("电池电量", IconMode::Battery),
+    ] {
+        let id = n.len() as i32;
+        n.push(button(label, Command::SetIcon(m)));
+        n[icon as usize].children.push(id);
     }
     // 根节点的子项顺序即菜单顺序
     n[0].children = root;
@@ -364,10 +456,13 @@ pub struct TrayHandle {
 }
 
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
-pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, icon: IconMode) {
+///
+/// 配置只用来给菜单的勾选态和图标内容取初值，之后托盘自己镜像菜单点击的结果。
+pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Config) {
+    let state = State::from_config(cfg);
     thread::spawn(move || {
         let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
-        match run(cmd_tx, note_rx, handle_tx, note_tx, icon) {
+        match run(cmd_tx, note_rx, handle_tx, note_tx, state) {
             Ok(()) => {}
             Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
         }
@@ -389,7 +484,7 @@ fn run(
     note_rx: Receiver<Note>,
     handle_tx: Sender<TrayHandle>,
     note_tx: Sender<Note>,
-    icon: IconMode,
+    state: State,
 ) -> Result<(), String> {
     let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
     let mut err = DBusError::zeroed();
@@ -398,12 +493,13 @@ fn run(
         return Err(format!("连不上会话总线: {}", err.describe()));
     }
     let mut sampler = sysinfo::Sampler::new();
-    let (_, _, pixmap) = icon_pixmap(icon, &sampler.sample(), crate::clock::now_hms());
+    let (_, _, pixmap) = icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms());
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
         nodes: build_nodes(),
         pixmap,
+        state: std::cell::RefCell::new(state),
     }));
 
     // 导出两个对象路径
@@ -447,7 +543,9 @@ fn run(
         }
         if icon_at.elapsed() >= ICON_EVERY {
             icon_at = Instant::now();
-            let (_, _, px) = icon_pixmap(icon, &sampler.sample(), crate::clock::now_hms());
+            // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
+            let mode = unsafe { (*server).state.borrow().icon };
+            let (_, _, px) = icon_pixmap(mode, &sampler.sample(), crate::clock::now_hms());
             // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
             let changed = unsafe {
                 let server = &mut *server;
@@ -641,6 +739,8 @@ unsafe extern "C" fn on_message(
             if let Some(id) = read_event(dbus, args)
                 && let Some(cmd) = server.nodes.get(id as usize).and_then(|n| n.command)
             {
+                // 先镜像再转发：菜单的 checked 读的是这一份，不能等主窗口回话
+                server.state.borrow_mut().note(cmd);
                 let _ = server.cmd_tx.send(cmd);
             }
             reply(dbus, conn, msg, |_, _| {})
@@ -843,6 +943,12 @@ unsafe fn write_props_all(dbus: &DBus, it: *mut DBusMessageIter, server: &Server
 /// 菜单节点属性写进一个 `a{sv}`。
 /// 把一个节点的属性写成 `a{sv}`。**这个数组必须始终写出来**（未知 id 就写空的）：
 /// 外层签名是 `(ia{sv})` / `(ia{sv}av)`，少写一项会让 libdbus 断言失败直接 abort。
+/// dbusmenu 节点属性的值：字符串或布尔。
+enum Prop<'a> {
+    Str(&'a str),
+    Bool(bool),
+}
+
 unsafe fn write_node_props(dbus: &DBus, it: *mut DBusMessageIter, server: &Server, id: i32) {
     let mut arr = match open(dbus, it, d::T_ARRAY, Some(c"{sv}")) {
         Some(a) => a,
@@ -855,22 +961,35 @@ unsafe fn write_node_props(dbus: &DBus, it: *mut DBusMessageIter, server: &Serve
             return;
         }
     };
-    // 值为 `None` 表示布尔 true（dbusmenu 只用到 enabled=true 这一种）
-    let entries: &[(&str, Option<&str>)] = match node.kind {
-        Kind::Separator => &[("type", Some("separator"))],
-        Kind::Root => &[("children-display", Some("compound"))],
-        Kind::Submenu => &[("label", Some(&node.label)), ("children-display", Some("submenu"))],
-        Kind::Button => &[("label", Some(&node.label)), ("enabled", None)],
+    let entries: Vec<(&str, Prop)> = match node.kind {
+        Kind::Separator => vec![("type", Prop::Str("separator"))],
+        Kind::Root => vec![("children-display", Prop::Str("compound"))],
+        Kind::Submenu => vec![
+            ("label", Prop::Str(&node.label)),
+            ("children-display", Prop::Str("submenu")),
+        ],
+        Kind::Button => match node.command.and_then(Command::check) {
+            // 单选组：把当前状态回灌成勾选，菜单才看得出「现在用的是哪一套」
+            Some(c) => vec![
+                ("label", Prop::Str(&node.label)),
+                ("enabled", Prop::Bool(true)),
+                ("checked", Prop::Bool(server.state.borrow().checked(c))),
+            ],
+            None => vec![
+                ("label", Prop::Str(&node.label)),
+                ("enabled", Prop::Bool(true)),
+            ],
+        },
     };
-    for (key, text) in entries {
+    for (key, value) in &entries {
         let mut de = match open(dbus, &mut arr, d::T_DICT_ENTRY, None) {
             Some(x) => x,
             None => return,
         };
         put_str(dbus, &mut de, key);
-        match text {
-            Some(text) => variant_str(dbus, &mut de, text),
-            None => variant_bool(dbus, &mut de, true),
+        match value {
+            Prop::Str(text) => variant_str(dbus, &mut de, text),
+            Prop::Bool(flag) => variant_bool(dbus, &mut de, *flag),
         }
         close(dbus, &mut arr, &mut de);
     }
@@ -1255,24 +1374,98 @@ mod tests {
     fn appearance_submenu_reaches_every_preset() {
         let n = build_nodes();
         let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
-        assert_eq!(look.children.len(), 2, "外观下应当是 透明度 + 配色 两个子菜单");
-        let kids = |parent: i32| -> Vec<Option<Command>> {
+        assert_eq!(look.children.len(), 3, "外观下应是 透明度 + 配色 + 图标 三个子菜单");
+        let acts = |parent: i32| -> Vec<Option<Command>> {
             n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
         };
-        let (alpha_id, palette_id) = (look.children[0], look.children[1]);
+        let (alpha_id, palette_id, icon_id) =
+            (look.children[0], look.children[1], look.children[2]);
         assert_eq!(n[alpha_id as usize].label, "背景透明度");
         assert_eq!(n[palette_id as usize].label, "配色预设");
+        assert_eq!(n[icon_id as usize].label, "图标内容");
 
-        let alpha = kids(alpha_id);
+        let alpha = acts(alpha_id);
         assert_eq!(alpha.len(), ALPHA_STEPS.len());
-        for (k, cmd) in alpha.iter().enumerate() {
-            assert_eq!(*cmd, Some(Command::SetAlpha(ALPHA_STEPS[k].1)), "第 {k} 档透明度接错");
+        for (k, act) in alpha.iter().enumerate() {
+            assert_eq!(
+                *act,
+                Some(Command::SetAlpha(ALPHA_STEPS[k].1)),
+                "第 {k} 档透明度接错"
+            );
         }
-        let palette = kids(palette_id);
+        let palette = acts(palette_id);
         assert_eq!(palette.len(), PALETTES.len());
         for (k, id) in n[palette_id as usize].children.iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetPalette(k)));
             assert_eq!(n[*id as usize].label, PALETTES[k].name, "菜单标签与预设对不上");
         }
+        let icons = acts(icon_id);
+        assert_eq!(icons.len(), 4);
+        for (k, id) in n[icon_id as usize].children.iter().enumerate() {
+            let expect = [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery][k];
+            assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect)));
+        }
+    }
+
+    /// 只有单选组该带勾选；动作按钮（开始/暂停/退出/时长预设）不该画成圆点。
+    #[test]
+    fn only_radio_items_are_checkable() {
+        let n = build_nodes();
+        for node in &n {
+            let Some(cmd) = node.command else { continue };
+            let checkable = cmd.check().is_some();
+            let in_radio = matches!(
+                cmd,
+                Command::SetMode(_) | Command::SetAlpha(_) | Command::SetPalette(_) | Command::SetIcon(_)
+            );
+            assert_eq!(checkable, in_radio, "{} 的勾选属性推错了", node.label);
+        }
+    }
+
+    #[test]
+    fn checked_state_mirrors_menu_clicks() {
+        let cfg = Config { mode: Mode::Countdown, bg_alpha: 96, ..Config::default() };
+        let mut s = State::from_config(&cfg);
+        assert!(s.checked(Check::Mode(Mode::Countdown)));
+        assert!(!s.checked(Check::Mode(Mode::Pomodoro)));
+        assert!(s.checked(Check::Alpha(96)));
+        assert!(s.checked(Check::Icon(IconMode::Clock)));
+
+        s.note(Command::SetMode(Mode::Pomodoro));
+        assert!(s.checked(Check::Mode(Mode::Pomodoro)));
+        assert!(!s.checked(Check::Mode(Mode::Countdown)), "旧的那项必须取消勾选");
+
+        s.note(Command::SetAlpha(0));
+        assert!(s.checked(Check::Alpha(0)) && !s.checked(Check::Alpha(96)));
+
+        // 时长预设之类不影响任何勾选，别把它们误登记进去
+        s.note(Command::Preset(600));
+        s.note(Command::Start);
+        assert!(s.checked(Check::Mode(Mode::Pomodoro)));
+    }
+
+    /// 配色勾选只有在四色与某套预设完全一致时才算命中；用户手改过就一项都不勾。
+    #[test]
+    fn palette_matches_only_when_all_four_colors_agree() {
+        let p = &PALETTES[2];
+        let cfg = Config {
+            color_bg: p.bg,
+            color_running: p.running,
+            color_paused: p.paused,
+            color_done: p.done,
+            ..Config::default()
+        };
+        assert_eq!(State::from_config(&cfg).palette, Some(2));
+
+        let off = Config { color_done: 0x123456, ..cfg };
+        assert_eq!(State::from_config(&off).palette, None);
+        let st = State::from_config(&off);
+        for i in 0..PALETTES.len() {
+            assert!(!st.checked(Check::Palette(i)), "自定义配色不该勾中第 {i} 套");
+        }
+        // 点一次预设就重新有得勾
+        let mut st = st;
+        st.note(Command::SetPalette(4));
+        assert!(st.checked(Check::Palette(4)) && !st.checked(Check::Palette(2)));
     }
 }

@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - handle_tx: 托盘线程就绪后把 TrayHandle 发给主窗口（发通知用）
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (handle_tx, handle_rx) = mpsc::channel();
-    tray::spawn(cmd_tx, handle_tx, config.tray_icon);
+    tray::spawn(cmd_tx, handle_tx, &config);
 
     run_backend(&cmd_rx, &handle_rx, config, autostart)
 }

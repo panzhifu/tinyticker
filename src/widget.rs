@@ -133,6 +133,12 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::SetIcon(mode) => {
+                if self.config.tray_icon != mode {
+                    self.config.tray_icon = mode;
+                    self.persist_appearance();
+                }
+            }
             Command::SetPalette(i) => {
                 if let Some(p) = PALETTES.get(i) {
                     self.config.color_bg = p.bg;
