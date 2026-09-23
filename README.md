@@ -17,6 +17,7 @@
 - **浮在全屏窗口之上**：Wayland 上走 layer-shell 的 overlay 层，网页视频全屏时依然可见（协议限制下这是唯一办法）；X11 走 `_NET_WM_STATE_ABOVE`
 - **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–3.0，自动持久化）；**在托盘图标上滚动同样缩放**（SNI `Scroll`，挂件太小或开着点击穿透时更顺手）
 - **外观即时可调**：托盘「外观」子菜单——5 档背景透明度 + 6 套配色预设 + 4 种图标内容，点击立刻生效并写回配置，不必重启；菜单带勾选，看得出当前用的是哪一项
+- **外部文本源**：`text_source` 指向一个由别的进程写的文件，它的第一行顶替状态行（编译进度、下载百分比之类）。靠 `(大小, mtime)` 判断要不要重读，超过 64 KB 直接不采信，文件缺失或清空就交还状态行。**只读不执行**——不像 Catime 那样替你启动插件脚本，生产者得自己跑
 - **时长输入**：相对时长 `25m` / `1h30m` / `90`，或**绝对时刻** `14:30`（已过则算明天）
 - **托盘控制**：**左键开始/暂停、中键重置**，右键打开完整菜单——时长预设（1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）、四模式切换、外观、退出
 - **托盘图标会走**：`tray_icon` 选真实时表盘（指针按本地时间摆），或 CPU / 内存 / 电量的水位占用表——读 `/proc/stat`、`/proc/meminfo`、`/sys/class/power_supply`，每秒重绘并发 `NewIcon`
@@ -131,6 +132,8 @@ pomo_work = 1500       # 番茄钟专注时长（秒）
 pomo_break = 300       # 番茄钟休息时长（秒）
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）
                        # 经 sh -c 解释，例如锁屏 loginctl lock-session、关机 systemctl poweroff
+text_source = ~/tmp/build.out       # 外部文本源（可选）：第一行顶替状态行，支持开头的 ~/
+                       # 只能显示 ASCII（内置 8x8 字体），非 ASCII 字符会留空位
 color_bg = 0f0f14      # 背景色（#RRGGBB / 0xRRGGBB / RRGGBB 均可）
 color_running = ffffff # 运行中
 color_paused = ffc850  # 暂停
@@ -160,6 +163,7 @@ src/
 ├── widget.rs  # 与后端无关的挂件核心（计时推进、帧内容与布局）
 ├── clock.rs   # 本地时间读取（自研 TZif + POSIX 规则解析，不依赖 C 库时区 API）
 ├── sysinfo.rs # 系统状态采样（CPU 差分 / MemAvailable / 电量），只读 /proc 与 /sys
+├── textsrc.rs # 外部文本源：读一个文件的第一行顶替状态行，带大小上限与变化检测
 ├── timer.rs   # 计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟），含走时补齐
 ├── render.rs  # 像素画布、8x8 字形渲染、时间格式化
 ├── config.rs  # 配置持久化（纯 std 文件 IO）
