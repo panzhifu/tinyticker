@@ -64,6 +64,14 @@ pub fn parse_absolute(input: &str) -> Option<(u32, u32, u32)> {
     Some((h, m, s))
 }
 
+/// 绝对时刻距 `now` 还有多少秒，两者都是 `(h, m, s)`；已过则视为明天同一时刻。
+pub fn secs_until(target: (u32, u32, u32), now: (u32, u32, u32)) -> u32 {
+    let at = |t: (u32, u32, u32)| t.0 * 3600 + t.1 * 60 + t.2;
+    let diff = (86_400 + at(target) - at(now)) % 86_400;
+    // 正好等于此刻按一整天算：0 秒的倒计时没有意义
+    if diff == 0 { 86_400 } else { diff }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +130,15 @@ mod tests {
         assert_eq!(parse_absolute("14:30:45:00"), None);
         assert_eq!(parse_absolute("14:3o"), None);
         assert_eq!(parse_absolute(""), None);
+    }
+
+    #[test]
+    fn secs_until_wraps_to_tomorrow() {
+        assert_eq!(secs_until((14, 30, 0), (10, 0, 0)), 16_200);
+        // 已过 → 明天同一时刻
+        assert_eq!(secs_until((1, 0, 0), (23, 0, 0)), 7_200);
+        // 正好此刻按一整天算
+        assert_eq!(secs_until((12, 0, 0), (12, 0, 0)), 86_400);
+        assert_eq!(secs_until((0, 0, 0), (0, 0, 10)), 86_390);
     }
 }

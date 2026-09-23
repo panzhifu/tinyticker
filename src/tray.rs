@@ -1,15 +1,27 @@
-//! 系统托盘：菜单控制、快速预设、计时结束通知。
+//! 系统托盘与桌面通知：直调 libdbus 实现 StatusNotifierItem + com.canonical.dbusmenu。
 //!
-//! 在独立线程运行；托盘不可用（如无 StatusNotifierItem 宿主）时只打印
-//! 警告，不影响悬浮窗口。
+//! 不依赖任何 Rust 托盘库：dlopen `libdbus-1.so.3`，导出
+//! - `/StatusNotifierItem`（`org.kde.StatusNotifierItem`）：属性里 `IconPixmap` 直接
+//!   带 32x32 位图（ARGB32 网络字节序），因此不需要任何图标文件；`Menu` 指向
+//! - `/MenuBar`（`com.canonical.dbusmenu`）：宿主拉取菜单布局，点击回 `Event`
+//!
+//! 通知走 `org.freedesktop.Notifications.Notify`，并用消息过滤器接
+//! `ActionInvoked` 信号来实现通知上的按钮。
+//!
+//! 整条链路跑在独立线程上；托盘不可用（没有 StatusNotifierWatcher，或没有 libdbus）
+//! 时只打印警告，不影响悬浮窗口。
 
-use std::sync::mpsc::Sender;
+// 本模块几乎每个函数体都是逐条 libdbus 调用；按 C 的习惯，`unsafe fn` 本身就声明了
+// 调用前置条件（消息/迭代器非空且属于当前派发），再给上百处调用点逐个套 unsafe 块
+// 只会淹没真正需要审读的边界。
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
-use ldtray::{
-    ActionId, Event, Icon, Menu, MenuItem, Notification, Tray, TrayConfig, TrayHandle,
-};
-
+use crate::sys::dbus as d;
+use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::timer::Mode;
 
 /// 托盘 → 主窗口的命令。
@@ -25,19 +37,18 @@ pub enum Command {
     Quit,
 }
 
-// 菜单项 ID（自行约定，托盘回调中原样回传）
-const ID_START: u32 = 1;
-const ID_PAUSE: u32 = 2;
-const ID_RESET: u32 = 3;
-const ID_PRESET_BASE: u32 = 10;
-const ID_PRESET_LAST: u32 = ID_PRESET_BASE + PRESETS.len() as u32 - 1;
-const ID_MODE_COUNTDOWN: u32 = 20;
-const ID_MODE_STOPWATCH: u32 = 21;
-const ID_MODE_POMODORO: u32 = 22;
-const ID_MODE_CLOCK: u32 = 23;
-const ID_QUIT: u32 = 99;
-/// 通知里“再来一次”按钮的 ActionId。
-const ACTION_RESTART: u32 = 1;
+const ITEM_PATH: &CStr = c"/StatusNotifierItem";
+const ITEM_IFACE: &CStr = c"org.kde.StatusNotifierItem";
+const WATCHER_NAME: &CStr = c"org.kde.StatusNotifierWatcher";
+const WATCHER_PATH: &CStr = c"/StatusNotifierWatcher";
+const MENU_PATH: &CStr = c"/MenuBar";
+const MENU_IFACE: &CStr = c"com.canonical.dbusmenu";
+const PROPS_IFACE: &CStr = c"org.freedesktop.DBus.Properties";
+const INTROSPECT_IFACE: &CStr = c"org.freedesktop.DBus.Introspectable";
+const NOTIF_NAME: &CStr = c"org.freedesktop.Notifications";
+const NOTIF_PATH: &CStr = c"/org/freedesktop/Notifications";
+/// 通知按钮的动作标识，`ActionInvoked` 原样回传。
+const ACTION_RESTART: &str = "restart";
 
 /// 快速预设（标签, 秒）。
 const PRESETS: [(&str, u32); 6] = [
@@ -49,169 +60,851 @@ const PRESETS: [(&str, u32); 6] = [
     ("1 小时", 3600),
 ];
 
-/// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程（用于发通知）。
-pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>) {
-    thread::spawn(move || {
-        if let Err(e) = run(cmd_tx, handle_tx) {
-            eprintln!("⚠️ 无法加载托盘图标: {e}");
-        }
+// ---------------------------------------------------------------------------
+// 菜单模型：启动时摊平成 id 索引的节点表
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Root,
+    Button,
+    Separator,
+    Submenu,
+}
+
+struct Node {
+    kind: Kind,
+    label: String,
+    command: Option<Command>,
+    children: Vec<i32>,
+}
+
+/// 一条待发的通知。
+struct Note {
+    body: String,
+    action: String,
+}
+
+/// 托盘线程的全部状态。会被泄漏，因此回调里的裸指针始终有效。
+struct Server {
+    dbus: &'static DBus,
+    cmd_tx: Sender<Command>,
+    nodes: Vec<Node>,
+    /// 32x32 图标的 ARGB32 网络字节序像素
+    pixmap: Vec<u8>,
+}
+
+fn build_nodes() -> Vec<Node> {
+    let button = |label: &str, command: Command| Node {
+        kind: Kind::Button,
+        label: label.into(),
+        command: Some(command),
+        children: Vec::new(),
+    };
+    let mut n = vec![Node {
+        kind: Kind::Root,
+        label: String::new(),
+        command: None,
+        children: Vec::new(),
+    }];
+    n.push(button("▶ 开始", Command::Start));
+    n.push(button("⏸ 暂停", Command::Pause));
+    n.push(button("⟳ 重置", Command::Reset));
+    n.push(Node { kind: Kind::Separator, label: String::new(), command: None, children: Vec::new() });
+    let presets = n.len() as i32;
+    n.push(Node {
+        kind: Kind::Submenu,
+        label: "时长预设".into(),
+        command: None,
+        children: Vec::new(),
     });
-}
-
-fn run(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>) -> ldtray::Result<()> {
-    let config = TrayConfig::new(clock_icon()?)
-        .tooltip("TinyTicker")
-        .menu(build_menu());
-
-    let tray = Tray::new(config)?;
-    let _ = handle_tx.send(tray.handle());
-
-    tray.run(move |event| match event {
-        Event::Menu(id) => {
-            if let Some(cmd) = menu_command(id.0) {
-                let _ = cmd_tx.send(cmd);
-            }
-        }
-        // 通知里的“再来一次”按钮
-        Event::NotificationAction(ActionId(ACTION_RESTART)) => {
-            let _ = cmd_tx.send(Command::Start);
-        }
-        _ => {}
-    })
-}
-
-fn menu_command(id: u32) -> Option<Command> {
-    match id {
-        ID_START => Some(Command::Start),
-        ID_PAUSE => Some(Command::Pause),
-        ID_RESET => Some(Command::Reset),
-        ID_MODE_COUNTDOWN => Some(Command::SetMode(Mode::Countdown)),
-        ID_MODE_STOPWATCH => Some(Command::SetMode(Mode::Stopwatch)),
-        ID_MODE_POMODORO => Some(Command::SetMode(Mode::Pomodoro)),
-        ID_MODE_CLOCK => Some(Command::SetMode(Mode::Clock)),
-        ID_QUIT => Some(Command::Quit),
-        ID_PRESET_BASE..=ID_PRESET_LAST => {
-            Some(Command::Preset(PRESETS[(id - ID_PRESET_BASE) as usize].1))
-        }
-        _ => None,
+    let modes = n.len() as i32;
+    n.push(Node {
+        kind: Kind::Submenu,
+        label: "模式".into(),
+        command: None,
+        children: Vec::new(),
+    });
+    n.push(Node { kind: Kind::Separator, label: String::new(), command: None, children: Vec::new() });
+    n.push(button("✕ 退出", Command::Quit));
+    for (label, secs) in PRESETS {
+        let id = n.len() as i32;
+        n.push(button(&format!("⏱ {label}"), Command::Preset(secs)));
+        n[presets as usize].children.push(id);
     }
+    for (label, mode) in [
+        ("倒计时", Mode::Countdown),
+        ("秒表", Mode::Stopwatch),
+        ("🍅 番茄钟", Mode::Pomodoro),
+        ("🕐 时钟", Mode::Clock),
+    ] {
+        let id = n.len() as i32;
+        n.push(button(label, Command::SetMode(mode)));
+        n[modes as usize].children.push(id);
+    }
+    // 根节点的子项顺序即菜单顺序
+    n[0].children = (1..=8).collect();
+    n
 }
 
-fn build_menu() -> Menu {
-    let presets = PRESETS.iter().enumerate().map(|(i, (label, _))| {
-        MenuItem::button(ID_PRESET_BASE + i as u32, format!("⏱ {label}"))
-    });
-    Menu::new()
-        .item(MenuItem::button(ID_START, "▶ 开始"))
-        .item(MenuItem::button(ID_PAUSE, "⏸ 暂停"))
-        .item(MenuItem::button(ID_RESET, "⟳ 重置"))
-        .item(MenuItem::separator())
-        .item(MenuItem::submenu("时长预设", presets))
-        .item(MenuItem::submenu(
-            "模式",
-            [
-                MenuItem::button(ID_MODE_COUNTDOWN, "倒计时"),
-                MenuItem::button(ID_MODE_STOPWATCH, "秒表"),
-                MenuItem::button(ID_MODE_POMODORO, "🍅 番茄钟"),
-                MenuItem::button(ID_MODE_CLOCK, "🕐 时钟"),
-            ],
-        ))
-        .item(MenuItem::separator())
-        .item(MenuItem::button(ID_QUIT, "✕ 退出"))
-}
-
-/// 发一条桌面通知（计时结束等事件由主线程调用）。
-/// `action_label` 是通知按钮文案，点击后向主窗口发送 Start 命令。
-pub fn notify(handle: &TrayHandle, body: &str, action_label: &str) {
-    let note = Notification::new("TinyTicker", body).action(ACTION_RESTART, action_label);
-    let _ = handle.notify(note);
-}
-
-/// 程序化绘制一枚 32x32 时钟图标（深色表盘 + 白色表圈和指针），
-/// 避免引入图片资源文件。
-fn clock_icon() -> ldtray::Result<Icon> {
-    const SIZE: usize = 32;
+/// 32x32 时钟图标（深色表盘 + 白色表圈和指针），输出 ARGB32 网络字节序。
+///
+/// 与悬浮窗的位图字体同一取向：不引入任何图片资源文件。
+fn clock_pixmap() -> (i32, i32, Vec<u8>) {
+    const S: usize = 32;
     const CENTER: f32 = 15.5;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4]; // 圆外全透明
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    let mut px = vec![0u8; S * S * 4]; // 圆外全透明
+    for y in 0..S {
+        for x in 0..S {
             let dx = x as f32 - CENTER;
             let dy = y as f32 - CENTER;
             let dist = (dx * dx + dy * dy).sqrt();
             if dist > 15.0 {
-                continue; // 圆外透明
+                continue;
             }
-            let (r, g, b) = if dist > 12.5 {
-                (255, 255, 255) // 表圈
-            } else {
-                (15, 15, 20) // 表盘
-            };
-            let idx = (y * SIZE + x) * 4;
-            rgba[idx] = r;
-            rgba[idx + 1] = g;
-            rgba[idx + 2] = b;
-            rgba[idx + 3] = 255;
+            let (r, g, b) = if dist > 12.5 { (255, 255, 255) } else { (15, 15, 20) };
+            put(&mut px, x, y, r, g, b);
         }
     }
     // 指针（白色，2px）：分针向上、时针向右
     for y in 7..=16 {
-        put_white(&mut rgba, SIZE, 15, y);
-        put_white(&mut rgba, SIZE, 16, y);
+        put(&mut px, 15, y, 255, 255, 255);
+        put(&mut px, 16, y, 255, 255, 255);
     }
     for x in 16..=23 {
-        put_white(&mut rgba, SIZE, x, 15);
-        put_white(&mut rgba, SIZE, x, 16);
+        put(&mut px, x, 15, 255, 255, 255);
+        put(&mut px, x, 16, 255, 255, 255);
     }
-
-    Icon::from_rgba(SIZE as u32, SIZE as u32, rgba)
+    (S as i32, S as i32, px)
 }
 
-fn put_white(rgba: &mut [u8], size: usize, x: usize, y: usize) {
-    let idx = (y * size + x) * 4;
-    rgba[idx] = 255;
-    rgba[idx + 1] = 255;
-    rgba[idx + 2] = 255;
-    rgba[idx + 3] = 255;
+/// SNI 的 IconPixmap 是网络字节序（大端）的 A,R,G,B 四字节。
+fn put(px: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
+    let i = (y * 32 + x) * 4;
+    px[i] = 255;
+    px[i + 1] = r;
+    px[i + 2] = g;
+    px[i + 3] = b;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ---------------------------------------------------------------------------
+// 对外接口
+// ---------------------------------------------------------------------------
 
-    #[test]
-    fn menu_ids_map_to_commands() {
-        assert!(matches!(menu_command(ID_START), Some(Command::Start)));
-        assert!(matches!(menu_command(ID_QUIT), Some(Command::Quit)));
-        assert!(matches!(
-            menu_command(ID_MODE_STOPWATCH),
-            Some(Command::SetMode(Mode::Stopwatch))
-        ));
-        assert!(matches!(
-            menu_command(ID_MODE_POMODORO),
-            Some(Command::SetMode(Mode::Pomodoro))
-        ));
-        assert!(matches!(
-            menu_command(ID_MODE_CLOCK),
-            Some(Command::SetMode(Mode::Clock))
-        ));
-        // 预设区间首尾
-        assert!(matches!(
-            menu_command(ID_PRESET_BASE),
-            Some(Command::Preset(60))
-        ));
-        assert!(matches!(
-            menu_command(ID_PRESET_BASE + PRESETS.len() as u32 - 1),
-            Some(Command::Preset(3600))
-        ));
-        // 未定义的 id
-        assert_eq!(menu_command(50), None);
+/// 主线程用来发通知的句柄（内部只是一条到托盘线程的通道）。
+pub struct TrayHandle {
+    tx: Sender<Note>,
+}
+
+/// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
+pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>) {
+    thread::spawn(move || {
+        let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
+        match run(cmd_tx, note_rx, handle_tx, note_tx) {
+            Ok(()) => {}
+            Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
+        }
+    });
+}
+
+/// 发一条桌面通知；`action` 是按钮文案，点击后向主窗口发 [`Command::Start`]。
+pub fn notify(handle: &TrayHandle, body: &str, action: &str) {
+    let _ = handle.tx.send(Note { body: body.to_string(), action: action.to_string() });
+}
+
+// ---------------------------------------------------------------------------
+// 线程主体
+// ---------------------------------------------------------------------------
+
+fn run(
+    cmd_tx: Sender<Command>,
+    note_rx: Receiver<Note>,
+    handle_tx: Sender<TrayHandle>,
+    note_tx: Sender<Note>,
+) -> Result<(), String> {
+    let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
+    let mut err = DBusError::zeroed();
+    let conn = unsafe { (dbus.dbus_bus_get)(d::BUS_SESSION, &mut err) };
+    if conn.is_null() {
+        return Err(format!("连不上会话总线: {}", err.describe()));
+    }
+    let (_, _, pixmap) = clock_pixmap();
+    let server: *mut Server = Box::leak(Box::new(Server {
+        dbus,
+        cmd_tx,
+        nodes: build_nodes(),
+        pixmap,
+    }));
+
+    // 导出两个对象路径
+    let vtable = Box::leak(Box::new(DBusObjectPathVTable::new(on_message)));
+    for path in [ITEM_PATH, MENU_PATH] {
+        unsafe {
+            (dbus.dbus_connection_try_register_object_path)(
+                conn,
+                path.as_ptr(),
+                vtable as *const DBusObjectPathVTable,
+                server as *mut c_void,
+                &mut err,
+            )
+        };
     }
 
-    #[test]
-    fn clock_icon_has_valid_size() {
-        let icon = clock_icon().expect("图标构建失败");
-        assert_eq!(icon.width(), 32);
-        assert_eq!(icon.height(), 32);
+    // 注册到宿主
+    let unique = unsafe { CStr::from_ptr((dbus.dbus_bus_get_unique_name)(conn)) };
+    unsafe { register_with_watcher(dbus, conn, unique.to_string_lossy().as_ref()) };
+
+    // 通知按钮回调：需要 match 规则 + 消息过滤器
+    let rule = CString::new(
+        "type='signal',interface='org.freedesktop.Notifications',member='ActionInvoked'",
+    )
+    .unwrap();
+    unsafe { (dbus.dbus_bus_add_match)(conn, rule.as_ptr(), &mut err) };
+    unsafe {
+        (dbus.dbus_connection_add_filter)(conn, Some(on_filter), server as *mut c_void, None)
+    };
+
+    // 主线程拿到句柄后就能发通知
+    if handle_tx.send(TrayHandle { tx: note_tx }).is_err() {
+        return Ok(());
     }
+
+    // 派发循环：200ms 醒一次，顺带把待发通知送出去
+    loop {
+        while let Ok(note) = note_rx.try_recv() {
+            unsafe { send_notification(dbus, conn, &note) };
+        }
+        if unsafe { (dbus.dbus_connection_read_write_dispatch)(conn, 200) } != d::TRUE {
+            return Ok(()); // 连接断了（多数是退出登录）
+        }
+    }
+}
+
+/// `org.freedesktop.Notifications.Notify`：带一个「再来一次」按钮。
+unsafe fn send_notification(dbus: &DBus, conn: *mut d::DBusConnection, note: &Note) {
+    let msg = (dbus.dbus_message_new_method_call)(
+        NOTIF_NAME.as_ptr(),
+        NOTIF_PATH.as_ptr(),
+        NOTIF_NAME.as_ptr(),
+        c"Notify".as_ptr(),
+    );
+    if msg.is_null() {
+        return;
+    }
+    let mut it = DBusMessageIter::uninit();
+    (dbus.dbus_message_iter_init_append)(msg, &mut it);
+    put_str(dbus, &mut it, "TinyTicker"); // app_name
+    put_u32(dbus, &mut it, 0); // replaces_id
+    put_str(dbus, &mut it, ""); // 图标名：留空，宿主用我们的 SNI 图标
+    put_str(dbus, &mut it, "TinyTicker"); // summary
+    put_str(dbus, &mut it, &note.body); // body
+    // actions: as —— [key, label] 成对
+    let mut acts = match open(dbus, &mut it, d::T_ARRAY, Some(c"s")) {
+        Some(a) => a,
+        None => return,
+    };
+    put_str(dbus, &mut acts, ACTION_RESTART);
+    put_str(dbus, &mut acts, &note.action);
+    close(dbus, &mut it, &mut acts);
+    // hints: a{sv} —— 空字典
+    let mut hints = match open(dbus, &mut it, d::T_ARRAY, Some(c"{sv}")) {
+        Some(h) => h,
+        None => return,
+    };
+    close(dbus, &mut it, &mut hints);
+    put_i32(dbus, &mut it, 0); // expire_timeout：0 = 用默认
+    (dbus.dbus_connection_send)(conn, msg, std::ptr::null_mut());
+    (dbus.dbus_connection_flush)(conn);
+    (dbus.dbus_message_unref)(msg);
+}
+
+unsafe fn put_u32(dbus: &DBus, it: *mut DBusMessageIter, v: u32) {
+    (dbus.dbus_message_iter_append_basic)(it, d::T_UINT32, &v as *const _ as *const c_void);
+}
+
+unsafe fn register_with_watcher(dbus: &DBus, conn: *mut d::DBusConnection, service: &str) {
+    let msg = (dbus.dbus_message_new_method_call)(
+        WATCHER_NAME.as_ptr(),
+        WATCHER_PATH.as_ptr(),
+        WATCHER_NAME.as_ptr(),
+        c"RegisterStatusNotifierItem".as_ptr(),
+    );
+    if msg.is_null() {
+        return;
+    }
+    let mut it = DBusMessageIter::uninit();
+    (dbus.dbus_message_iter_init_append)(msg, &mut it);
+    put_str(dbus, &mut it, service);
+    let mut err = DBusError::zeroed();
+    let reply = (dbus.dbus_connection_send_with_reply_and_block)(conn, msg, 2000, &mut err);
+    if reply.is_null() {
+        eprintln!("⚠️ 注册托盘图标失败: {}", err.describe());
+    } else {
+        (dbus.dbus_message_unref)(reply);
+    }
+    (dbus.dbus_message_unref)(msg);
+}
+
+// ---------------------------------------------------------------------------
+// 消息处理
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn on_message(
+    conn: *mut d::DBusConnection,
+    msg: *mut DBusMessage,
+    data: *mut c_void,
+) -> c_int {
+    let server = unsafe { &*(data as *const Server) };
+    let dbus = server.dbus;
+    let member = match cstr(unsafe { (dbus.dbus_message_get_member)(msg) }) {
+        Some(m) => m,
+        None => return d::NOT_YET_HANDLED,
+    };
+    let iface = cstr(unsafe { (dbus.dbus_message_get_interface)(msg) }).unwrap_or_default();
+    let path = cstr(unsafe { (dbus.dbus_message_get_path)(msg) }).unwrap_or_default();
+    let is_call = unsafe { (dbus.dbus_message_get_type)(msg) } == d::MSG_METHOD_CALL;
+    if !is_call {
+        return d::NOT_YET_HANDLED;
+    }
+
+    let mut args = DBusMessageIter::uninit();
+    let has_args = unsafe { (dbus.dbus_message_iter_init)(msg, &mut args) } == d::TRUE;
+    let mut empty = DBusMessageIter::uninit();
+    let args = if has_args { &mut args } else { &mut empty };
+
+    // 接口/路径名统一用上面的 CStr 常量比对（它们同时也是注册对象路径时用的）
+    let (item_p, menu_p) = (ITEM_PATH.to_str().unwrap(), MENU_PATH.to_str().unwrap());
+    let (props_i, intro_i, item_i, menu_i) = (
+        PROPS_IFACE.to_str().unwrap(),
+        INTROSPECT_IFACE.to_str().unwrap(),
+        ITEM_IFACE.to_str().unwrap(),
+        MENU_IFACE.to_str().unwrap(),
+    );
+    match member.as_str() {
+        "Ping" => reply(dbus, conn, msg, |_, _| {}),
+        "Introspect" if iface == intro_i => {
+            let xml = if path == menu_p { MENU_XML } else { ITEM_XML };
+            reply(dbus, conn, msg, |db, it| put_str(db, it, xml))
+        }
+        "Get" if iface == props_i => {
+            // (s 接口名, s 属性名) → v
+            let name = second_string(dbus, args);
+            reply_props_get(dbus, conn, msg, server, &name)
+        }
+        "GetAll" if iface == props_i => {
+            reply(dbus, conn, msg, |db, it| write_props_all(db, it, server))
+        }
+        // 三击都只回成功：ItemIsMenu=true，宿主自己弹 /MenuBar
+        "Activate" | "SecondaryActivate" | "ContextMenu" if path == item_p && iface == item_i => {
+            reply(dbus, conn, msg, |_, _| {})
+        }
+        "GetLayout" if path == menu_p && iface == menu_i => {
+            let (root, depth) = read_layout_request(dbus, args);
+            reply(dbus, conn, msg, |db, it| {
+                put_i32(db, it, 1); // revision
+                write_layout(db, it, server, root, depth);
+            })
+        }
+        "GetGroupProperties" if path == menu_p && iface == menu_i => {
+            let ids = read_ids(dbus, args);
+            reply(dbus, conn, msg, |db, it| write_group_properties(db, it, server, &ids))
+        }
+        "GetProperty" if path == menu_p && iface == menu_i => {
+            let (id, name) = read_property_request(dbus, args);
+            reply(dbus, conn, msg, |db, it| write_node_property(db, it, server, id, &name))
+        }
+        "AboutToShow" if path == menu_p && iface == menu_i => {
+            reply(dbus, conn, msg, |db, it| put_bool(db, it, false))
+        }
+        "Event" if path == menu_p && iface == menu_i => {
+            if let Some(id) = read_event(dbus, args)
+                && let Some(cmd) = server.nodes.get(id as usize).and_then(|n| n.command)
+            {
+                let _ = server.cmd_tx.send(cmd);
+            }
+            reply(dbus, conn, msg, |_, _| {})
+        }
+        "EventGroup" if path == menu_p && iface == menu_i => {
+            reply(dbus, conn, msg, |db, it| put_bool(db, it, false))
+        }
+        _ => d::NOT_YET_HANDLED,
+    }
+}
+
+/// 通知上的按钮被按下。
+///
+/// `DBusHandleMessageFunction` 的三个参数是 `(connection, message, user_data)`，
+/// 与对象路径 vtable 同形，没有 `DBusError`。
+unsafe extern "C" fn on_filter(
+    _conn: *mut d::DBusConnection,
+    msg: *mut DBusMessage,
+    data: *mut c_void,
+) -> c_int {
+    let server = unsafe { &*(data as *const Server) };
+    let dbus = server.dbus;
+    if unsafe { (dbus.dbus_message_is_signal)(msg, NOTIF_NAME.as_ptr(), c"ActionInvoked".as_ptr()) }
+        != d::TRUE
+    {
+        return d::NOT_YET_HANDLED;
+    }
+    let mut it = DBusMessageIter::uninit();
+    if unsafe { (dbus.dbus_message_iter_init)(msg, &mut it) } != d::TRUE {
+        return d::NOT_YET_HANDLED;
+    }
+    // (u id, s key)
+    (dbus.dbus_message_iter_next)(&mut it);
+    let key = match cstr({
+        let mut p: *const c_char = std::ptr::null();
+        (dbus.dbus_message_iter_get_basic)(&mut it, &mut p as *mut _ as *mut c_void);
+        p
+    }) {
+        Some(k) => k,
+        None => return d::NOT_YET_HANDLED,
+    };
+    if key == ACTION_RESTART {
+        let _ = server.cmd_tx.send(Command::Start);
+    }
+    d::HANDLED
+}
+
+// ---------------------------------------------------------------------------
+// 属性与布局的写出
+// ---------------------------------------------------------------------------
+
+const ITEM_XML: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+ <interface name="org.kde.StatusNotifierItem">
+  <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+  <signal name="NewIcon"/><signal name="NewToolTip"/><signal name="NewTitle"/>
+  <signal name="NewStatus"><arg name="status" type="s"/></signal>
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="IconPixmap" type="a(iiay)" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <property name="Menu" type="o" access="read"/>
+ </interface>
+</node>"#;
+
+const MENU_XML: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+ <interface name="com.canonical.dbusmenu">
+  <method name="GetLayout"><arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/><arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/></method>
+  <method name="GetGroupProperties"><arg type="ai" direction="in"/><arg type="as" direction="in"/><arg type="a(ia{sv})" direction="out"/></method>
+  <method name="GetProperty"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+  <method name="Event"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/><arg type="u" direction="in"/></method>
+  <method name="EventGroup"><arg type="a(isv)" direction="in"/><arg type="u" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="Ping"><arg type="b" direction="out"/></method>
+ </interface>
+</node>"#;
+
+unsafe fn write_pixmap(dbus: &DBus, it: *mut DBusMessageIter, server: &Server) {
+    let mut arr = match open(dbus, it, d::T_ARRAY, Some(c"(iiay)")) {
+        Some(a) => a,
+        None => return,
+    };
+    let mut st = match open(dbus, &mut arr, d::T_STRUCT, None) {
+        Some(s) => s,
+        None => return,
+    };
+    put_i32(dbus, &mut st, PIX_W);
+    put_i32(dbus, &mut st, PIX_H);
+    let mut bytes = match open(dbus, &mut st, d::T_ARRAY, Some(c"y")) {
+        Some(b) => b,
+        None => return,
+    };
+    let ptr = server.pixmap.as_ptr() as *const c_void;
+    let n = server.pixmap.len() as c_int;
+    (dbus.dbus_message_iter_append_fixed_array)(&mut bytes, d::T_BYTE, &ptr as *const _ as *const c_void, n);
+    close(dbus, &mut st, &mut bytes);
+    close(dbus, &mut arr, &mut st);
+    close(dbus, it, &mut arr);
+}
+
+const PIX_W: i32 = 32;
+const PIX_H: i32 = 32;
+
+unsafe fn write_sni_property(dbus: &DBus, it: *mut DBusMessageIter, server: &Server, name: &str) {
+    match name {
+        "Category" => variant_str(dbus, it, "ApplicationStatus"),
+        "Id" => variant_str(dbus, it, "tinyticker"),
+        "Title" => variant_str(dbus, it, "TinyTicker"),
+        "Status" => variant_str(dbus, it, "Active"),
+        "IconName" => variant_str(dbus, it, ""),
+        "ItemIsMenu" => variant_bool(dbus, it, true),
+        "Menu" => variant_objpath(dbus, it, "/MenuBar"),
+        "IconPixmap" => {
+            let mut v = match open(dbus, it, d::T_VARIANT, Some(c"a(iiay)")) {
+                Some(v) => v,
+                None => return,
+            };
+            write_pixmap(dbus, &mut v, server);
+            close(dbus, it, &mut v);
+        }
+        "ToolTip" => {
+            // (sa(iiay)ss)：图标 + 标题 + 正文
+            let mut v = match open(dbus, it, d::T_VARIANT, Some(c"(sa(iiay)ss)")) {
+                Some(v) => v,
+                None => return,
+            };
+            let mut st = match open(dbus, &mut v, d::T_STRUCT, None) {
+                Some(s) => s,
+                None => return,
+            };
+            put_str(dbus, &mut st, "");
+            write_pixmap(dbus, &mut st, server);
+            put_str(dbus, &mut st, "TinyTicker");
+            put_str(dbus, &mut st, "极简悬浮计时器");
+            close(dbus, &mut v, &mut st);
+            close(dbus, it, &mut v);
+        }
+        // 兜底也要写一个 variant：属性名由 SNI_PROPERTIES 把关卡，走到这里说明
+        // 名单和这段 match 漂了——宁可回空值，也不能让回复缺项而 abort。
+        _ => variant_str(dbus, it, ""),
+    }
+}
+
+unsafe fn reply_props_get(
+    dbus: &DBus,
+    conn: *mut d::DBusConnection,
+    msg: *mut DBusMessage,
+    server: &Server,
+    name: &str,
+) -> c_int {
+    if !SNI_PROPERTIES.contains(&name) {
+        return reply_error(
+            dbus,
+            conn,
+            msg,
+            c"org.freedesktop.DBus.Error.UnknownProperty",
+            &format!("未知属性 {name}"),
+        );
+    }
+    reply(dbus, conn, msg, |db, it| {
+        write_sni_property(db, it, server, name);
+    })
+}
+
+/// SNI 属性名单，`Properties.Get` 的认账表与 `GetAll` 的遍历表共用一份。
+/// 与上面的 `write_sni_property` 及 `ITEM_XML` 里的 property 列表一一对应。
+const SNI_PROPERTIES: &[&str] =
+    &["Category", "Id", "Title", "Status", "IconName", "IconPixmap", "ToolTip", "ItemIsMenu", "Menu"];
+
+unsafe fn write_props_all(dbus: &DBus, it: *mut DBusMessageIter, server: &Server) {
+    let mut arr = match open(dbus, it, d::T_ARRAY, Some(c"{sv}")) {
+        Some(a) => a,
+        None => return,
+    };
+    for name in SNI_PROPERTIES {
+        let mut de = match open(dbus, &mut arr, d::T_DICT_ENTRY, None) {
+            Some(x) => x,
+            None => return,
+        };
+        put_str(dbus, &mut de, name);
+        write_sni_property(dbus, &mut de, server, name);
+        close(dbus, &mut arr, &mut de);
+    }
+    close(dbus, it, &mut arr);
+}
+
+/// 菜单节点属性写进一个 `a{sv}`。
+/// 把一个节点的属性写成 `a{sv}`。**这个数组必须始终写出来**（未知 id 就写空的）：
+/// 外层签名是 `(ia{sv})` / `(ia{sv}av)`，少写一项会让 libdbus 断言失败直接 abort。
+unsafe fn write_node_props(dbus: &DBus, it: *mut DBusMessageIter, server: &Server, id: i32) {
+    let mut arr = match open(dbus, it, d::T_ARRAY, Some(c"{sv}")) {
+        Some(a) => a,
+        None => return,
+    };
+    let node = match server.nodes.get(id as usize) {
+        Some(n) => n,
+        None => {
+            close(dbus, it, &mut arr);
+            return;
+        }
+    };
+    // 值为 `None` 表示布尔 true（dbusmenu 只用到 enabled=true 这一种）
+    let entries: &[(&str, Option<&str>)] = match node.kind {
+        Kind::Separator => &[("type", Some("separator"))],
+        Kind::Root => &[("children-display", Some("compound"))],
+        Kind::Submenu => &[("label", Some(&node.label)), ("children-display", Some("submenu"))],
+        Kind::Button => &[("label", Some(&node.label)), ("enabled", None)],
+    };
+    for (key, text) in entries {
+        let mut de = match open(dbus, &mut arr, d::T_DICT_ENTRY, None) {
+            Some(x) => x,
+            None => return,
+        };
+        put_str(dbus, &mut de, key);
+        match text {
+            Some(text) => variant_str(dbus, &mut de, text),
+            None => variant_bool(dbus, &mut de, true),
+        }
+        close(dbus, &mut arr, &mut de);
+    }
+    close(dbus, it, &mut arr);
+}
+
+unsafe fn write_layout(
+    dbus: &DBus,
+    it: *mut DBusMessageIter,
+    server: &Server,
+    id: i32,
+    depth: i32,
+) {
+    let mut st = match open(dbus, it, d::T_STRUCT, None) {
+        Some(s) => s,
+        None => return,
+    };
+    put_i32(dbus, &mut st, id);
+    write_node_props(dbus, &mut st, server, id);
+    let mut kids = match open(dbus, &mut st, d::T_ARRAY, Some(c"v")) {
+        Some(k) => k,
+        None => return,
+    };
+    // depth == 1 表示只要本层，不带子节点
+    if depth != 1
+        && let Some(node) = server.nodes.get(id as usize)
+    {
+        for child in &node.children {
+            let mut v = match open(dbus, &mut kids, d::T_VARIANT, Some(c"(ia{sv}av)")) {
+                Some(v) => v,
+                None => break,
+            };
+            write_layout(dbus, &mut v, server, *child, if depth > 0 { depth - 1 } else { 0 });
+            close(dbus, &mut kids, &mut v);
+        }
+    }
+    close(dbus, &mut st, &mut kids);
+    close(dbus, it, &mut st);
+}
+
+unsafe fn write_group_properties(
+    dbus: &DBus,
+    it: *mut DBusMessageIter,
+    server: &Server,
+    ids: &[i32],
+) {
+    let mut arr = match open(dbus, it, d::T_ARRAY, Some(c"(ia{sv})")) {
+        Some(a) => a,
+        None => return,
+    };
+    // ids 为空 = 宿主想要全部节点（dbusmenu 的约定）
+    let all: Vec<i32> = (0..server.nodes.len() as i32).collect();
+    let list: &[i32] = if ids.is_empty() { &all } else { ids };
+    for &id in list {
+        let mut st = match open(dbus, &mut arr, d::T_STRUCT, None) {
+            Some(s) => s,
+            None => return,
+        };
+        put_i32(dbus, &mut st, id);
+        write_node_props(dbus, &mut st, server, id);
+        close(dbus, &mut arr, &mut st);
+    }
+    close(dbus, it, &mut arr);
+}
+
+unsafe fn write_node_property(
+    dbus: &DBus,
+    it: *mut DBusMessageIter,
+    server: &Server,
+    id: i32,
+    name: &str,
+) {
+    let node = match server.nodes.get(id as usize) {
+        Some(n) => n,
+        None => {
+            variant_str(dbus, it, "");
+            return;
+        }
+    };
+    match name {
+        "label" => variant_str(dbus, it, &node.label),
+        "enabled" => variant_bool(dbus, it, node.kind == Kind::Button),
+        "visible" => variant_bool(dbus, it, true),
+        "children-display" => {
+            variant_str(dbus, it, if node.kind == Kind::Submenu { "submenu" } else { "compound" })
+        }
+        "type" => variant_str(dbus, it, if node.kind == Kind::Separator { "separator" } else { "standard" }),
+        _ => variant_str(dbus, it, ""),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 参数读取
+// ---------------------------------------------------------------------------
+
+unsafe fn second_string(dbus: &DBus, args: *mut DBusMessageIter) -> String {
+    (dbus.dbus_message_iter_next)(args);
+    read_str(dbus, args)
+}
+
+unsafe fn read_str(dbus: &DBus, it: *mut DBusMessageIter) -> String {
+    let mut p: *const c_char = std::ptr::null();
+    if unsafe { (dbus.dbus_message_iter_get_arg_type)(it) } == d::T_STRING {
+        unsafe { (dbus.dbus_message_iter_get_basic)(it, &mut p as *mut _ as *mut c_void) };
+    }
+    cstr(p).unwrap_or_default()
+}
+
+unsafe fn read_i32(dbus: &DBus, it: *mut DBusMessageIter) -> i32 {
+    let mut v: i32 = 0;
+    if unsafe { (dbus.dbus_message_iter_get_arg_type)(it) } == d::T_INT32 {
+        unsafe { (dbus.dbus_message_iter_get_basic)(it, &mut v as *mut _ as *mut c_void) };
+    }
+    v
+}
+
+unsafe fn read_layout_request(dbus: &DBus, args: *mut DBusMessageIter) -> (i32, i32) {
+    let root = read_i32(dbus, args);
+    (dbus.dbus_message_iter_next)(args);
+    (root, read_i32(dbus, args))
+}
+
+unsafe fn read_property_request(dbus: &DBus, args: *mut DBusMessageIter) -> (i32, String) {
+    let id = read_i32(dbus, args);
+    (dbus.dbus_message_iter_next)(args);
+    (id, read_str(dbus, args))
+}
+
+/// `Event(i id, s eventId, v data, u timestamp)` → 取 id（仅认 clicked）。
+unsafe fn read_event(dbus: &DBus, args: *mut DBusMessageIter) -> Option<i32> {
+    let id = read_i32(dbus, args);
+    (dbus.dbus_message_iter_next)(args);
+    let event = read_str(dbus, args);
+    (event == "clicked").then_some(id)
+}
+
+/// `GetGroupProperties(ai ids, as names)` → 读 ids。
+unsafe fn read_ids(dbus: &DBus, args: *mut DBusMessageIter) -> Vec<i32> {
+    let mut out = Vec::new();
+    if unsafe { (dbus.dbus_message_iter_get_arg_type)(args) } != d::T_ARRAY {
+        return out;
+    }
+    let mut sub = DBusMessageIter::uninit();
+    unsafe { (dbus.dbus_message_iter_recurse)(args, &mut sub) };
+    while unsafe { (dbus.dbus_message_iter_get_arg_type)(&mut sub) } == d::T_INT32 {
+        out.push(read_i32(dbus, &mut sub));
+        unsafe { (dbus.dbus_message_iter_next)(&mut sub) };
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 写出小工具
+// ---------------------------------------------------------------------------
+
+fn cstr(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+}
+
+/// 打开一个容器。`contained_signature` 只对数组和 variant 有意义：
+/// libdbus 断言结构体 / dict entry 必须传 `NULL`（元素类型由内容推出），
+/// 而数组必须传元素类型、variant 必须传内容类型。传错直接 abort。
+unsafe fn open(
+    dbus: &DBus,
+    it: *mut DBusMessageIter,
+    ty: c_int,
+    sig: Option<&CStr>,
+) -> Option<DBusMessageIter> {
+    let mut sub = DBusMessageIter::uninit();
+    let sig = sig.map_or(std::ptr::null(), |s| s.as_ptr());
+    let ok = unsafe { (dbus.dbus_message_iter_open_container)(it, ty, sig, &mut sub) };
+    (ok == d::TRUE).then_some(sub)
+}
+
+unsafe fn close(dbus: &DBus, it: *mut DBusMessageIter, sub: &mut DBusMessageIter) {
+    unsafe { (dbus.dbus_message_iter_close_container)(it, sub) };
+}
+
+unsafe fn put_str(dbus: &DBus, it: *mut DBusMessageIter, s: &str) {
+    let c = CString::new(s).unwrap_or_default();
+    let p = c.as_ptr();
+    unsafe { (dbus.dbus_message_iter_append_basic)(it, d::T_STRING, &p as *const _ as *const c_void) };
+}
+
+unsafe fn put_i32(dbus: &DBus, it: *mut DBusMessageIter, v: i32) {
+    unsafe { (dbus.dbus_message_iter_append_basic)(it, d::T_INT32, &v as *const _ as *const c_void) };
+}
+
+unsafe fn put_bool(dbus: &DBus, it: *mut DBusMessageIter, v: bool) {
+    let b: d::DBusBool = v as d::DBusBool;
+    unsafe { (dbus.dbus_message_iter_append_basic)(it, d::T_BOOL, &b as *const _ as *const c_void) };
+}
+
+unsafe fn variant_str(dbus: &DBus, it: *mut DBusMessageIter, s: &str) {
+    let mut v = match open(dbus, it, d::T_VARIANT, Some(c"s")) {
+        Some(v) => v,
+        None => return,
+    };
+    put_str(dbus, &mut v, s);
+    close(dbus, it, &mut v);
+}
+
+unsafe fn variant_bool(dbus: &DBus, it: *mut DBusMessageIter, b: bool) {
+    let mut v = match open(dbus, it, d::T_VARIANT, Some(c"b")) {
+        Some(v) => v,
+        None => return,
+    };
+    put_bool(dbus, &mut v, b);
+    close(dbus, it, &mut v);
+}
+
+unsafe fn variant_objpath(dbus: &DBus, it: *mut DBusMessageIter, p: &str) {
+    let mut v = match open(dbus, it, d::T_VARIANT, Some(c"o")) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = CString::new(p).unwrap_or_default();
+    let ptr = c.as_ptr();
+    unsafe { (dbus.dbus_message_iter_append_basic)(&mut v, d::T_OBJECT_PATH, &ptr as *const _ as *const c_void) };
+    close(dbus, it, &mut v);
+}
+
+/// 发一个方法回复；`fill` 负责写入返回值。
+unsafe fn reply(
+    dbus: &DBus,
+    conn: *mut d::DBusConnection,
+    call: *mut DBusMessage,
+    fill: impl FnOnce(&DBus, *mut DBusMessageIter),
+) -> c_int {
+    let msg = unsafe { (dbus.dbus_message_new_method_return)(call) };
+    if msg.is_null() {
+        return d::NOT_YET_HANDLED;
+    }
+    let mut it = DBusMessageIter::uninit();
+    unsafe { (dbus.dbus_message_iter_init_append)(msg, &mut it) };
+    fill(dbus, &mut it);
+    unsafe {
+        (dbus.dbus_connection_send)(conn, msg, std::ptr::null_mut());
+        (dbus.dbus_connection_flush)(conn);
+        (dbus.dbus_message_unref)(msg);
+    }
+    d::HANDLED
+}
+
+/// 回一个 D-Bus 错误（未知属性等）。
+unsafe fn reply_error(dbus: &DBus, conn: *mut d::DBusConnection, call: *mut DBusMessage, name: &CStr, text: &str) -> c_int {
+    let msg = unsafe {
+        (dbus.dbus_message_new_error)(call, name.as_ptr(), CString::new(text).unwrap_or_default().as_ptr())
+    };
+    if msg.is_null() {
+        return d::NOT_YET_HANDLED;
+    }
+    unsafe {
+        (dbus.dbus_connection_send)(conn, msg, std::ptr::null_mut());
+        (dbus.dbus_connection_flush)(conn);
+        (dbus.dbus_message_unref)(msg);
+    }
+    d::HANDLED
 }

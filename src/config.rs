@@ -1,6 +1,7 @@
-//! 配置持久化：`~/.config/tinyticker/config.conf`。
+//! 配置持久化：`config.conf`，放在 `$XDG_CONFIG_HOME/tinyticker/`，
+//! 该变量缺失或非绝对路径时退回 `$HOME/.config/tinyticker/`。
 //!
-//! 纯 std 实现（无 serde），行式 `key = value` 格式，`#` 开头为注释；
+//! 纯 std 实现（无 serde / dirs），行式 `key = value` 格式，`#` 开头为注释；
 //! 未知键与非法值静默忽略并回落默认值。
 
 use std::fs;
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 use crate::parse::parse_duration;
 use crate::render::{parse_color, rgb};
 use crate::timer::Mode;
+
+const CONFIG_FILE: &str = "config.conf";
 
 // zoom 为 f32（非 Eq），整体只做 PartialEq 比较
 #[derive(Clone, Debug, PartialEq)]
@@ -39,10 +42,10 @@ pub struct Config {
     pub pomo_work: u32,
     /// 番茄钟休息时长（秒）。
     pub pomo_break: u32,
-    /// 倒计时归零 / 番茄钟专注完成时执行的 shell 命令
-    /// （锁屏：`loginctl lock-session`，关机：`systemctl poweroff` 等）。
+    /// 倒计时归零 / 番茄钟专注完成时执行的命令（经 `sh -c` 解释）。
+    /// 例如锁屏 `loginctl lock-session`、关机 `systemctl poweroff`。
     pub on_finish: Option<String>,
-    /// 上次退出时的窗口位置（X11/Win/macOS 生效，Wayland 忽略）。
+    /// 上次退出时的窗口位置（逻辑像素）：layer-shell 的 margin 与 X11 的窗口坐标。
     pub window_pos: Option<(i32, i32)>,
 }
 
@@ -67,13 +70,23 @@ impl Default for Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/tinyticker/config.conf`，否则 `$HOME/.config/...`。
-fn config_path() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() && PathBuf::from(&dir).is_absolute() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
-    };
-    Some(base.join("tinyticker").join("config.conf"))
+/// 环境变量值只有是非空绝对路径时才算数：相对路径会让配置跟着当前工作目录漂移。
+fn absolute(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    let path = PathBuf::from(&value);
+    (!value.is_empty() && path.is_absolute()).then_some(path)
+}
+
+fn env_dir(name: &str) -> Option<PathBuf> {
+    absolute(std::env::var_os(name))
+}
+
+/// 配置文件完整路径。XDG 优先，缺省 `$HOME/.config`；两个环境变量都不合格时返回
+/// `None`，此时 `load` / `save` 静默走默认值（不读写文件）。
+pub fn config_path() -> Option<PathBuf> {
+    let dir =
+        env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|home| home.join(".config")))?;
+    Some(dir.join(env!("CARGO_PKG_NAME")).join(CONFIG_FILE))
 }
 
 impl Config {
@@ -130,11 +143,6 @@ impl Config {
                         cfg.mode = mode;
                     }
                 }
-                "color_bg" => {
-                    if let Some(c) = parse_color(value) {
-                        cfg.color_bg = c;
-                    }
-                }
                 "bg_alpha" => {
                     if let Ok(a) = value.parse::<u8>() {
                         cfg.bg_alpha = a;
@@ -147,17 +155,16 @@ impl Config {
                         cfg.zoom = z;
                     }
                 }
-                "click_through" => {
-                    cfg.click_through = matches!(
+                "click_through" | "clock_12h" => {
+                    let on = matches!(
                         value.to_ascii_lowercase().as_str(),
                         "true" | "1" | "yes" | "on"
                     );
-                }
-                "clock_12h" => {
-                    cfg.clock_12h = matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "true" | "1" | "yes" | "on"
-                    );
+                    if key == "click_through" {
+                        cfg.click_through = on;
+                    } else {
+                        cfg.clock_12h = on;
+                    }
                 }
                 "pomo_work" => {
                     if let Some(s) = parse_duration(value) {
@@ -174,19 +181,14 @@ impl Config {
                         cfg.on_finish = Some(value.to_string());
                     }
                 }
-                "color_running" => {
+                "color_bg" | "color_running" | "color_paused" | "color_done" => {
                     if let Some(c) = parse_color(value) {
-                        cfg.color_running = c;
-                    }
-                }
-                "color_paused" => {
-                    if let Some(c) = parse_color(value) {
-                        cfg.color_paused = c;
-                    }
-                }
-                "color_done" => {
-                    if let Some(c) = parse_color(value) {
-                        cfg.color_done = c;
+                        match key {
+                            "color_bg" => cfg.color_bg = c,
+                            "color_running" => cfg.color_running = c,
+                            "color_paused" => cfg.color_paused = c,
+                            _ => cfg.color_done = c,
+                        }
                     }
                 }
                 "window_x" => window_x = value.parse().ok(),
@@ -287,5 +289,27 @@ mod tests {
     fn window_position_needs_both_axes() {
         let cfg = Config::from_str("window_x = 5\nwindow_y = -7\n");
         assert_eq!(cfg.window_pos, Some((5, -7)));
+    }
+
+    #[test]
+    fn empty_or_relative_env_values_are_ignored() {
+        assert_eq!(absolute(None), None);
+        assert_eq!(absolute(Some("".into())), None);
+        assert_eq!(absolute(Some("relative/dir".into())), None);
+        // temp_dir 总是绝对路径，正向用例因此与主机无关
+        let abs = std::env::temp_dir();
+        assert_eq!(absolute(Some(abs.clone().into_os_string())), Some(abs));
+    }
+
+    #[test]
+    fn config_path_ends_with_app_and_file() {
+        let Some(path) = config_path() else {
+            return; // 环境里连 HOME 都没有，load/save 会静默走默认值
+        };
+        assert_eq!(path.file_name(), Some(std::ffi::OsStr::new(CONFIG_FILE)));
+        assert_eq!(
+            path.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new(env!("CARGO_PKG_NAME")))
+        );
     }
 }
