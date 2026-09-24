@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::tray::TrayHandle;
 
 use crate::clock;
-use crate::config::{Config, PALETTES};
+use crate::config::{COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path};
 use crate::effect::{self, Effect, Gradient};
 use crate::render::{self, premultiply, Canvas};
 use crate::text;
@@ -103,7 +103,7 @@ impl Frame {
 pub struct Widget {
     pub config: Config,
     pub timer: Timer,
-    /// 滚轮缩放倍数（0.5-3.0，持久化）。
+    /// 滚轮缩放倍数（`ZOOM_MIN`-`ZOOM_MAX`，持久化）。
     pub zoom: f32,
     tray: Option<TrayHandle>,
     /// 外部文本源：配了 `text_source` 才碰文件系统
@@ -114,6 +114,8 @@ pub struct Widget {
     ///
     /// 不进配置：退出时是隐藏状态，下次启动该是看得见的，否则用户只会以为程序没起来。
     hidden: bool,
+    /// 配置文件的变更探测：手改 `config.conf` 不用重启就生效（#17）。
+    cfg_watch: Watch,
     /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号 / 动画相位）。
     last_frame: Option<(String, String, u32, u32, u32, u32)>,
 }
@@ -136,6 +138,7 @@ impl Widget {
             text_src,
             started: Instant::now(),
             hidden: false,
+            cfg_watch: Watch::new(config_path()),
             last_frame: None,
         }
     }
@@ -151,6 +154,15 @@ impl Widget {
     /// 数字行这一帧要不要带百分秒。时钟挂件显示的是系统时间，恒不到秒以下。
     fn shows_centis(&self) -> bool {
         self.config.centiseconds && self.timer.mode != Mode::Clock
+    }
+
+    /// 计时模式（非时钟、非到点顶替）下的数字行文本。
+    fn timing_text(&self) -> String {
+        if self.shows_centis() {
+            render::format_centis(self.timer.display_centis(), self.config.time_pad)
+        } else {
+            render::format_time(self.timer.display_secs(), self.config.time_pad)
+        }
     }
 
     /// 挂件当前是否被藏着（后端据此决定要不要呈现）。
@@ -223,6 +235,16 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::SetRunningColor(i) => {
+                // 值串就是配置文件里要写的那串，解析失败（不该发生）就什么都不做
+                let Some(g) = COLOR_OPTIONS.get(i).and_then(|v| Gradient::parse(v)) else {
+                    return false;
+                };
+                if self.config.color_running != g {
+                    self.config.color_running = g;
+                    self.persist_appearance();
+                }
+            }
             Command::SetEffect(effect) => {
                 if self.config.text_effect != effect {
                     self.config.text_effect = effect;
@@ -255,11 +277,59 @@ impl Widget {
     fn persist_appearance(&mut self) {
         self.invalidate();
         self.config.save();
+        // 把自己的写入对齐进基准，否则下一拍会把它当成"用户手改了配置"再绕一圈回来
+        self.cfg_watch.sync();
+    }
+
+    /// 手改配置文件不用重启（GAP #17）。每拍最多 stat 一次，真变了才读文件。
+    fn reload_config(&mut self) {
+        if !self.cfg_watch.changed(Instant::now()) {
+            return;
+        }
+        let next = Config::load();
+        // 值一样就什么都不做：自己的写入、编辑器的原子替换、只改注释都能走到这里
+        if next == self.config {
+            return;
+        }
+        let restart = next.presets != self.config.presets
+            || next.tray_icon != self.config.tray_icon
+            || next.tray_gif != self.config.tray_gif
+            || next.window_pos != self.config.window_pos;
+        self.apply_config(next);
+        eprintln!(
+            "↻ 配置已热加载{}",
+            if restart { "（时长预设 / 托盘图标 / 窗口位置要重启才生效）" } else { "" }
+        );
+    }
+
+    /// 把一份新配置落到挂件与计时器上。拆出来是为了能在不碰真实配置文件的前提下测它。
+    fn apply_config(&mut self, next: Config) {
+        if next.text_source != self.config.text_source {
+            self.text_src = textsrc::Source::new(next.text_source.as_deref());
+        }
+        let running = self.timer.running;
+        self.config = next;
+        self.timer.set_pomo(&self.config.pomo);
+        // 正在跑的时候不动模式与总时长：那是用户此刻正在用的东西，改配置文件
+        // 不该把它掐掉；空着的时候才跟着文件走
+        if !running {
+            if self.timer.mode != self.config.mode {
+                self.timer.set_mode(self.config.mode); // 换模式自带 reset
+            }
+            if self.timer.total != self.config.duration_secs {
+                self.timer.total = self.config.duration_secs;
+                self.timer.reset();
+            }
+        }
+        // 后端每拍从 `Widget::zoom` 结算窗口尺寸，所以这里只改值
+        self.zoom = self.config.zoom;
+        self.invalidate();
     }
 
     /// 推进计时，并处理本次产生的结束事件（通知 + on_finish 命令）。
     pub fn tick(&mut self) {
         self.text_src.refresh();
+        self.reload_config();
         self.timer.maybe_tick();
         let Some(ev) = self.timer.take_finished() else {
             return;
@@ -293,7 +363,7 @@ impl Widget {
 
     /// 滚轮缩放：`dy` 为带符号的格数；返回 `true` 表示倍数确实变了。
     pub fn zoom_by(&mut self, dy: f32) -> bool {
-        let zoom = (self.zoom + dy * 0.25).clamp(0.5, 3.0);
+        let zoom = (self.zoom + dy * 0.25).clamp(ZOOM_MIN, ZOOM_MAX);
         if zoom == self.zoom {
             return false;
         }
@@ -332,14 +402,22 @@ impl Widget {
             None => status,
         };
         let status_color = Gradient::solid(0xA0A0AA);
-        // 时钟模式实时读取本地时间；其余模式显示计时秒数（或百分秒）
+        // 数字行字号只依赖传进来的 scale，所以先算：到点顶替的自定义文本要按
+        // 同一字号裁剪，晚一步就拿不到正确的宽度了
+        let num_scale = scale * 2;
+        // 时钟模式实时读取本地时间；其余模式显示计时数。到点且配了 `timeout_text`
+        // 时整行换成那句话，`"0"` 是"留空"的哨兵值（状态行仍写 DONE，不会以为程序没了）
         let text = if self.timer.mode == Mode::Clock {
             let (h, m, s) = clock::now_hms();
             clock::format_clock(h, m, s, self.config.clock_12h, self.config.clock_seconds)
-        } else if self.shows_centis() {
-            render::format_centis(self.timer.display_centis(), self.config.time_pad)
+        } else if self.timer.is_done() {
+            match self.config.timeout_text.as_deref() {
+                Some("0") => String::new(),
+                Some(t) => text::fit(t, num_scale, width),
+                None => self.timing_text(),
+            }
         } else {
-            render::format_time(self.timer.display_secs(), self.config.time_pad)
+            self.timing_text()
         };
 
         // 动画相位要进指纹，否则内容没变时脏检查会把每一帧都吃掉、特效就定住不动；
@@ -354,7 +432,6 @@ impl Widget {
         // 布局：数字行 8x8 × (scale*2)，状态行 8x8 × scale，垂直居中。
         // 标称盒只按点阵算，TTF 字形从中线向下对基线、向上溢出的部分落进那条 gap，
         // 所以这套算式不随字形来源变化。
-        let num_scale = scale * 2;
         let num_h = 8 * num_scale;
         let status_h = 8 * scale;
         let gap = 4 * scale;
@@ -517,6 +594,52 @@ mod tests {
         // 设定值命令是幂等的：重复执行不会再翻一次
         w.handle_cmd(Command::SetHidden(false));
         assert!(!w.hidden());
+    }
+
+    /// 热加载：空着的计时器跟着文件走，正在跑的不动；缩放与配色当场生效。
+    #[test]
+    fn apply_config_follows_the_file_only_when_idle() {
+        let idle = Config { duration_secs: 60, mode: Mode::Countdown, ..Config::default() };
+        let mut w = Widget::new(idle, false);
+        assert_eq!(w.timer.total, 60);
+        w.apply_config(Config { mode: Mode::Stopwatch, duration_secs: 300, ..Config::default() });
+        assert_eq!((w.timer.mode, w.timer.total), (Mode::Stopwatch, 300), "空着时该跟文件走");
+        assert_eq!(w.timer.display_secs(), 0);
+        w.apply_config(Config { mode: Mode::Countdown, duration_secs: 45, ..Config::default() });
+        w.timer.start();
+        w.apply_config(Config { mode: Mode::Pomodoro, duration_secs: 900, ..Config::default() });
+        assert_eq!(w.timer.mode, Mode::Countdown, "跑动中不该被配置文件掐掉");
+        assert_eq!(w.timer.total, 45);
+        assert!(w.timer.running);
+        w.apply_config(Config { zoom: 2.0, bg_alpha: 128, ..Config::default() });
+        assert_eq!(w.zoom, 2.0, "缩放是当场结算的");
+        assert_eq!(w.config.bg_alpha, 128);
+    }
+
+    /// 到点顶替数字行：自定义文本（含中文）走字形层，`"0"` 是留空，没配就照旧显示 0。
+    #[test]
+    fn timeout_text_replaces_the_number_row() {
+        let t0 = Instant::now();
+        let done = |w: &mut Widget| {
+            w.timer.tick_at(t0);
+            w.timer.tick_at(t0 + Duration::from_secs(2));
+            assert!(w.timer.is_done());
+            assert!(w.build_frame(200, 100, 1).is_some());
+        };
+        let cfg = Config { duration_secs: 1, timeout_text: Some("时间到".into()), ..Config::default() };
+        let mut w = Widget::new(cfg, true);
+        done(&mut w);
+        assert_eq!(last_text(&w), "时间到");
+        assert_eq!(last_status(&w), "DONE", "状态行仍要说清楚是结束了");
+
+        let blank = Config { duration_secs: 1, timeout_text: Some("0".into()), ..Config::default() };
+        let mut w2 = Widget::new(blank, true);
+        done(&mut w2);
+        assert_eq!(last_text(&w2), "");
+
+        let mut w3 = Widget::new(Config { duration_secs: 1, ..Config::default() }, true);
+        done(&mut w3);
+        assert_eq!(last_text(&w3), "0s", "没配就该保持原来的样子");
     }
 
     /// 走动的百分秒要把心跳提到 20ms；停住了、以及时钟模式都不该提这一档。

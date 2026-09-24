@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{ALPHA_STEPS, Config, PALETTES, preset_label};
+use crate::config::{ALPHA_STEPS, COLOR_OPTIONS, Config, PALETTES, color_label, preset_label};
 use crate::effect::{EFFECTS, Effect, Gradient};
 use crate::gif;
 use crate::render::{PADS, Pad};
@@ -48,6 +48,8 @@ pub enum Command {
     SetAlpha(u8),
     /// 套用 `config::PALETTES` 的第 i 套配色。
     SetPalette(usize),
+    /// 只换运行中的数字色：套用 `config::COLOR_OPTIONS` 的第 i 条（Catime 的那 30 条值）。
+    SetRunningColor(usize),
     /// 换文字特效（写回 `text_effect`，与透明度/配色同样要落盘）。
     SetEffect(Effect),
     /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
@@ -148,6 +150,7 @@ impl Command {
             Command::SetMode(m) => Some(Check::Mode(m)),
             Command::SetAlpha(a) => Some(Check::Alpha(a)),
             Command::SetPalette(i) => Some(Check::Palette(i)),
+            Command::SetRunningColor(i) => Some(Check::RunningColor(i)),
             Command::SetEffect(e) => Some(Check::Effect(e)),
             Command::SetIcon(m) => Some(Check::Icon(m)),
             Command::ToggleCentiseconds => Some(Check::Centiseconds),
@@ -166,6 +169,7 @@ enum Check {
     Mode(Mode),
     Alpha(u8),
     Palette(usize),
+    RunningColor(usize),
     Effect(Effect),
     Icon(IconMode),
     /// 下面三个是勾选框（各自独立），上面五个是单选组。勾选框只有一项，不必带值。
@@ -184,6 +188,8 @@ struct State {
     alpha: u8,
     /// 配置里的四色恰好等于某套预设时才是 `Some`；用户手改过颜色就是 `None`
     palette: Option<usize>,
+    /// 当前运行色恰好是 `COLOR_OPTIONS` 里的那 30 条之一时才是 `Some`
+    running_color: Option<usize>,
     effect: Effect,
     icon: IconMode,
     /// 数字行有没有带百分秒。
@@ -211,6 +217,9 @@ impl State {
             }),
             effect: cfg.text_effect,
             icon: cfg.tray_icon,
+            running_color: COLOR_OPTIONS.iter().position(|v| {
+                Gradient::parse(v).is_some_and(|g| g == cfg.color_running)
+            }),
             centis: cfg.centiseconds,
             pad: cfg.time_pad,
             clock_seconds: cfg.clock_seconds,
@@ -230,6 +239,7 @@ impl State {
             Check::Mode(m) => self.mode == m,
             Check::Alpha(a) => self.alpha == a,
             Check::Palette(i) => self.palette == Some(i),
+            Check::RunningColor(i) => self.running_color == Some(i),
             Check::Effect(e) => self.effect == e,
             Check::Icon(m) => self.icon == m,
             Check::Centiseconds => self.centis,
@@ -247,7 +257,19 @@ impl State {
                 self.alpha = a;
                 // 透明度不改变配色，但自定义过的配色不该再算命中任何预设
             }
-            Command::SetPalette(i) => self.palette = Some(i),
+            Command::SetPalette(i) => {
+                self.palette = Some(i);
+                // 整套四色预设的运行色也可能正好是那 30 条之一，两组的勾要一起对
+                self.running_color = COLOR_OPTIONS.iter().position(|v| {
+                    Gradient::parse(v).is_some_and(|g| g == Gradient::solid(PALETTES[i].running))
+                });
+            }
+            Command::SetRunningColor(i) => {
+                self.running_color = Some(i);
+                // 只换运行色，那"四色一套"的勾就不该再亮着（除非新值恰好仍命中某套，
+                // 而托盘自持的那份状态算不出这件事，宁可留空）
+                self.palette = None;
+            }
             Command::SetEffect(e) => self.effect = e,
             Command::SetIcon(m) => self.icon = m,
             Command::ToggleCentiseconds => self.centis = !self.centis,
@@ -347,6 +369,10 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     let palette = n.len() as i32;
     n.push(submenu("配色预设"));
     n[look as usize].children.push(palette);
+    // 30 条取自 Catime 的数字色（含渐变）：只换运行色，不动背景与另两态
+    let colors = n.len() as i32;
+    n.push(submenu("文字颜色"));
+    n[look as usize].children.push(colors);
     let effects = n.len() as i32;
     n.push(submenu("文字特效"));
     n[look as usize].children.push(effects);
@@ -366,6 +392,11 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
         let id = n.len() as i32;
         n.push(button(p.name, Command::SetPalette(i)));
         n[palette as usize].children.push(id);
+    }
+    for (i, v) in COLOR_OPTIONS.iter().enumerate() {
+        let id = n.len() as i32;
+        n.push(button(&color_label(v), Command::SetRunningColor(i)));
+        n[colors as usize].children.push(id);
     }
     for e in EFFECTS {
         let id = n.len() as i32;
@@ -1550,24 +1581,38 @@ mod tests {
         let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
         assert_eq!(
             look.children.len(),
-            5,
-            "外观下应是 透明度 / 配色 / 文字特效 / 图标内容 / 时间格式 五个子菜单"
+            6,
+            "外观下应是 透明度 / 配色 / 文字颜色 / 文字特效 / 图标内容 / 时间格式 六个子菜单"
         );
         let acts = |parent: i32| -> Vec<Option<Command>> {
             n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
         };
-        let (alpha_id, palette_id, effect_id, icon_id, fmt_id) = (
+        let (alpha_id, palette_id, colors_id, effect_id, icon_id, fmt_id) = (
             look.children[0],
             look.children[1],
             look.children[2],
             look.children[3],
             look.children[4],
+            look.children[5],
         );
         assert_eq!(n[alpha_id as usize].label, "背景透明度");
         assert_eq!(n[palette_id as usize].label, "配色预设");
+        assert_eq!(n[colors_id as usize].label, "文字颜色");
         assert_eq!(n[effect_id as usize].label, "文字特效");
         assert_eq!(n[icon_id as usize].label, "图标内容");
         assert_eq!(n[fmt_id as usize].label, "时间格式");
+
+        // 那 30 条取自 Catime 的数字色要一条条排进菜单，标签就是值串本身
+        let colors = acts(colors_id);
+        assert_eq!(colors.len(), COLOR_OPTIONS.len());
+        for (k, id) in n[colors_id as usize].children.iter().enumerate() {
+            assert_eq!(n[*id as usize].command, Some(Command::SetRunningColor(k)));
+            assert_eq!(n[*id as usize].label, color_label(COLOR_OPTIONS[k]), "第 {k} 条标签不对");
+        }
+        // 每条都得能被 Gradient 解析，否则点了就是静默无效
+        for v in COLOR_OPTIONS {
+            assert!(Gradient::parse(v).is_some(), "{v} 解析不出渐变");
+        }
 
         let alpha = acts(alpha_id);
         assert_eq!(alpha.len(), ALPHA_STEPS.len());
@@ -1676,6 +1721,7 @@ mod tests {
                 Command::SetMode(_)
                     | Command::SetAlpha(_)
                     | Command::SetPalette(_)
+                    | Command::SetRunningColor(_)
                     | Command::SetEffect(_)
                     | Command::SetIcon(_)
                     | Command::SetTimePad(_)

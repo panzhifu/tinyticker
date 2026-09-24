@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::effect::{Effect, Gradient};
 use crate::parse::parse_duration;
@@ -17,6 +18,14 @@ const CONFIG_FILE: &str = "config.conf";
 
 /// 单段时长的上限：24 小时。再长更可能是写错了单位而不是有意为之。
 const MAX_SPAN: u32 = 86_400;
+
+/// 缩放倍数的上下限。做成常量是因为这两头以前各写一份字面量（配置解析里一份、
+/// `Widget::zoom_by` 里一份），改上限必然漏掉一边。
+///
+/// 下限 0.5：窗口按 `LOGICAL_SIZE × zoom` 算，再小会裁切数字。
+/// 上限 6.0：200×100 的逻辑画布放到 1200×600，够当一块小投影屏用了。
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 6.0;
 
 /// 出厂时长预设（秒）。菜单标签由 [`preset_label`] 现算，不再手写。
 pub const DEFAULT_PRESETS: [u32; 6] = [60, 300, 900, 1500, 2700, 3600];
@@ -68,9 +77,57 @@ pub fn preset_label(secs: u32) -> String {
     parts.join(" ")
 }
 
+/// 数字行颜色的 30 条预设，**逐条取自 Catime** 的 `DEFAULT_COLOR_OPTIONS_INI`
+/// （`include/config/config_constants.h:46-52`）：9 个纯色 + 20 条两段渐变 +
+/// 1 条五段渐变。值串格式与我们自己的 `color_running` 完全一致（`_` 分隔、
+/// 超过两个停靠点会自动流动），所以这里是原值照抄而不是另编一套。
+///
+/// 与 [`PALETTES`] 的分工：那一组是"四色一套"的整体气质预设（含背景与三态），
+/// 这一组只换运行中的数字色，给想要单个颜色的人。
+pub const COLOR_OPTIONS: [&str; 30] = [
+    "#FFFFFF",
+    "#E3E3E5",
+    "#000000",
+    "#FF5F5F",
+    "#F6ABB7",
+    "#FB7FA4",
+    "#F59E0B",
+    "#22C55E",
+    "#8771C6",
+    "#FF9A9E_#FECFEF",
+    "#FEA5B7_#FFDE9B",
+    "#A8EDEA_#FED6E3",
+    "#D299C2_#FEF9D7",
+    "#FF9966_#FF5E62",
+    "#ED4264_#FFEDBC",
+    "#F6D365_#FDA085",
+    "#FFE985_#FA742B",
+    "#FF9A56_#56CCBA",
+    "#10BD92_#8CE442",
+    "#11998E_#38EF7D",
+    "#43E97B_#38F9D7",
+    "#FFFFFF_#00FFFF",
+    "#89F7FE_#66A6FF",
+    "#00C9FF_#92FE9D",
+    "#648CFF_#64DC78",
+    "#1F92A9_#EEE0D5",
+    "#8E9EF3_#F774A0",
+    "#FF5E96_#56C6FF",
+    "#30CFD0_#330867",
+    "#FFA745_#FE869F_#EF7AC8_#A083ED_#43AEFF",
+];
+
+/// 预设颜色在菜单上的标签：去掉 `#`、把 `_` 换成 `→`，读起来就是"这串值长什么样"。
+///
+/// 不给它们编中文名：30 个名字是我造出来的数据，而这一串恰好就是配置文件里要写的值。
+pub fn color_label(value: &str) -> String {
+    value.replace('#', "").replace('_', "→")
+}
+
 /// 托盘「外观 → 配色」子菜单套用的一组四色。
 ///
-/// 只给预设、不做调色板：本项目没有对话框，改色要么点预设要么编辑配置文件。
+/// 只给预设、不做调色板对话框：改色要么点这一组、要么点「文字颜色」那 30 条、
+/// 要么编辑配置文件（工作区版本起改了即时生效）。
 pub struct Palette {
     pub name: &'static str,
     pub bg: u32,
@@ -153,7 +210,7 @@ pub struct Config {
     pub color_done: Gradient,
     /// 文字特效。渐变与特效都只作用于文字，背景不受影响。
     pub text_effect: Effect,
-    /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 `Widget::zoom_by` 的 clamp 范围保持一致）。
+    /// 窗口缩放倍数（滚轮调节，`ZOOM_MIN`-`ZOOM_MAX`；两端共用同一对常量）。
     /// 下限 0.5 是因窗口按 LOGICAL_SIZE×zoom 计算，再小会裁切数字。
     pub zoom: f32,
     /// 透明区域是否让鼠标穿透：开启后只有文字范围接收点击（不再挡住下方窗口），
@@ -176,9 +233,14 @@ pub struct Config {
     pub pomo: Pomo,
     /// 托盘「时长预设」子菜单的档位（秒，按配置顺序），点击即重置并开始。
     pub presets: Vec<u32>,
-    /// 倒计时归零 / 番茄钟专注完成时执行的命令（经 `sh -c` 解释）。
+    /// 倒计时归零 / 番茄钟跑完时执行的命令（经 `sh -c` 解释）。
     /// 例如锁屏 `loginctl lock-session`、关机 `systemctl poweroff`。
     pub on_finish: Option<String>,
+    /// 到点之后数字行显示什么（对齐 Catime 的 `CLOCK_TIMEOUT_TEXT`）。
+    ///
+    /// 空 = 保持现状（显示 `0s` / `0.00s`）；`"0"` = 整行留空；其它文本（可中文）
+    /// 直接顶替数字。状态行仍会写 `DONE`，所以留空不会让人以为程序没了。
+    pub timeout_text: Option<String>,
     /// 外部文本源文件（可选）。非空时它的第一行会顶替状态行内容；
     /// 支持开头的 `~/`。文件缺失/为空/超限时状态行回到挂件自己的内容。
     pub text_source: Option<String>,
@@ -210,6 +272,7 @@ impl Default for Config {
             pomo: Pomo::default(),
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
+            timeout_text: None,
             text_source: None,
             text_font: TextFont::default(),
             window_pos: None,
@@ -340,7 +403,7 @@ impl Config {
                 }
                 "zoom" => {
                     if let Ok(z) = value.parse::<f32>()
-                        && (0.5..=3.0).contains(&z)
+                        && (ZOOM_MIN..=ZOOM_MAX).contains(&z)
                     {
                         cfg.zoom = z;
                     }
@@ -403,6 +466,11 @@ impl Config {
                         cfg.on_finish = Some(value.to_string());
                     }
                 }
+                "timeout_text" => {
+                    if !value.is_empty() {
+                        cfg.timeout_text = Some(value.to_string());
+                    }
+                }
                 "text_source" => {
                     if !value.is_empty() {
                         cfg.text_source = Some(value.to_string());
@@ -446,7 +514,7 @@ impl Config {
     }
 
     fn serialize(&self) -> String {
-        let mut out = String::from("# tinyticker 配置（手动编辑后重启生效）\n");
+        let mut out = String::from("# tinyticker 配置（手动编辑后即时生效，见 README「配置」一节）\n");
         out.push_str(&format!("duration = {}\n", self.duration_secs));
         let presets: Vec<String> = self.presets.iter().map(u32::to_string).collect();
         out.push_str(&format!("presets = {}\n", presets.join(", ")));
@@ -470,6 +538,9 @@ impl Config {
         if let Some(cmd) = &self.on_finish {
             out.push_str(&format!("on_finish = {cmd}\n"));
         }
+        if let Some(text) = &self.timeout_text {
+            out.push_str(&format!("timeout_text = {text}\n"));
+        }
         if let Some(path) = &self.text_source {
             out.push_str(&format!("text_source = {path}\n"));
         }
@@ -487,6 +558,59 @@ impl Config {
             out.push_str(&format!("window_x = {x}\nwindow_y = {y}\n"));
         }
         out
+    }
+}
+
+/// 配置文件的变更探测：与 `textsrc` 同一手法，每拍一次 `stat`，靠 `(大小, mtime)`
+/// 判断要不要重读。
+///
+/// 为什么不用 inotify：Catime 那边其实是"目录 watcher + stat 兜底"两套并行
+/// （`config_watcher_thread.c` 与 `config_ini_read.c` 的 100 ms 节流兜底），我们只做
+/// 兜底那一套——它已经把延迟压进一个心跳以内，代价是一个 syscall，而 inotify 要新开
+/// 一组 libc FFI、一条阻塞线程和它的 fd 生命周期。手改配置的延迟敏感不到哪里去。
+pub struct Watch {
+    path: Option<PathBuf>,
+    /// 上次看到的 (大小, 修改时间)；`None` = 还没基准（文件当时读不到）
+    stamp: Option<(u64, SystemTime)>,
+    at: Instant,
+    every: Duration,
+}
+
+impl Watch {
+    /// 以当前磁盘状态为基准：启动时刚读过，不该立刻又算一次"变了"。
+    pub fn new(path: Option<PathBuf>) -> Self {
+        let mut w = Self { path, stamp: None, at: Instant::now(), every: Duration::from_millis(250) };
+        w.sync();
+        w
+    }
+
+    /// 把基准对齐到文件的当前状态。我们自己刚写完配置时用它，免得把自己的写入
+    /// 当成外部编辑再绕一圈回来。
+    pub fn sync(&mut self) {
+        self.stamp = self.stat_now();
+    }
+
+    fn stat_now(&self) -> Option<(u64, SystemTime)> {
+        let meta = fs::metadata(self.path.as_ref()?).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    }
+
+    /// 文件被外部改过（或删掉又建回来）时返回 true。`now` 由调用方给，测试里注入假时间。
+    pub fn changed(&mut self, now: Instant) -> bool {
+        // 20ms 心跳那一档不该每秒 stat 五十次
+        if now.duration_since(self.at) < self.every {
+            return false;
+        }
+        self.at = now;
+        match self.stat_now() {
+            Some(stamp) if Some(stamp) == self.stamp => false,
+            Some(stamp) => {
+                self.stamp = Some(stamp);
+                true
+            }
+            // 编辑器正在 rename：这一拍不认，基准留着，下一拍再看
+            None => false,
+        }
     }
 }
 
@@ -511,6 +635,7 @@ mod tests {
             pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 },
             presets: vec![90, 600, 5400],
             on_finish: Some("loginctl lock-session".into()),
+            timeout_text: Some("时间到".into()),
             text_source: Some("~/tmp/tinyticker-out.txt".into()),
             window_pos: Some((-10, 200)),
             ..Config::default()
@@ -783,6 +908,32 @@ mod tests {
             .collect();
         assert!(extras.is_empty(), "临时文件没清掉: {extras:?}");
         assert!(fs::remove_dir_all(&dir).is_ok());
+    }
+
+    /// 配置变更探测：靠 `(大小, mtime)` 认外部编辑，节流窗口内不重复 stat，
+    /// 自己的写入可以用 `sync()` 抹掉。
+    #[test]
+    fn watch_notices_external_edits() {
+        let dir = std::env::temp_dir().join(format!("tinyticker-watch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.conf");
+        fs::write(&path, "duration = 60\n").unwrap();
+        let mut w = Watch::new(Some(path.clone()));
+        let t0 = Instant::now();
+        assert!(!w.changed(t0), "刚建立基准不该立刻算变了");
+        fs::write(&path, "duration = 1500\n").unwrap();
+        assert!(!w.changed(t0), "节流窗口内不该去 stat");
+        assert!(w.changed(t0 + Duration::from_millis(300)), "文件变了要认出来");
+        assert!(!w.changed(t0 + Duration::from_millis(600)), "同一份内容不该报第二次");
+        fs::write(&path, "duration = 900\n").unwrap();
+        w.sync();
+        assert!(!w.changed(t0 + Duration::from_millis(1000)), "自己的写入该被抹掉");
+        // 文件正被编辑器 rename 走：不认、不 panic，基准留着等下一拍
+        fs::remove_file(&path).unwrap();
+        assert!(!w.changed(t0 + Duration::from_millis(1300)));
+        // 没有合格路径（HOME / XDG_CONFIG_HOME 都不在）时整个探测静默
+        assert!(!Watch::new(None).changed(t0 + Duration::from_millis(2000)));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

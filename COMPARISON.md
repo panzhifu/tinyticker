@@ -13,7 +13,7 @@
 | 定位 | 极简悬浮计时器（自用 / 学习向） | 功能完整的轻量计时工具箱 |
 | 平台 | Linux（Wayland 优先，X11 可选编译）；目标就是只做 Linux，不做跨平台移植 | 仅 Windows |
 | 语言 / 技术栈 | Rust + 自研 Wayland 客户端（layer-shell + ARGB shm，直调 libwayland-client）+ 自研 X11 客户端（override-redirect ARGB，直调 libX11）+ 自研托盘（直调 libdbus） | 纯 C + Win32 API + GDI |
-| 二进制体积 | 0.57 MB 两个产物（Wayland 极小版 592 640 B / 含 X11 通用版 601 400 B），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
+| 二进制体积 | Wayland 极小版 0.57 MB（600 016 B）/ 含 X11 通用版 0.58 MB（609 240 B），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
 | 许可 | MIT | Apache-2.0 |
 
 ## 二、功能对比表
@@ -34,10 +34,10 @@
 | 隐藏 / 显示挂件 | ✅（工作区版本：托盘「👻 隐藏挂件」+ `tinyticker --hide` / `--show` 经单实例套接字下命令，所以 DE 快捷键直接绑得到。计时照跑、心跳回落到最慢档。**Wayland 侧的约束**：layer-shell 不允许未锚定的表面尺寸为 0，`attach(NULL)` 会被合成器掐断，所以隐藏是一帧全透明 + 空输入区域——看不见也点不到，但窗口列表里还在；X11 是正经 `XUnmapWindow`） | ✅（专用热键 `HOTKEY_TOGGLE_VISIBILITY` + 菜单项，另有 `NO_DISPLAY` 启动模式） |
 | 拖动移动 | ✅（左键 drag_window） | ✅（编辑模式拖动） |
 | 窗口位置记忆 | ✅（0.2.0 退出保存、启动恢复；0.5.0 起 Wayland 的 layer-shell 路径也生效，坐标统一存逻辑像素） | ✅ |
-| 滚轮缩放 | ✅（0.4.0，`zoom` 0.5-3.0，自动持久化） | ✅ |
+| 滚轮缩放 | ✅（0.4.0，`zoom` 0.5-6.0，自动持久化；上下限做成 `ZOOM_MIN`/`ZOOM_MAX` 一对常量，配置解析与滚轮共用） | ✅ |
 | 点击穿透 | ✅（0.4.0，`click_through` 开启后只有文字接收输入；Wayland 走 input region，0.5.0 起 X11 也支持（直调 libXext 的 `XShapeCombineRectangles`）） | ✅（**且是默认态**：非编辑模式下整窗 `WS_EX_TRANSPARENT`，`window_events.c:41`、`drag_scale_edit.c:143`，还按光标位置 50 ms 轮询切换"软穿透"。**先前记的 ❌ 是错的，已在 GAP.md §十勘误**） |
 | **视觉自定义** | | |
-| 颜色自定义 | ✅（0.2.0 配置文件设四色；工作区版本加托盘「外观 → 配色预设」6 套，点击即时重绘并写回配置。文字三色可写 `_` 分隔的横向渐变，2-20 个停靠点、超过 2 个自动流动——与 Catime 同语法同规则。仍无调色板对话框） | ✅ **30 套预设**（9 纯色 + 21 条渐变，`config_constants.h:46-53`；先前记的"15 种"不准）+ 自绘 HSV 取色器（SV 画布 / 色相条 / HEX+RGB 输入 / 已存色板 / 屏幕取色）+ CSS 颜色名与 `rgb()` 解析 |
+| 颜色自定义 | ✅（0.2.0 配置文件设四色；工作区版本加托盘「外观 → 配色预设」6 套整体配色，以及「外观 → 文字颜色」**30 条数字色预设——逐条取自 Catime 的 `DEFAULT_COLOR_OPTIONS_INI`**，点击即时重绘并写回配置。文字三色可写 `_` 分隔的横向渐变，2-20 个停靠点、超过 2 个自动流动——与 Catime 同语法同规则。仍无 HSV 取色器对话框） | ✅ **30 套预设**（9 纯色 + 21 条渐变，`config_constants.h:46-53`；先前记的"15 种"不准）+ 自绘 HSV 取色器（SV 画布 / 色相条 / HEX+RGB 输入 / 已存色板 / 屏幕取色）+ CSS 颜色名与 `rgb()` 解析 |
 | 文字特效 | ✅（工作区版本，`text_effect`：`NONE/GLOW/GLASS/NEON/HOLOGRAPHIC/LIQUID/AQUA/RETRO`，值串与 Catime 逐字一致。软渲染实现：覆盖度图 + 可分离盒模糊 + 腐蚀求轮廓 + 梯度幅度描边 + 正弦/value-noise 位移 + 预乘合成。**但半径与位移量按 8x8 位图字形重定**，不是照抄 Catime 针对几十像素 TTF 字形的常数，所以是同一族观感而非逐像素复刻） | ✅ 7 种（Glow / Optical Prism / Neon / Holographic / Liquid / Aqua / Retro），作用在大字号 TTF 上 |
 | 字体 | 数字行内置 8x8 位图（仅 ASCII）；状态行里点阵补不到的码位（中文、Latin-1、符号）由运行时 dlopen 的 libfreetype 用宿主字体补齐，两种字形同基线混排。二进制不带字体数据，`text_font` 可指定路径或关掉 | 13 款内嵌 TTF（出厂即为裁剪过的 "Essence" 子集）+ 自定义字体目录 + 系统字体选择对话框。缺字逐字回落到备用字体；四张字形缓存带世代号失效。**裁剪工具在官网、不在仓库**（`tools/` 只有图标/资源打包脚本） |
 | 字号缩放 | ✅ 跟随 DPI + 滚轮自由调节（0.4.0）；工作区版本起在**托盘图标上滚动**同样缩放（SNI `Scroll`） | 滚轮自由调节 |
@@ -60,7 +60,7 @@
 | 锁屏 / 关机 / 重启 | ✅（0.4.0，经 `on_finish` 命令，如 `loginctl lock-session`） | ✅ |
 | 打开文件 / 自定义命令 | ✅（0.4.0，`on_finish` 任意 shell 命令） | ✅ |
 | **扩展性** | | |
-| 配置持久化 | ✅（0.2.0 起，纯 std 手写格式；0.4.0 扩展为时长/模式/颜色/透明度/缩放/番茄钟/结束命令/窗口位置，工作区版本再加显示精度与文字字形） | ✅ INI 文件，**92 个元数据项**（`config_defaults.c:18-129`）：改文件即时生效（目录 watcher + 200 ms 去抖 + 三元组复核），写入走临时文件原子替换，非法值自愈写回。我们改配置需重启，且非原子写 |
+| 配置持久化 | ✅（0.2.0 起，纯 std 手写格式；0.4.0 扩展为时长/模式/颜色/透明度/缩放/番茄钟/结束命令/窗口位置，工作区版本再加显示精度与文字字形；**手改文件即时生效**（stat 轮询热加载），写入走临时文件 + `rename` 的原子替换） | ✅ INI 文件，**92 个元数据项**（`config_defaults.c:18-129`）：改文件即时生效（目录 watcher + 200 ms 去抖 + 三元组复核），写入走临时文件原子替换，非法值自愈写回 |
 | 插件系统 | ⚠️ 只做显示那半边（工作区版本：`text_source` 指向的文件第一行顶替状态行，带 64 KB 上限与 (大小,mtime) 变化检测；**不执行任何外部程序**） | ✅（`output.txt` 文件通信 + `<notify>`/`<exit>` 行内控制标签 + 74 种脚本扩展名 + SHA-256 信任门 + Job Object 进程树回收 + 单插件热重载。注意：**脚本要用户在托盘菜单里逐个启动，并没有开机自动拉起**——先前记的"自动拉起"不准，见 GAP.md §十勘误 7） |
 | 国际化 | 无 UI 文本（托盘文案硬编码中文；挂件受 8x8 ASCII 字体限制画不出中文） | ✅ 10 个 locale（简体/繁體/英/法/德/日/韩/葡/俄/西），切换走托盘子菜单，另有带俄语三条复数规则与 CJK 去空格的本地化时长串 |
 | 安装分发 | GitHub Releases（版本化产物名 + SHA256SUMS + freedesktop 元数据）；AUR 待建 | winget / GitHub Releases |
@@ -69,7 +69,7 @@
 
 1. **零第三方依赖**：Wayland / X11 / D-Bus 全部运行时 dlopen 系统库，协议客户端、托盘、时区读取都是自研；`Cargo.lock` 里只有本项目自己一个包，构建不需要任何 `-dev` 包。
 2. **内存安全的 Rust 实现**：无 C 的 UB/内存泄漏风险（Catime 的 commit 历史中有多个 security hardening 修复）。
-3. **体积同量级**：0.57 MB（含 X11 后端、字形层与单实例套接字；UPX 后待 CI 实测）对比 995 KB，且是 64 位 + Wayland/X11 双后端，二进制里不含任何字体数据。
+3. **体积同量级**：0.58 MB（含 X11 后端、字形层、单实例套接字与配置热加载；UPX 后待 CI 实测）对比 995 KB，且是 64 位 + Wayland/X11 双后端，二进制里不含任何字体数据。
 4. **现代构建链**：cargo 管理，无手工 Makefile / build.bat 差异。
 
 ## 四、roadmap 完成情况
@@ -86,7 +86,7 @@
 | ★★☆ 自定义颜色 | ✅ 0.2.0 | 配置文件四色键（背景 + 三态数字色），支持 `#RRGGBB` 等写法 |
 | ★☆☆ 半透明背景 | ✅ 0.3.0 | 原估"+4 MB（换 wgpu）"不成立：softbuffer 的 Wayland 后端硬编码 XRGB 才是唯一障碍。自研 ~250 行 ARGB shm 呈现（复用其连接管线），X11 走 depth-32 visual，体积零增量；Wayland 真机验证通过 |
 | ★☆☆ 番茄钟 | ✅ 0.4.0 | `Phase::Work/Break` 自动轮转 + `round` 计数，阶段结束发通知并自动进入下一阶段；时长走 `pomo_work` / `pomo_break`。预设与通知的基建复用，实际成本低于预估 |
-| ★☆☆ 滚轮缩放 | ✅ 0.4.0 | wheel 事件改 `zoom`（0.5-3.0），`font_scale = round(scale_factor × zoom)` 并把窗口请求到 `LOGICAL_SIZE × zoom` |
+| ★☆☆ 滚轮缩放 | ✅ 0.4.0 | wheel 事件改 `zoom`（0.5-3.0，工作区版本上限提到 6.0），`font_scale = round(scale_factor × zoom)` 并把窗口请求到 `LOGICAL_SIZE × zoom` |
 | ★☆☆ 绝对时间输入 | ✅ 0.4.0 | `parse_absolute("14:30")` → 距现在秒数（已过按明天算），成本确如预估为低 |
 | ★☆☆ 自定义结束命令 | ✅ 0.4.0 | 原清单未列，作为"锁屏/关机"的通用替代：`on_finish` 配置任意 shell，一条路径覆盖多个场景 |
 | ★☆☆ 番茄钟长休息 + 组数上限 | ✅ 工作区版本 | `Phase` 加 `LongBreak`：每跑满 `pomo_rounds` 轮专注插一次 `pomo_long_break`（0 = 关闭）；`pomo_cycles` 限定跑几组后收工显示 DONE（0 = 不限，保住旧行为）。收工判定挂在"组界"上而不是长休息本身，所以关掉长休息也停得下来 |
@@ -119,4 +119,4 @@
 
 差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透，0.5.0 补上 Wayland 置顶与自定位（不再需要合成器规则），工作区版本清掉长休息/可配预设/文字特效/渐变/占用表/外部文本源六项，再补状态行中文（字形层）。本次逐文件读码另需修正本表 6 处（点击穿透、Catime 版本号、预设数、绝对时间语法、字体裁剪工具归属、插件启动方式）——见 GAP.md §十。
 
-> 体积验证：Wayland 极小版 0.57 MB / 含 X11 通用版 0.57 MB（未压缩，592 640 / 601 400 字节；这一批 #15+#2+#4+#7+#14+#18 六项合计长了 8.6 KB）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。
+> 体积验证：Wayland 极小版 0.57 MB / 含 X11 通用版 0.58 MB（未压缩，600 016 / 609 240 字节；#15+#2+#4+#7+#14+#18+#17+#3+#5+#6+#8 十一项合计长了 16 KB）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。
