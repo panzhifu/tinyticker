@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{ALPHA_STEPS, Config, PALETTES, preset_label};
+use crate::effect::{EFFECTS, Effect, Gradient};
 use crate::gif;
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
@@ -46,6 +47,8 @@ pub enum Command {
     SetAlpha(u8),
     /// 套用 `config::PALETTES` 的第 i 套配色。
     SetPalette(usize),
+    /// 换文字特效（写回 `text_effect`，与透明度/配色同样要落盘）。
+    SetEffect(Effect),
     /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
     SetIcon(IconMode),
     Quit,
@@ -130,6 +133,7 @@ impl Command {
             Command::SetMode(m) => Some(Check::Mode(m)),
             Command::SetAlpha(a) => Some(Check::Alpha(a)),
             Command::SetPalette(i) => Some(Check::Palette(i)),
+            Command::SetEffect(e) => Some(Check::Effect(e)),
             Command::SetIcon(m) => Some(Check::Icon(m)),
             _ => None,
         }
@@ -142,6 +146,7 @@ enum Check {
     Mode(Mode),
     Alpha(u8),
     Palette(usize),
+    Effect(Effect),
     Icon(IconMode),
 }
 
@@ -154,6 +159,7 @@ struct State {
     alpha: u8,
     /// 配置里的四色恰好等于某套预设时才是 `Some`；用户手改过颜色就是 `None`
     palette: Option<usize>,
+    effect: Effect,
     icon: IconMode,
     /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
     gif: bool,
@@ -166,10 +172,11 @@ impl State {
             alpha: cfg.bg_alpha,
             palette: PALETTES.iter().position(|p| {
                 p.bg == cfg.color_bg
-                    && p.running == cfg.color_running
-                    && p.paused == cfg.color_paused
-                    && p.done == cfg.color_done
+                    && Gradient::solid(p.running) == cfg.color_running
+                    && Gradient::solid(p.paused) == cfg.color_paused
+                    && Gradient::solid(p.done) == cfg.color_done
             }),
+            effect: cfg.text_effect,
             icon: cfg.tray_icon,
             gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
         }
@@ -185,6 +192,7 @@ impl State {
             Check::Mode(m) => self.mode == m,
             Check::Alpha(a) => self.alpha == a,
             Check::Palette(i) => self.palette == Some(i),
+            Check::Effect(e) => self.effect == e,
             Check::Icon(m) => self.icon == m,
         }
     }
@@ -198,6 +206,7 @@ impl State {
                 // 透明度不改变配色，但自定义过的配色不该再算命中任何预设
             }
             Command::SetPalette(i) => self.palette = Some(i),
+            Command::SetEffect(e) => self.effect = e,
             Command::SetIcon(m) => self.icon = m,
             _ => {}
         }
@@ -283,13 +292,16 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
         n.push(button(label, Command::SetMode(mode)));
         n[modes as usize].children.push(id);
     }
-    // 外观：透明度 / 配色 / 图标内容，各一个二级子菜单
+    // 外观：透明度 / 配色 / 文字特效 / 图标内容，各一个二级子菜单
     let alpha = n.len() as i32;
     n.push(submenu("背景透明度"));
     n[look as usize].children.push(alpha);
     let palette = n.len() as i32;
     n.push(submenu("配色预设"));
     n[look as usize].children.push(palette);
+    let effects = n.len() as i32;
+    n.push(submenu("文字特效"));
+    n[look as usize].children.push(effects);
     let icon = n.len() as i32;
     n.push(submenu("图标内容"));
     n[look as usize].children.push(icon);
@@ -302,6 +314,11 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
         let id = n.len() as i32;
         n.push(button(p.name, Command::SetPalette(i)));
         n[palette as usize].children.push(id);
+    }
+    for e in EFFECTS {
+        let id = n.len() as i32;
+        n.push(button(e.label(), Command::SetEffect(e)));
+        n[effects as usize].children.push(id);
     }
     for (label, m) in [
         ("🕐 时钟表盘", IconMode::Clock),
@@ -1425,14 +1442,15 @@ mod tests {
     fn appearance_submenu_reaches_every_preset() {
         let n = build_nodes(&Config::default().presets, true);
         let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
-        assert_eq!(look.children.len(), 3, "外观下应是 透明度 + 配色 + 图标 三个子菜单");
+        assert_eq!(look.children.len(), 4, "外观下应是 透明度 + 配色 + 文字特效 + 图标 四个子菜单");
         let acts = |parent: i32| -> Vec<Option<Command>> {
             n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
         };
-        let (alpha_id, palette_id, icon_id) =
-            (look.children[0], look.children[1], look.children[2]);
+        let (alpha_id, palette_id, effect_id, icon_id) =
+            (look.children[0], look.children[1], look.children[2], look.children[3]);
         assert_eq!(n[alpha_id as usize].label, "背景透明度");
         assert_eq!(n[palette_id as usize].label, "配色预设");
+        assert_eq!(n[effect_id as usize].label, "文字特效");
         assert_eq!(n[icon_id as usize].label, "图标内容");
 
         let alpha = acts(alpha_id);
@@ -1449,6 +1467,13 @@ mod tests {
         for (k, id) in n[palette_id as usize].children.iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetPalette(k)));
             assert_eq!(n[*id as usize].label, PALETTES[k].name, "菜单标签与预设对不上");
+        }
+        let effects = acts(effect_id);
+        // 特效加一档忘了登记就会漏在这里
+        assert_eq!(effects.len(), EFFECTS.len());
+        for (k, id) in n[effect_id as usize].children.iter().enumerate() {
+            assert_eq!(n[*id as usize].command, Some(Command::SetEffect(EFFECTS[k])));
+            assert_eq!(n[*id as usize].label, EFFECTS[k].label(), "菜单标签与特效对不上");
         }
         let icons = acts(icon_id);
         // 菜单里的图标项必须与 IconMode 的全部取值一一对应：加一档忘了登记就漏在这里
@@ -1511,7 +1536,11 @@ mod tests {
             let checkable = cmd.check().is_some();
             let in_radio = matches!(
                 cmd,
-                Command::SetMode(_) | Command::SetAlpha(_) | Command::SetPalette(_) | Command::SetIcon(_)
+                Command::SetMode(_)
+                    | Command::SetAlpha(_)
+                    | Command::SetPalette(_)
+                    | Command::SetEffect(_)
+                    | Command::SetIcon(_)
             );
             assert_eq!(checkable, in_radio, "{} 的勾选属性推错了", node.label);
         }
@@ -1545,14 +1574,14 @@ mod tests {
         let p = &PALETTES[2];
         let cfg = Config {
             color_bg: p.bg,
-            color_running: p.running,
-            color_paused: p.paused,
-            color_done: p.done,
+            color_running: Gradient::solid(p.running),
+            color_paused: Gradient::solid(p.paused),
+            color_done: Gradient::solid(p.done),
             ..Config::default()
         };
         assert_eq!(State::from_config(&cfg).palette, Some(2));
 
-        let off = Config { color_done: 0x123456, ..cfg };
+        let off = Config { color_done: Gradient::solid(0x123456), ..cfg };
         assert_eq!(State::from_config(&off).palette, None);
         let st = State::from_config(&off);
         for i in 0..PALETTES.len() {

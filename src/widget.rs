@@ -4,13 +4,15 @@
 //! 输入事件与呈现，一帧的内容由 [`Widget::build_frame`] 产出；内容未变化时返回
 //! `None`，后端据此整帧跳过（连 shm 都不提交）。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tray::TrayHandle;
 
 use crate::clock;
 use crate::config::{Config, PALETTES};
+use crate::effect::{self, Effect, Gradient};
 use crate::render::{self, premultiply, Canvas};
+use crate::text;
 use crate::textsrc;
 use crate::timer::{Finished, Mode, Timer};
 use crate::tray::{self, Command};
@@ -18,40 +20,51 @@ use crate::tray::{self, Command};
 /// 逻辑画布大小（参考值；实际像素缓冲跟随窗口物理尺寸 × 缩放系数）。
 pub const LOGICAL_SIZE: (u32, u32) = (200, 100);
 
-/// 心跳间隔：处理托盘命令与计时的心跳（也驱动重绘）。
+/// 静态内容的心跳间隔。
 ///
 /// 显示内容是秒级变化的，30fps 毫无意义；200ms 既能让托盘点击在
 /// 一次眨眼内响应，又把空转开销降到 1/6。真正的省电靠 [`Widget::build_frame`]
 /// 的脏检查——内容没变时连 shm 都不提交。
 pub const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 
-/// 状态行在当前宽度下能放下多少个字符（8px 字形 × `scale`）。
-/// 外部文本可能很长，不截断的话居中的起点会被压到 0，右边直接被裁掉。
-fn status_budget(width: u32, scale: u32) -> usize {
-    (width as usize / (8 * scale.max(1)) as usize).max(1)
-}
+/// 动画特效的心跳间隔。Catime 给动画特效配的是 33-120ms 的渲染定时器，
+/// 50ms 是同一档；再快也只是白烧 CPU，因为位图字体本身只有 8 像素高。
+pub const ANIM_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 动画相位进帧指纹时的量化步长，与 [`ANIM_INTERVAL`] 对齐。
+const ANIM_STEP_MS: u32 = 50;
 
 /// 一帧的完整内容与布局（buffer 物理像素坐标）。
+///
+/// 只带已栅格化的字形：文本本身在 [`Widget::last_frame`] 的指纹里已经有一份，
+/// 这里再存一遍就是纯粹的死重。
 pub struct Frame {
-    pub text: String,
-    pub status: String,
     pub width: u32,
     pub height: u32,
-    num_color: u32,
-    status_color: u32,
+    /// 两行已栅格化的字形。坐标是绝对的，特效与绘制都直接消费它。
+    num_run: text::Run,
+    status_run: text::Run,
+    num_color: Gradient,
+    status_color: Gradient,
+    effect: Effect,
+    /// 动画时钟（毫秒）。静态配色与静态特效恒为 0，好让脏检查照样能去重。
+    phase_ms: u32,
     bg: u32,
     num_scale: u32,
     status_scale: u32,
-    y_num: i32,
-    y_status: i32,
     click_through: bool,
 }
 
 impl Frame {
     pub fn paint(&self, canvas: &mut Canvas) {
         canvas.fill(self.bg);
-        canvas.draw_text_centered(self.y_num, &self.text, self.num_color, self.num_scale);
-        canvas.draw_text_centered(self.y_status, &self.status, self.status_color, self.status_scale);
+        // 两行各走一遍特效：它们各有各的颜色，合一张遮罩反而要多一次逐像素判断
+        let rows = [
+            effect::Row { run: &self.num_run, scale: self.num_scale },
+            effect::Row { run: &self.status_run, scale: self.status_scale },
+        ];
+        effect::draw(canvas, &rows[..1], &self.num_color, self.effect, self.phase_ms);
+        effect::draw(canvas, &rows[1..], &self.status_color, self.effect, self.phase_ms);
     }
 
     /// 点击穿透时接收输入的区域（surface 逻辑坐标 `x, y, w, h`）；
@@ -60,15 +73,17 @@ impl Frame {
         if !self.click_through {
             return None;
         }
-        // 两行文字并集的包围盒
-        let text_w = render::text_width(self.text.chars().count(), self.num_scale);
-        let status_w = render::text_width(self.status.chars().count(), self.status_scale);
-        let x_num = self.width.saturating_sub(text_w) / 2;
-        let x_status = self.width.saturating_sub(status_w) / 2;
+        // 两行字形实际包围盒的并集：按 run 而不是按"字数 × 8"算，
+        // 否则混排行（点阵 + TTF 中文）的右边会被切掉一截。
+        let x_num = self.width.saturating_sub(self.num_run.width) / 2;
+        let x_status = self.width.saturating_sub(self.status_run.width) / 2;
         let left = x_num.min(x_status);
-        let right = (x_num + text_w).max(x_status + status_w).min(self.width);
-        let top = self.y_num.max(0) as u32;
-        let bottom = (self.y_status.max(0) as u32 + 8 * self.status_scale).min(self.height);
+        let right = (x_num + self.num_run.width)
+            .max(x_status + self.status_run.width)
+            .min(self.width);
+        let top = self.num_run.top.min(self.status_run.top).max(0) as u32;
+        let bottom = (self.num_run.bottom.max(self.status_run.bottom).max(0) as u32).min(self.height);
+        let height = bottom.saturating_sub(top).max(1);
 
         // 物理像素 → surface 坐标（buffer 按 scale_factor 放大过）
         let sf = scale_factor.max(1.0);
@@ -76,7 +91,7 @@ impl Frame {
             (left as f32 / sf).floor() as i32,
             (top as f32 / sf).floor() as i32,
             ((right - left) as f32 / sf).ceil().max(1.0) as i32,
-            (bottom.saturating_sub(top) as f32 / sf).ceil().max(1.0) as i32,
+            (height as f32 / sf).ceil().max(1.0) as i32,
         ))
     }
 }
@@ -89,8 +104,10 @@ pub struct Widget {
     tray: Option<TrayHandle>,
     /// 外部文本源：配了 `text_source` 才碰文件系统
     text_src: textsrc::Source,
-    /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号）。
-    last_frame: Option<(String, String, u32, u32, u32)>,
+    /// 特效动画的时钟原点。
+    started: Instant,
+    /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号 / 动画相位）。
+    last_frame: Option<(String, String, u32, u32, u32, u32)>,
 }
 
 impl Widget {
@@ -109,8 +126,22 @@ impl Widget {
             zoom,
             tray: None,
             text_src,
+            started: Instant::now(),
             last_frame: None,
         }
+    }
+
+    /// 有没有需要持续重绘的东西：动画特效，或会自动流动的渐变。
+    fn animating(&self) -> bool {
+        self.config.text_effect.animated()
+            || self.config.color_running.animated()
+            || self.config.color_paused.animated()
+            || self.config.color_done.animated()
+    }
+
+    /// 心跳间隔：静态内容 200ms 就够，动画特效要 50ms 才看得出流动。
+    pub fn tick_interval(&self) -> Duration {
+        if self.animating() { ANIM_INTERVAL } else { DRAW_INTERVAL }
     }
 
     /// 接收托盘线程发来的句柄（用于发通知）。
@@ -154,9 +185,16 @@ impl Widget {
             Command::SetPalette(i) => {
                 if let Some(p) = PALETTES.get(i) {
                     self.config.color_bg = p.bg;
-                    self.config.color_running = p.running;
-                    self.config.color_paused = p.paused;
-                    self.config.color_done = p.done;
+                    // 预设是单色板；写成预设会把用户手调的渐变覆盖掉，这是点预设的应有之义
+                    self.config.color_running = Gradient::solid(p.running);
+                    self.config.color_paused = Gradient::solid(p.paused);
+                    self.config.color_done = Gradient::solid(p.done);
+                    self.persist_appearance();
+                }
+            }
+            Command::SetEffect(effect) => {
+                if self.config.text_effect != effect {
+                    self.config.text_effect = effect;
                     self.persist_appearance();
                 }
             }
@@ -235,17 +273,18 @@ impl Widget {
         };
         // 数字颜色：时钟常亮运行色；其余按 结束/运行/暂停 三态
         let num_color = match self.timer.mode {
-            Mode::Clock => premultiply(self.config.color_running, 0xFF),
-            _ if self.timer.is_done() => premultiply(self.config.color_done, 0xFF),
-            _ if self.timer.running => premultiply(self.config.color_running, 0xFF),
-            _ => premultiply(self.config.color_paused, 0xFF),
+            Mode::Clock => self.config.color_running.clone(),
+            _ if self.timer.is_done() => self.config.color_done.clone(),
+            _ if self.timer.running => self.config.color_running.clone(),
+            _ => self.config.color_paused.clone(),
         };
-        // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态
+        // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态。
+        // 截断按**实测像素宽**算，不是按字数——中文一格点阵宽写不下时也必须整字退让。
         let status = match self.text_src.text() {
-            Some(external) => external.chars().take(status_budget(width, scale)).collect(),
+            Some(external) => text::fit(external, scale, width),
             None => status,
         };
-        let status_color = premultiply(0xA0A0AA, 0xFF);
+        let status_color = Gradient::solid(0xA0A0AA);
         // 时钟模式实时读取本地时间；其余模式显示计时秒数
         let text = if self.timer.mode == Mode::Clock {
             let (h, m, s) = clock::now_hms();
@@ -254,13 +293,18 @@ impl Widget {
             render::format_time(self.timer.display_secs())
         };
 
-        let key = (text.clone(), status.clone(), width, height, scale);
+        // 动画相位要进指纹，否则内容没变时脏检查会把每一帧都吃掉、特效就定住不动；
+        // 不动画时恒为 0，去重行为和以前一样
+        let phase_ms = if self.animating() { self.started.elapsed().as_millis() as u32 } else { 0 };
+        let key = (text.clone(), status.clone(), width, height, scale, phase_ms / ANIM_STEP_MS);
         if self.last_frame.as_ref() == Some(&key) {
             return None;
         }
         self.last_frame = Some(key);
 
-        // 布局：数字行 8x8 × (scale*2)，状态行 8x8 × scale，垂直居中
+        // 布局：数字行 8x8 × (scale*2)，状态行 8x8 × scale，垂直居中。
+        // 标称盒只按点阵算，TTF 字形从中线向下对基线、向上溢出的部分落进那条 gap，
+        // 所以这套算式不随字形来源变化。
         let num_scale = scale * 2;
         let num_h = 8 * num_scale;
         let status_h = 8 * scale;
@@ -268,19 +312,21 @@ impl Widget {
         let total_h = (num_h + gap + status_h) as i32;
         let y_num = ((height as i32 - total_h) / 2).max(0);
         let y_status = y_num + (num_h + gap) as i32;
+        let num_run = text::shape(&text, num_scale, y_num);
+        let status_run = text::shape(&status, scale, y_status);
 
         Some(Frame {
-            text,
-            status,
             width,
             height,
+            num_run,
+            status_run,
             num_color,
             status_color,
+            effect: self.config.text_effect,
+            phase_ms,
             bg,
             num_scale,
             status_scale: scale,
-            y_num,
-            y_status,
             click_through: self.config.click_through,
         })
     }
@@ -307,6 +353,11 @@ impl Widget {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// 最近一帧的状态行。内容只存在指纹里（`Frame` 不重复存一份），断言就从那儿读。
+    fn last_status(w: &Widget) -> String {
+        w.last_frame.as_ref().expect("还没有产出过帧").1.clone()
+    }
 
     #[test]
     fn toggle_flips_running_and_back() {
@@ -341,16 +392,59 @@ mod tests {
             ..Config::default()
         };
         let mut w = Widget::new(cfg, true);
-        assert_eq!(w.build_frame(200, 100, 1).unwrap().status, "WORK 1");
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "WORK 1");
         let t0 = Instant::now();
         w.timer.tick_at(t0);
         w.timer.tick_at(t0 + Duration::from_secs(1));
-        assert_eq!(w.build_frame(200, 100, 1).unwrap().status, "LONG 1");
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "LONG 1");
         // 长休息走完就是最后一组的结尾：停住并显示 DONE
         w.timer.tick_at(t0 + Duration::from_secs(2));
-        let frame = w.build_frame(200, 100, 1).expect("状态换了就该有新一帧");
-        assert_eq!(frame.status, "DONE");
+        assert!(w.build_frame(200, 100, 1).is_some(), "状态换了就该有新一帧");
+        assert_eq!(last_status(&w), "DONE");
         assert!(!w.timer.running);
+    }
+
+    /// 点击穿透的输入区域必须同时罩住两行字形。这里把默认内容下的矩形钉成具体数字：
+    /// `200×100` 画布、`scale=2` → 数字行 `1:00`(4 字 × 8 × 4 = 128px)、
+    /// 状态行 `PAUSED`(6 字 × 8 × 2 = 96px)，垂直从 `y_num=22` 到状态行底 `78`。
+    /// 改动包围盒算法（比如退回按字数算、或漏掉 TTF 向上溢出的部分）会立刻撞到这里。
+    #[test]
+    fn click_through_rect_spans_both_rows() {
+        let cfg = Config { click_through: true, ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        let f = w.build_frame(200, 100, 2).expect("第一帧总要画");
+        assert_eq!(f.input_rect(1.0), Some((36, 22, 128, 56)));
+        // 没开穿透就整窗接收
+        let mut plain = Widget::new(Config::default(), false);
+        assert_eq!(plain.build_frame(200, 100, 2).unwrap().input_rect(1.0), None);
+    }
+
+    /// 特效开着时脏检查仍要生效：静态内容不该每帧重画。
+    #[test]
+    fn static_effect_still_dedupes_frames() {
+        let cfg = Config { text_effect: Effect::Neon, ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert!(w.build_frame(200, 100, 1).is_none(), "静态特效也该去重，否则白烧 CPU");
+    }
+
+    /// 动画特效 / 自动流动的渐变要把心跳提上去，否则 5fps 看不出流动。
+    #[test]
+    fn animating_content_shortens_the_heartbeat() {
+        let mut w = Widget::new(Config::default(), false);
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "静态内容不该白醒");
+        w.config.text_effect = Effect::Glow;
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "静态特效也不该提频");
+        w.config.text_effect = Effect::Liquid;
+        assert_eq!(w.tick_interval(), ANIM_INTERVAL);
+        w.config.text_effect = Effect::None;
+        // 只有超过两个停靠点的渐变才会自动流动
+        w.config.color_running = Gradient::parse("#111111_#222222_#333333").unwrap();
+        assert_eq!(w.tick_interval(), ANIM_INTERVAL);
+        w.config.color_running = Gradient::parse("#111111_#222222").unwrap();
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "两停靠点是静止渐变");
     }
 
     /// 外观命令带磁盘写（`config.save()`），不适合在单测里走；这里只测它的另一半：

@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod dbus;
+pub mod freetype;
 pub mod wayland;
 pub mod x11;
 
@@ -38,6 +39,19 @@ pub const POLL_IN: i16 = 1;
 
 unsafe extern "C" {
     pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
+}
+
+// —— getuid(2)：给 /tmp 下的套接字文件名带上 uid（见 `crate::ipc`）——
+
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn sys_getuid() -> u32;
+}
+
+/// 当前进程的真实 uid。libc 本来就已硬链，不必 dlopen。
+#[must_use]
+pub fn getuid() -> u32 {
+    unsafe { sys_getuid() }
 }
 
 /// 已打开的共享库。故意不提供 Drop：挂件常驻进程，库映射活到进程结束即可，

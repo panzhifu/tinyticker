@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::effect::{Effect, Gradient};
 use crate::parse::parse_duration;
 use crate::render::{parse_color, rgb};
 use crate::timer::{Mode, Pomo};
@@ -99,6 +100,40 @@ pub const ALPHA_STEPS: [(&str, u8); 5] = [
     ("不透明", 255),
 ];
 
+/// 状态行里点阵覆盖不到的码位（中文、Latin-1、符号）用什么字形补。
+///
+/// 见 [`crate::text`]：内置 8x8 点阵始终优先，这个开关只决定"点阵没有的那些字"
+/// 要不要去问一次 libfreetype。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum TextFont {
+    /// 自动：运行时 `dlopen` libfreetype，并按 [`crate::text`] 里的偏好找一块中文字体。
+    #[default]
+    Auto,
+    /// 完全不用外部字体：非 ASCII 一律留空位（v0.5.0 之前的行为）。
+    Off,
+    /// 指定字体文件，支持开头的 `~/`。打不开会警告并退回自动发现。
+    Path(String),
+}
+
+impl TextFont {
+    /// 值串与 `Effect` / `IconMode` 同族：小写关键字，其余一律当作路径。
+    fn from_value(value: &str) -> Self {
+        match value {
+            "" | "auto" => TextFont::Auto,
+            "off" | "none" => TextFont::Off,
+            other => TextFont::Path(other.to_string()),
+        }
+    }
+
+    fn to_value(&self) -> String {
+        match self {
+            TextFont::Auto => "auto".to_string(),
+            TextFont::Off => "off".to_string(),
+            TextFont::Path(p) => p.clone(),
+        }
+    }
+}
+
 // zoom 为 f32（非 Eq），整体只做 PartialEq 比较
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -110,12 +145,14 @@ pub struct Config {
     pub color_bg: u32,
     /// 背景不透明度（0=全透明，255=不透明）。文字始终不透明。
     pub bg_alpha: u8,
-    /// 运行中数字颜色。
-    pub color_running: u32,
-    /// 暂停时数字颜色。
-    pub color_paused: u32,
-    /// 计时结束数字颜色。
-    pub color_done: u32,
+    /// 运行中数字颜色（可写 `_` 分隔的渐变）。
+    pub color_running: Gradient,
+    /// 暂停时数字颜色（可写渐变）。
+    pub color_paused: Gradient,
+    /// 计时结束数字颜色（可写渐变）。
+    pub color_done: Gradient,
+    /// 文字特效。渐变与特效都只作用于文字，背景不受影响。
+    pub text_effect: Effect,
     /// 窗口缩放倍数（滚轮调节，0.5-3.0；与 `Widget::zoom_by` 的 clamp 范围保持一致）。
     /// 下限 0.5 是因窗口按 LOGICAL_SIZE×zoom 计算，再小会裁切数字。
     pub zoom: f32,
@@ -138,6 +175,8 @@ pub struct Config {
     /// 外部文本源文件（可选）。非空时它的第一行会顶替状态行内容；
     /// 支持开头的 `~/`。文件缺失/为空/超限时状态行回到挂件自己的内容。
     pub text_source: Option<String>,
+    /// 点阵补不出的码位（中文等）用什么字形。
+    pub text_font: TextFont,
     /// 上次退出时的窗口位置（逻辑像素）：layer-shell 的 margin 与 X11 的窗口坐标。
     pub window_pos: Option<(i32, i32)>,
 }
@@ -149,9 +188,10 @@ impl Default for Config {
             mode: Mode::Countdown,
             color_bg: rgb(15, 15, 20),
             bg_alpha: 0, // 默认完全透明：只悬浮文字；需要底色可在配置中调大（0-255）
-            color_running: rgb(255, 255, 255),
-            color_paused: rgb(255, 200, 80),
-            color_done: rgb(80, 220, 120),
+            color_running: Gradient::solid(rgb(255, 255, 255)),
+            color_paused: Gradient::solid(rgb(255, 200, 80)),
+            color_done: Gradient::solid(rgb(80, 220, 120)),
+            text_effect: Effect::None,
             zoom: 1.0,
             click_through: false,
             clock_12h: false,
@@ -161,6 +201,7 @@ impl Default for Config {
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
             text_source: None,
+            text_font: TextFont::default(),
             window_pos: None,
         }
     }
@@ -330,14 +371,30 @@ impl Config {
                         cfg.text_source = Some(value.to_string());
                     }
                 }
-                "color_bg" | "color_running" | "color_paused" | "color_done" => {
+                // 除 off/auto 外一律当路径收下：写错路径由 text::init 在启动时警告，
+                // 不在解析阶段悄悄丢掉——那样用户无从知道自己拼错了。
+                "text_font" => {
+                    cfg.text_font = TextFont::from_value(value);
+                }
+                "color_bg" => {
                     if let Some(c) = parse_color(value) {
+                        cfg.color_bg = c;
+                    }
+                }
+                // 文字三色可写成 `_` 分隔的渐变；背景保持单色——渐变是按横向铺满
+                // 文字采样的，背景再来一层只会和文字互相干扰
+                "color_running" | "color_paused" | "color_done" => {
+                    if let Some(g) = Gradient::parse(value) {
                         match key {
-                            "color_bg" => cfg.color_bg = c,
-                            "color_running" => cfg.color_running = c,
-                            "color_paused" => cfg.color_paused = c,
-                            _ => cfg.color_done = c,
+                            "color_running" => cfg.color_running = g,
+                            "color_paused" => cfg.color_paused = g,
+                            _ => cfg.color_done = g,
                         }
+                    }
+                }
+                "text_effect" => {
+                    if let Some(e) = Effect::from_name(value) {
+                        cfg.text_effect = e;
                     }
                 }
                 "window_x" => window_x = value.parse().ok(),
@@ -376,14 +433,16 @@ impl Config {
         if let Some(path) = &self.text_source {
             out.push_str(&format!("text_source = {path}\n"));
         }
-        for (key, color) in [
-            ("color_bg", self.color_bg),
-            ("color_running", self.color_running),
-            ("color_paused", self.color_paused),
-            ("color_done", self.color_done),
+        out.push_str(&format!("text_font = {}\n", self.text_font.to_value()));
+        out.push_str(&format!("color_bg = {:06x}\n", self.color_bg & 0xFFFFFF));
+        for (key, grad) in [
+            ("color_running", &self.color_running),
+            ("color_paused", &self.color_paused),
+            ("color_done", &self.color_done),
         ] {
-            out.push_str(&format!("{key} = {:06x}\n", color & 0xFFFFFF));
+            out.push_str(&format!("{key} = {}\n", grad.to_config_string()));
         }
+        out.push_str(&format!("text_effect = {}\n", self.text_effect.name()));
         if let Some((x, y)) = self.window_pos {
             out.push_str(&format!("window_x = {x}\nwindow_y = {y}\n"));
         }
@@ -401,7 +460,7 @@ mod tests {
             duration_secs: 1500,
             mode: Mode::Pomodoro,
             color_bg: 0x112233,
-            color_done: 0xAABBCC,
+            color_done: Gradient::solid(0xAABBCC),
             bg_alpha: 120,
             zoom: 1.75,
             tray_icon: IconMode::Gif,
@@ -439,9 +498,9 @@ mod tests {
         // 第一套必须就是出厂默认，否则「默认」菜单项会改变外观
         let d = Config::default();
         assert_eq!(PALETTES[0].bg, d.color_bg);
-        assert_eq!(PALETTES[0].running, d.color_running);
-        assert_eq!(PALETTES[0].paused, d.color_paused);
-        assert_eq!(PALETTES[0].done, d.color_done);
+        assert_eq!(Gradient::solid(PALETTES[0].running), d.color_running);
+        assert_eq!(Gradient::solid(PALETTES[0].paused), d.color_paused);
+        assert_eq!(Gradient::solid(PALETTES[0].done), d.color_done);
         for p in &PALETTES {
             for c in [p.bg, p.running, p.paused, p.done] {
                 assert!(c <= 0xFFFFFF, "{} 的颜色超出 24 位: {c:#08x}", p.name);
@@ -549,6 +608,36 @@ mod tests {
         assert_eq!(Config::default().pomo, p);
     }
 
+    /// 文字三色可写成渐变、背景不行；`text_effect` 认 Catime 的那几个值串。
+    #[test]
+    fn gradient_colors_and_text_effect_parse_and_roundtrip() {
+        let cfg = Config::from_str(
+            "color_running = #FF5E96_#56C6FF\ncolor_done = 50dc78\ntext_effect = neon\n",
+        );
+        assert_eq!(cfg.color_running, Gradient::parse("#FF5E96_#56C6FF").unwrap());
+        assert_eq!(cfg.color_done, Gradient::solid(0x50DC78));
+        assert_eq!(cfg.text_effect, Effect::Neon);
+        let text = cfg.serialize();
+        // 单色仍写成裸 16 进制，别把老配置重写出一堆噪声
+        assert!(text.contains("color_done = 50dc78\n"), "单色写法变了: {text}");
+        assert_eq!(Config::from_str(&text), cfg);
+        // 背景不接受渐变；非法特效名回落 none
+        let bad = Config::from_str("color_bg = #111111_#222222\ntext_effect = bloom\n");
+        assert_eq!(bad.color_bg, Config::default().color_bg);
+        assert_eq!(bad.text_effect, Effect::None);
+    }
+
+    /// 每个特效的值串都要能写回配置再读回来，否则用户改了配置就丢。
+    #[test]
+    fn every_effect_name_survives_the_config_roundtrip() {
+        for e in crate::effect::EFFECTS {
+            let cfg = Config::from_str(&format!("text_effect = {}\n", e.name()));
+            assert_eq!(cfg.text_effect, e, "{} 没走通", e.name());
+            let again = Config::from_str(&cfg.serialize());
+            assert_eq!(again.text_effect, e, "{} 序列化后丢了", e.name());
+        }
+    }
+
     #[test]
     fn pomo_new_keys_parse_and_reject_out_of_range() {
         let cfg = Config::from_str("pomo_long_break = 20m\npomo_rounds = 6\npomo_cycles = 2\n");
@@ -576,6 +665,25 @@ mod tests {
             );
         }
         assert!(!Config::default().click_through); // 默认整窗可拖动
+    }
+
+    /// `text_font` 的三态要能原样往返：路径值一旦在写回时被规范化或丢掉，
+    /// 用户指定的字体就再也找不回来了。
+    #[test]
+    fn text_font_round_trips_all_three_states() {
+        assert_eq!(Config::from_str("text_font = off\n").text_font, TextFont::Off);
+        assert_eq!(Config::from_str("text_font = none\n").text_font, TextFont::Off);
+        assert_eq!(Config::from_str("text_font = auto\n").text_font, TextFont::Auto);
+        // 缺键与空值都回到 auto，而不是把上一次的显式设置吃掉
+        assert_eq!(Config::from_str("").text_font, TextFont::Auto);
+        assert_eq!(Config::from_str("text_font =\n").text_font, TextFont::Auto);
+        let path = "~/fonts/My Han.ttf";
+        let cfg = Config::from_str(&format!("text_font = {path}\n"));
+        assert_eq!(cfg.text_font, TextFont::Path(path.to_string()));
+        // 写回再读一次，必须还是同一个值
+        let again = Config::from_str(&cfg.serialize());
+        assert_eq!(again.text_font, cfg.text_font);
+        assert!(cfg.serialize().contains("text_font = ~/fonts/My Han.ttf\n"));
     }
 
     #[test]

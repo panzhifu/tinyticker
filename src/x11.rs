@@ -21,7 +21,7 @@ use crate::sys::x11 as x;
 use crate::sys::{POLL_IN, PollFd, poll};
 use crate::sys::x11::{Event, Rectangle, VisualInfo, X11, XExt};
 use crate::tray::{Command, TrayHandle};
-use crate::widget::{DRAW_INTERVAL, LOGICAL_SIZE, Widget};
+use crate::widget::{LOGICAL_SIZE, Widget};
 
 /// 没有历史位置时的初始坐标（逻辑像素，距左上角），与 layer-shell 路径一致。
 const DEFAULT_POS: (i32, i32) = (80, 80);
@@ -381,7 +381,7 @@ impl Client {
         screen_size(self.x, self.dpy, self.screen)
     }
 
-    /// 事件 + 心跳：每 `DRAW_INTERVAL` 推进一次，其余时间阻塞在 X 的连接 fd 上。
+    /// 事件 + 心跳：每 `Widget::tick_interval` 推进一次，其余时间阻塞在 X 的连接 fd 上。
     fn event_loop(
         &mut self,
         cmd_rx: &Receiver<Command>,
@@ -405,7 +405,7 @@ impl Client {
             self.draw();
             unsafe { (self.x.XFlush)(self.dpy) };
 
-            let deadline = Instant::now() + DRAW_INTERVAL;
+            let deadline = Instant::now() + self.widget.tick_interval();
             // 队列里已有事件就别白等
             if unsafe { (self.x.XPending)(self.dpy) } == 0 {
                 let fd = unsafe { (self.x.XConnectionNumber)(self.dpy) };

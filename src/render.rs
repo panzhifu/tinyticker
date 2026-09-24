@@ -1,6 +1,6 @@
 //! 软渲染：把 8x8 字形文本写入预乘 0xAARRGGBB 像素缓冲。
 
-use crate::font8x8;
+use crate::text;
 
 /// 配置/代码中的源色格式：0xRRGGBB（非预乘，不含 alpha）。
 pub const fn rgb(r: u32, g: u32, b: u32) -> u32 {
@@ -59,26 +59,88 @@ impl<'a> Canvas<'a> {
         Self { buf, width, height }
     }
 
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub fn fill(&mut self, color: u32) {
         self.buf.fill(color);
     }
 
-    /// 在水平方向居中绘制一行文本；超界部分自动裁剪。
-    pub fn draw_text_centered(&mut self, y: i32, text: &str, color: u32, scale: u32) {
-        let width = text_width(text.chars().count(), scale);
-        let x = ((self.width as i32 - width as i32) / 2).max(0);
-        self.draw_text(x, y, text, color, scale);
+    /// 预乘源覆盖（src-over）：`dst = src + dst × (1 - srcA)`。
+    pub fn over(&mut self, x: i32, y: i32, src: u32) {
+        self.blend(x, y, src, false);
     }
 
-    /// 把一串 ASCII 文本写入像素缓冲；非 ASCII 字符跳过（内置字体只覆盖 ASCII）。
-    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, scale: u32) {
-        let mut cursor_x = x;
-        for ch in text.chars() {
-            let code = ch as usize;
-            if code < 128 {
-                self.draw_glyph(cursor_x, y, &font8x8::FONT8X8_BASIC[code], color, scale);
+    /// 预乘源加法叠加：辉光与高光用，逐通道饱和到 255。
+    pub fn add(&mut self, x: i32, y: i32, src: u32) {
+        self.blend(x, y, src, true);
+    }
+
+    fn blend(&mut self, x: i32, y: i32, src: u32, additive: bool) {
+        if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+            return;
+        }
+        let idx = (y as u32 * self.width + x as u32) as usize;
+        let dst = self.buf[idx];
+        let sa = src >> 24;
+        // 全透明的源什么都不留
+        if sa == 0 {
+            return;
+        }
+        // 不透明源直接覆盖，省掉四次乘除
+        if sa >= 255 && !additive {
+            self.buf[idx] = src;
+            return;
+        }
+        let keep = 255 - sa.min(255);
+        let mut out = 0u32;
+        for ch in 0..4 {
+            let shift = 24 - 8 * ch;
+            let s = (src >> shift) & 0xFF;
+            let d = (dst >> shift) & 0xFF;
+            // 预乘空间里 src-over 就是 src + dst×(1-srcA)；alpha 通道同理
+            let v = if additive { (s + d).min(255) } else { s + d * keep / 255 };
+            out |= v << shift;
+        }
+        self.buf[idx] = out;
+    }
+
+    /// 在水平方向居中画一个已栅格化的行。
+    /// `run.width` 是实测推进量，所以混排行（点阵 + TTF）也居得正。
+    pub fn draw_run_centered(&mut self, run: &text::Run, color: u32) {
+        let x = ((self.width as i32 - run.width as i32) / 2).max(0);
+        self.draw_run(run, x, color);
+    }
+
+    /// 画一个已栅格化的行；`dx` 是整行的水平偏移（叠加在字形自带的 x 上）。
+    pub fn draw_run(&mut self, run: &text::Run, dx: i32, color: u32) {
+        for g in &run.glyphs {
+            match &g.body {
+                text::GlyphBody::Bits { bits, cell } => {
+                    self.draw_glyph(g.x + dx, g.y, bits, color, *cell);
+                }
+                text::GlyphBody::Gray { gray, w, h, .. } => {
+                    self.blit_gray(g.x + dx, g.y, gray, *w, *h, color);
+                }
             }
-            cursor_x += (8 * scale) as i32;
+        }
+    }
+
+    /// 逐像素覆盖度贴字：按覆盖度算 alpha 再 src-over。
+    /// 这是"字形边缘有灰度"与"预乘 alpha 画布"之间唯一的桥。
+    fn blit_gray(&mut self, x: i32, y: i32, gray: &[u8], w: u32, h: u32, color: u32) {
+        // 传进来的 `color` 是文字色（alpha 恒 0xFF），只取它的源色再按覆盖度预乘。
+        let src_color = color & 0xFF_FF_FF;
+        for row in 0..h {
+            for col in 0..w {
+                let v = gray[(row * w + col) as usize];
+                if v == 0 {
+                    continue;
+                }
+                let src = premultiply(src_color, v);
+                self.over(x + col as i32, y + row as i32, src);
+            }
         }
     }
 
@@ -100,10 +162,6 @@ impl<'a> Canvas<'a> {
             }
         }
     }
-}
-
-pub fn text_width(chars: usize, scale: u32) -> u32 {
-    chars as u32 * 8 * scale
 }
 
 #[cfg(test)]
@@ -145,8 +203,20 @@ mod tests {
         assert_eq!(parse_color(""), None);
     }
 
+    /// 点阵字行走的是新管道的快路：一格点阵放大成 `cell × cell` 的实心块，
+    /// 所以一个字形至少留下 8×8×cell² 个不透明像素。这条守住"接 Run 之后画面没坏"。
     #[test]
-    fn text_width_counts_chars() {
-        assert_eq!(text_width("1:00".chars().count(), 2), 4 * 8 * 2);
+    fn bitmap_run_paints_opaque_blocks() {
+        for cell in [1u32, 3] {
+            let run = text::shape("A", cell, 0);
+            assert_eq!(run.width, 8 * cell);
+            let mut buf = vec![0u32; (24 * 24) as usize];
+            let mut c = Canvas::new(&mut buf, 24, 24);
+            c.draw_run(&run, 0, 0xFF_FFFFFF);
+            let painted = buf.iter().filter(|p| **p == 0xFF_FFFFFF).count();
+            assert!(painted > 0, "cell={cell} 时一个字也没画出来");
+            let whole = (cell * cell) as usize;
+            assert_eq!(painted % whole, 0, "点阵必须整块放大");
+        }
     }
 }
