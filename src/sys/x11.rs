@@ -342,6 +342,7 @@ bindings! { X11, "libX11.so.6";
     fn XStoreName(*mut Display, Window, *const c_char) -> c_int;
     fn XSelectInput(*mut Display, Window, c_long) -> c_int;
     fn XMapRaised(*mut Display, Window) -> c_int;
+    fn XUnmapWindow(*mut Display, Window) -> c_int;
     fn XMoveWindow(*mut Display, Window, c_int, c_int) -> c_int;
     fn XResizeWindow(*mut Display, Window, c_uint, c_uint) -> c_int;
     fn XRaiseWindow(*mut Display, Window) -> c_int;

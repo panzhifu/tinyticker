@@ -31,19 +31,89 @@ pub fn parse_color(s: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// 秒数 → 显示文本：1 分钟内用 `"45s"`，之后用 `"m:ss"` / `"h:mm:ss"`。
-pub fn format_time(secs: u32) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
+/// 数字行的补零档位，对应配置项 `time_pad`（与 Catime 的三档 `TIME_FORMAT_*` 同形）。
+///
+/// 补零的另一半含义是**宽度固定**：`None` 档读数会从 `45s` 变成 `1:00`，整行左右
+/// 抖动；`Zero` / `Full` 档不会，秒表与挂钟并排时更能看出谁在走。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pad {
+    /// 最短：`45s` / `12:34` / `1:01:01`。v0.5.0 之前的行为，也是默认。
+    #[default]
+    None,
+    /// 当前出现的单位各补两位：`00:45` / `12:34` / `01:01:01`。
+    Zero,
+    /// 永远 `h:mm:ss`：`00:00:45` / `00:12:34` / `01:01:01`。
+    Full,
+}
+
+impl Pad {
+    /// 配置值串；认 Catime 的 `none` / `zero` / `full`。
+    pub fn from_name(name: &str) -> Option<Pad> {
+        match name {
+            "none" => Some(Pad::None),
+            "zero" => Some(Pad::Zero),
+            "full" => Some(Pad::Full),
+            _ => None,
+        }
     }
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Pad::None => "none",
+            Pad::Zero => "zero",
+            Pad::Full => "full",
+        }
     }
+
+    /// 托盘菜单上的标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            Pad::None => "不补零（45s）",
+            Pad::Zero => "补两位（00:45）",
+            Pad::Full => "总是时分秒（00:00:45）",
+        }
+    }
+}
+
+/// 补零档位的完整清单：托盘菜单与单测都从这里取，加一档不会漏登记。
+pub const PADS: [Pad; 3] = [Pad::None, Pad::Zero, Pad::Full];
+
+/// 秒（外加可选的百分位）→ 显示文本。三档补零见 [`Pad`]。
+fn format_parts(total_secs: u32, cs: Option<u32>, pad: Pad) -> String {
+    let frac = cs.map(|c| c % 100);
+    // 不补零档在 1 分钟内走 `45s` / `45.32s` 这种带后缀的写法
+    if pad == Pad::None && total_secs < 60 {
+        return match frac {
+            Some(f) => format!("{total_secs}.{f:02}s"),
+            None => format!("{total_secs}s"),
+        };
+    }
+    let (h, m, s) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    let tail = match frac {
+        Some(f) => format!(".{f:02}"),
+        None => String::new(),
+    };
+    match pad {
+        Pad::Full => format!("{h:02}:{m:02}:{s:02}{tail}"),
+        Pad::Zero if h > 0 => format!("{h:02}:{m:02}:{s:02}{tail}"),
+        Pad::Zero => format!("{m:02}:{s:02}{tail}"),
+        Pad::None if h > 0 => format!("{h}:{m:02}:{s:02}{tail}"),
+        Pad::None => format!("{m}:{s:02}{tail}"),
+    }
+}
+
+/// 秒数 → 显示文本：不补零档是 `45s` / `m:ss` / `h:mm:ss`，其余见 [`Pad`]。
+pub fn format_time(secs: u32, pad: Pad) -> String {
+    format_parts(secs, None, pad)
+}
+
+/// 百分之一秒数 → 显示文本：不补零档是 `45.32s` / `m:ss.cc` / `h:mm:ss.cc`。
+///
+/// 与 [`format_time`] 分开而不是加一个参数：隐藏百分秒时倒计时读的是向上取整的那一格
+/// （`format_time`），显示百分秒时才向下取整到百分位——同一个数在这两种模式下
+/// 本来就不该相等，合成一个函数只会把这件事藏起来。
+pub fn format_centis(cs: u32, pad: Pad) -> String {
+    format_parts(cs / 100, Some(cs % 100), pad)
 }
 
 /// 画布：包装预乘 0xAARRGGBB 像素缓冲，提供文本绘制。
@@ -170,14 +240,57 @@ mod tests {
 
     #[test]
     fn time_formatting() {
-        assert_eq!(format_time(0), "0s");
-        assert_eq!(format_time(45), "45s");
-        assert_eq!(format_time(59), "59s");
-        assert_eq!(format_time(60), "1:00");
-        assert_eq!(format_time(754), "12:34");
-        assert_eq!(format_time(3599), "59:59");
-        assert_eq!(format_time(3600), "1:00:00");
-        assert_eq!(format_time(3661), "1:01:01");
+        assert_eq!(format_time(0, Pad::None), "0s");
+        assert_eq!(format_time(45, Pad::None), "45s");
+        assert_eq!(format_time(59, Pad::None), "59s");
+        assert_eq!(format_time(60, Pad::None), "1:00");
+        assert_eq!(format_time(754, Pad::None), "12:34");
+        assert_eq!(format_time(3599, Pad::None), "59:59");
+        assert_eq!(format_time(3600, Pad::None), "1:00:00");
+        assert_eq!(format_time(3661, Pad::None), "1:01:01");
+    }
+
+    /// 补零三档：宽度固定是这一档的实际目的，`s` 后缀随之去掉。
+    #[test]
+    fn padding_ladder() {
+        for (secs, zero, full) in [
+            (0, "00:00", "00:00:00"),
+            (45, "00:45", "00:00:45"),
+            (754, "12:34", "00:12:34"),
+            (3661, "01:01:01", "01:01:01"),
+        ] {
+            assert_eq!(format_time(secs, Pad::Zero), zero, "{secs} 补两位不对");
+            assert_eq!(format_time(secs, Pad::Full), full, "{secs} 全补不对");
+        }
+        // 百分秒档共用同一套补零
+        assert_eq!(format_centis(4532, Pad::Zero), "00:45.32");
+        assert_eq!(format_centis(4532, Pad::Full), "00:00:45.32");
+        assert_eq!(format_centis(366101, Pad::Zero), "01:01:01.01");
+    }
+
+    /// 三档的值串都要能写回配置再读回来。
+    #[test]
+    fn pad_names_roundtrip() {
+        for p in [Pad::None, Pad::Zero, Pad::Full] {
+            assert_eq!(Pad::from_name(p.name()), Some(p));
+            assert!(!p.label().is_empty());
+        }
+        assert_eq!(Pad::from_name("half"), None);
+        assert_eq!(Pad::default(), Pad::None, "默认档必须是不改变旧行为的那个");
+    }
+
+    /// 百分秒档：秒位向下取整，百分位永远占两位。
+    #[test]
+    fn centisecond_formatting() {
+        assert_eq!(format_centis(0, Pad::None), "0.00s");
+        assert_eq!(format_centis(5, Pad::None), "0.05s");
+        assert_eq!(format_centis(99, Pad::None), "0.99s");
+        assert_eq!(format_centis(4532, Pad::None), "45.32s");
+        assert_eq!(format_centis(5999, Pad::None), "59.99s");
+        assert_eq!(format_centis(6000, Pad::None), "1:00.00");
+        assert_eq!(format_centis(75423, Pad::None), "12:34.23");
+        assert_eq!(format_centis(360000, Pad::None), "1:00:00.00");
+        assert_eq!(format_centis(366101, Pad::None), "1:01:01.01");
     }
 
     #[test]

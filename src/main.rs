@@ -59,12 +59,13 @@ TinyTicker —— 极简悬浮倒计时 / 秒表
   -p, --pomodoro   以番茄钟模式启动
   -k, --clock      以时钟挂件模式启动
   -r, --running    启动后立即开始计时
+  --hide, --show   隐藏 / 显示挂件（只对已经在跑的那个实例有效）
   -h, --help       显示帮助
   -V, --version    显示版本
 
 交互:
   托盘左键        开始 / 暂停（中键重置，右键完整菜单）
-  托盘右键菜单    开始 / 暂停 / 重置 / 时长预设 / 模式切换（倒计时/秒表/番茄钟/时钟）/ 外观 / 退出
+  托盘右键菜单    开始 / 暂停 / 重置 / 隐藏挂件 / 时长预设 / 模式切换（倒计时/秒表/番茄钟/时钟）/ 外观（透明度·配色·特效·图标·时间格式）/ 退出
   托盘图标滚轮    缩放悬浮窗
   悬浮窗          左键按住拖动，右键关闭；滚轮缩放；计时结束弹系统通知
 
@@ -77,7 +78,7 @@ TinyTicker —— 极简悬浮倒计时 / 秒表
   绑一条 `tinyticker 25m` 就行。套接字在 $XDG_RUNTIME_DIR/tinyticker.sock
   （不可用时退到 /tmp/tinyticker-<uid>.sock），权限 0600，只有同一用户能连。
 
-配置（时长 / 模式 / 颜色 / 透明度 / 缩放 / 番茄钟 / 结束命令 / 窗口位置）存于:
+配置（时长 / 模式 / 颜色 / 透明度 / 缩放 / 番茄钟 / 显示精度与补零 / 结束命令 / 窗口位置）存于:
 ";
 
 /// 打印帮助。配置文件位置按平台惯例不同，因此路径不写死在 `USAGE` 里。
@@ -121,6 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 到这里才是"本进程当那个唯一的实例"：命令行覆盖配置里的时长与模式（退出时随状态写回）
     let mut config = Config::load();
     let autostart = intent.apply(&mut config);
+    // --hide / --show 是"给在跑的那个下命令"的开关；新起的实例一律可见——
+    // 起一个看不见的挂件只会让人以为程序没起来。
+    if intent.hidden.is_some() {
+        eprintln!("提示：--hide / --show 只对已经在跑的实例有效，本次启动仍然可见。");
+    }
 
     // 趁还没进事件循环先把字形后端准备好：状态行里点阵覆盖不到的码位（中文、
     // Latin-1、符号）要靠 dlopen 出来的 libfreetype 补。开不成只警告不退出——
@@ -149,7 +155,10 @@ fn run_backend(
     config: Config,
     autostart: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    // 空值算"没有"：不少启动器会留一个 `WAYLAND_DISPLAY=`，按 is_some 判就会去走
+    // Wayland 分支然后连不上——那条路本该退回 X11
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    if wayland {
         return wl::run(cmd_rx, handle_rx, config, autostart);
     }
     #[cfg(feature = "x11")]

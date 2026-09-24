@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crate::config::{ALPHA_STEPS, Config, PALETTES, preset_label};
 use crate::effect::{EFFECTS, Effect, Gradient};
 use crate::gif;
+use crate::render::{PADS, Pad};
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::sysinfo;
@@ -51,6 +52,16 @@ pub enum Command {
     SetEffect(Effect),
     /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
     SetIcon(IconMode),
+    /// 切换数字行的百分之一秒（写回 `centiseconds`）。
+    ToggleCentiseconds,
+    /// 换计时数字行的补零档位（写回 `time_pad`）。
+    SetTimePad(Pad),
+    /// 切换时钟挂件的秒（写回 `clock_seconds`）。
+    ToggleClockSeconds,
+    /// 隐藏 / 显示挂件（托盘那一项用；命令行走 [`Command::SetHidden`]）。
+    ToggleHidden,
+    /// 把"是否隐藏"设成给定值——`tinyticker --hide` / `--show` 的语义，可重复执行。
+    SetHidden(bool),
     Quit,
 }
 
@@ -65,6 +76,8 @@ pub enum IconMode {
     Memory,
     /// 水位表 = 剩余电量；没有电池时显示空心盘。
     Battery,
+    /// 水位表 = 网络速率（上下行取大，对数刻度；`/proc/net/dev` 差分）。
+    Network,
     /// 用户提供的 GIF 动图（`tray_gif`）。解不出时退回真实时表盘。
     Gif,
 }
@@ -76,6 +89,7 @@ impl IconMode {
             "cpu" => Some(IconMode::Cpu),
             "memory" => Some(IconMode::Memory),
             "battery" => Some(IconMode::Battery),
+            "network" => Some(IconMode::Network),
             "gif" => Some(IconMode::Gif),
             _ => None,
         }
@@ -87,6 +101,7 @@ impl IconMode {
             IconMode::Cpu => "cpu",
             IconMode::Memory => "memory",
             IconMode::Battery => "battery",
+            IconMode::Network => "network",
             IconMode::Gif => "gif",
         }
     }
@@ -135,6 +150,11 @@ impl Command {
             Command::SetPalette(i) => Some(Check::Palette(i)),
             Command::SetEffect(e) => Some(Check::Effect(e)),
             Command::SetIcon(m) => Some(Check::Icon(m)),
+            Command::ToggleCentiseconds => Some(Check::Centiseconds),
+            Command::SetTimePad(p) => Some(Check::TimePad(p)),
+            Command::ToggleClockSeconds => Some(Check::ClockSeconds),
+            Command::ToggleHidden => Some(Check::Hidden),
+            Command::SetHidden(_) => None,
             _ => None,
         }
     }
@@ -148,6 +168,11 @@ enum Check {
     Palette(usize),
     Effect(Effect),
     Icon(IconMode),
+    /// 下面三个是勾选框（各自独立），上面五个是单选组。勾选框只有一项，不必带值。
+    Centiseconds,
+    TimePad(Pad),
+    ClockSeconds,
+    Hidden,
 }
 
 /// 托盘自己维护的一份显示状态。
@@ -161,6 +186,14 @@ struct State {
     palette: Option<usize>,
     effect: Effect,
     icon: IconMode,
+    /// 数字行有没有带百分秒。
+    centis: bool,
+    /// 计时数字行的补零档位。
+    pad: Pad,
+    /// 时钟挂件显示到秒还是到分。
+    clock_seconds: bool,
+    /// 挂件是否被藏着（只影响那一行的勾选）。
+    hidden: bool,
     /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
     gif: bool,
 }
@@ -178,6 +211,11 @@ impl State {
             }),
             effect: cfg.text_effect,
             icon: cfg.tray_icon,
+            centis: cfg.centiseconds,
+            pad: cfg.time_pad,
+            clock_seconds: cfg.clock_seconds,
+            // 挂件总是以"看得见"启动（hidden 不进配置），所以这里恒 false
+            hidden: false,
             gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
         }
     }
@@ -194,6 +232,10 @@ impl State {
             Check::Palette(i) => self.palette == Some(i),
             Check::Effect(e) => self.effect == e,
             Check::Icon(m) => self.icon == m,
+            Check::Centiseconds => self.centis,
+            Check::TimePad(p) => self.pad == p,
+            Check::ClockSeconds => self.clock_seconds,
+            Check::Hidden => self.hidden,
         }
     }
 
@@ -208,6 +250,11 @@ impl State {
             Command::SetPalette(i) => self.palette = Some(i),
             Command::SetEffect(e) => self.effect = e,
             Command::SetIcon(m) => self.icon = m,
+            Command::ToggleCentiseconds => self.centis = !self.centis,
+            Command::SetTimePad(p) => self.pad = p,
+            Command::ToggleClockSeconds => self.clock_seconds = !self.clock_seconds,
+            Command::ToggleHidden => self.hidden = !self.hidden,
+            Command::SetHidden(v) => self.hidden = v,
             _ => {}
         }
     }
@@ -270,6 +317,7 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     push_top(&mut n, &mut root, button("▶ 开始", Command::Start));
     push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
     push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
+    push_top(&mut n, &mut root, button("👻 隐藏挂件", Command::ToggleHidden));
     push_top(&mut n, &mut root, separator());
     let presets_menu = push_top(&mut n, &mut root, submenu("时长预设"));
     let modes = push_top(&mut n, &mut root, submenu("模式"));
@@ -305,6 +353,10 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     let icon = n.len() as i32;
     n.push(submenu("图标内容"));
     n[look as usize].children.push(icon);
+    // 时间格式：补零三档是单选组，显示秒与百分秒各是一个勾选框
+    let fmt = n.len() as i32;
+    n.push(submenu("时间格式"));
+    n[look as usize].children.push(fmt);
     for (label, value) in ALPHA_STEPS {
         let id = n.len() as i32;
         n.push(button(label, Command::SetAlpha(value)));
@@ -325,12 +377,25 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
         ("CPU 占用", IconMode::Cpu),
         ("内存占用", IconMode::Memory),
         ("电池电量", IconMode::Battery),
+        ("网络速率", IconMode::Network),
         // 没配路径就直说，否则点了只会静默退回表盘
         (if gif_configured { "GIF 动图" } else { "GIF 动图（未配置 tray_gif）" }, IconMode::Gif),
     ] {
         let id = n.len() as i32;
         n.push(button(label, Command::SetIcon(m)));
         n[icon as usize].children.push(id);
+    }
+    for p in PADS {
+        let id = n.len() as i32;
+        n.push(button(p.label(), Command::SetTimePad(p)));
+        n[fmt as usize].children.push(id);
+    }
+    for (label, cmd) in
+        [("时钟显示秒", Command::ToggleClockSeconds), ("百分之一秒", Command::ToggleCentiseconds)]
+    {
+        let id = n.len() as i32;
+        n.push(button(label, cmd));
+        n[fmt as usize].children.push(id);
     }
     // 根节点的子项顺序即菜单顺序
     n[0].children = root;
@@ -427,6 +492,25 @@ fn gauge_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Vec<u8>) {
     (S as i32, S as i32, px)
 }
 
+/// 网络水位表的刻度：上下行取大的那个，按**对数**映到 0-100。
+///
+/// 用对数是因为带宽跨六个数量级：线性刻度的话，浏览网页与满速下载会挤在同一格水位上。
+/// 区间取 `1 KB/s = 空盘 … 10 MB/s = 满盘`——低于 1 KB/s 的零星心跳算静默，否则桌面
+/// 挂着不动也会显示三成满。
+fn net_level(down: u64, up: u64) -> u8 {
+    const NET_MIN_BPS: u64 = 1024;
+    const NET_MAX_BPS: u64 = 10 * 1024 * 1024;
+    let rate = down.max(up);
+    if rate < NET_MIN_BPS {
+        return 0;
+    }
+    // 按"字节数的二进制位长"铺开：每翻一倍涨固定一格
+    let bits = |v: u64| 64 - v.leading_zeros();
+    let min_bits = bits(NET_MIN_BPS);
+    let span = bits(NET_MAX_BPS) - min_bits;
+    ((bits(rate) - min_bits) * 100 / span).min(100) as u8
+}
+
 /// 按 `mode` 生成当前该显示的图标。
 fn icon_pixmap(
     mode: IconMode,
@@ -441,6 +525,7 @@ fn icon_pixmap(
         IconMode::Battery => {
             gauge_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
         }
+        IconMode::Network => gauge_pixmap(Some(net_level(src.net_down, src.net_up)), false),
         // 动图解不出（没配 / 文件坏了）就退回真实时表盘，图标位不能空着
         IconMode::Gif => match player.current().map(|(f, w, h)| gif_pixmap(f, w, h)) {
             Some(px) => (S as i32, S as i32, px),
@@ -1399,10 +1484,31 @@ mod tests {
 
     #[test]
     fn icon_mode_names_roundtrip() {
-        for m in [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery] {
+        for m in [
+            IconMode::Clock,
+            IconMode::Cpu,
+            IconMode::Memory,
+            IconMode::Battery,
+            IconMode::Network,
+            IconMode::Gif,
+        ] {
             assert_eq!(IconMode::from_name(m.name()), Some(m));
         }
         assert_eq!(IconMode::from_name("disk"), None);
+    }
+
+    /// 网络水位是对数刻度：静默归零、区间内分得开、封顶不溢出。
+    #[test]
+    fn net_level_is_log_scaled_and_bounded() {
+        assert_eq!(net_level(0, 0), 0, "静默该是空盘");
+        assert_eq!(net_level(900, 12), 0, "低于 1 KB/s 的零星心跳算静默");
+        let small = net_level(64 * 1024, 0);
+        let big = net_level(2 * 1024 * 1024, 0);
+        assert!(0 < small && small < big && big < 100, "刻度要分得开: {small} {big}");
+        assert_eq!(net_level(10 * 1024 * 1024, 0), 100);
+        assert_eq!(net_level(u64::MAX, 0), 100, "超量要夹紧而不是回绕");
+        // 上下行取大：只有上传在跑也该看得见
+        assert_eq!(net_level(0, 2 * 1024 * 1024), big);
     }
 
     #[test]
@@ -1442,16 +1548,26 @@ mod tests {
     fn appearance_submenu_reaches_every_preset() {
         let n = build_nodes(&Config::default().presets, true);
         let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
-        assert_eq!(look.children.len(), 4, "外观下应是 透明度 + 配色 + 文字特效 + 图标 四个子菜单");
+        assert_eq!(
+            look.children.len(),
+            5,
+            "外观下应是 透明度 / 配色 / 文字特效 / 图标内容 / 时间格式 五个子菜单"
+        );
         let acts = |parent: i32| -> Vec<Option<Command>> {
             n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
         };
-        let (alpha_id, palette_id, effect_id, icon_id) =
-            (look.children[0], look.children[1], look.children[2], look.children[3]);
+        let (alpha_id, palette_id, effect_id, icon_id, fmt_id) = (
+            look.children[0],
+            look.children[1],
+            look.children[2],
+            look.children[3],
+            look.children[4],
+        );
         assert_eq!(n[alpha_id as usize].label, "背景透明度");
         assert_eq!(n[palette_id as usize].label, "配色预设");
         assert_eq!(n[effect_id as usize].label, "文字特效");
         assert_eq!(n[icon_id as usize].label, "图标内容");
+        assert_eq!(n[fmt_id as usize].label, "时间格式");
 
         let alpha = acts(alpha_id);
         assert_eq!(alpha.len(), ALPHA_STEPS.len());
@@ -1477,11 +1593,30 @@ mod tests {
         }
         let icons = acts(icon_id);
         // 菜单里的图标项必须与 IconMode 的全部取值一一对应：加一档忘了登记就漏在这里
-        let expect =
-            [IconMode::Clock, IconMode::Cpu, IconMode::Memory, IconMode::Battery, IconMode::Gif];
+        let expect = [
+            IconMode::Clock,
+            IconMode::Cpu,
+            IconMode::Memory,
+            IconMode::Battery,
+            IconMode::Network,
+            IconMode::Gif,
+        ];
         assert_eq!(icons.len(), expect.len());
         for (k, id) in n[icon_id as usize].children.iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect[k])));
+        }
+        // 时间格式：三档补零按 PADS 顺序，后面跟两个勾选框
+        let fmt_cmds = acts(fmt_id);
+        let want = [
+            Some(Command::SetTimePad(Pad::None)),
+            Some(Command::SetTimePad(Pad::Zero)),
+            Some(Command::SetTimePad(Pad::Full)),
+            Some(Command::ToggleClockSeconds),
+            Some(Command::ToggleCentiseconds),
+        ];
+        assert_eq!(fmt_cmds, want, "时间格式子菜单与预期对不上");
+        for (k, id) in n[fmt_id as usize].children[..PADS.len()].iter().enumerate() {
+            assert_eq!(n[*id as usize].label, PADS[k].label(), "补零档的标签对不上");
         }
     }
 
@@ -1534,15 +1669,21 @@ mod tests {
         for node in &n {
             let Some(cmd) = node.command else { continue };
             let checkable = cmd.check().is_some();
-            let in_radio = matches!(
+            // 五个单选组，加上百分秒 / 显示秒 / 隐藏挂件三个勾选框
+            // （SetHidden 是命令行走的设定值，菜单上没有它对应的那一项）
+            let in_group = matches!(
                 cmd,
                 Command::SetMode(_)
                     | Command::SetAlpha(_)
                     | Command::SetPalette(_)
                     | Command::SetEffect(_)
                     | Command::SetIcon(_)
+                    | Command::SetTimePad(_)
+                    | Command::ToggleCentiseconds
+                    | Command::ToggleClockSeconds
+                    | Command::ToggleHidden
             );
-            assert_eq!(checkable, in_radio, "{} 的勾选属性推错了", node.label);
+            assert_eq!(checkable, in_group, "{} 的勾选属性推错了", node.label);
         }
     }
 
@@ -1566,6 +1707,27 @@ mod tests {
         s.note(Command::Preset(600));
         s.note(Command::Start);
         assert!(s.checked(Check::Mode(Mode::Pomodoro)));
+
+        // 百分秒是勾选框：点一下翻面，且不牵连任何单选组
+        assert!(!s.checked(Check::Centiseconds), "默认该关着，开着的代价是心跳");
+        s.note(Command::ToggleCentiseconds);
+        assert!(s.checked(Check::Centiseconds));
+        assert!(s.checked(Check::Mode(Mode::Pomodoro)), "翻勾选框不该动了模式勾选");
+        s.note(Command::ToggleCentiseconds);
+        assert!(!s.checked(Check::Centiseconds));
+        let on = Config { centiseconds: true, ..Config::default() };
+        assert!(State::from_config(&on).checked(Check::Centiseconds));
+
+        // 补零是单选组：换档要把旧那档取消
+        assert!(s.checked(Check::TimePad(Pad::None)));
+        s.note(Command::SetTimePad(Pad::Full));
+        assert!(s.checked(Check::TimePad(Pad::Full)));
+        assert!(!s.checked(Check::TimePad(Pad::None)), "旧档必须取消勾选");
+        assert!(!s.checked(Check::Centiseconds), "换档不该牵连百分秒");
+        // 显示秒默认开着，点一下关掉
+        assert!(s.checked(Check::ClockSeconds));
+        s.note(Command::ToggleClockSeconds);
+        assert!(!s.checked(Check::ClockSeconds));
     }
 
     /// 配色勾选只有在四色与某套预设完全一致时才算命中；用户手改过就一项都不勾。

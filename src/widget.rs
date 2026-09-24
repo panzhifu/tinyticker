@@ -31,6 +31,10 @@ pub const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 /// 50ms 是同一档；再快也只是白烧 CPU，因为位图字体本身只有 8 像素高。
 pub const ANIM_INTERVAL: Duration = Duration::from_millis(50);
 
+/// 显示百分之一秒时的心跳间隔。Catime 的毫秒档同为 20ms：百分位每秒只翻 100 次，
+/// 再快人眼也读不出两位数，而这 20ms 是本程序最贵的一档心跳。
+pub const CENTIS_INTERVAL: Duration = Duration::from_millis(20);
+
 /// 动画相位进帧指纹时的量化步长，与 [`ANIM_INTERVAL`] 对齐。
 const ANIM_STEP_MS: u32 = 50;
 
@@ -106,6 +110,10 @@ pub struct Widget {
     text_src: textsrc::Source,
     /// 特效动画的时钟原点。
     started: Instant,
+    /// 挂件是否被藏起来：计时照常跑，只是不呈现（托盘「隐藏挂件」/ `--hide`）。
+    ///
+    /// 不进配置：退出时是隐藏状态，下次启动该是看得见的，否则用户只会以为程序没起来。
+    hidden: bool,
     /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号 / 动画相位）。
     last_frame: Option<(String, String, u32, u32, u32, u32)>,
 }
@@ -127,6 +135,7 @@ impl Widget {
             tray: None,
             text_src,
             started: Instant::now(),
+            hidden: false,
             last_frame: None,
         }
     }
@@ -139,9 +148,31 @@ impl Widget {
             || self.config.color_done.animated()
     }
 
-    /// 心跳间隔：静态内容 200ms 就够，动画特效要 50ms 才看得出流动。
+    /// 数字行这一帧要不要带百分秒。时钟挂件显示的是系统时间，恒不到秒以下。
+    fn shows_centis(&self) -> bool {
+        self.config.centiseconds && self.timer.mode != Mode::Clock
+    }
+
+    /// 挂件当前是否被藏着（后端据此决定要不要呈现）。
+    pub fn hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// 心跳间隔：静态内容 200ms 就够，动画特效要 50ms，走动的百分秒要 20ms。
+    ///
+    /// 只有计时器真在跑才提到 20ms——停住时百分位是冻住的，白醒只会烧 CPU。
     pub fn tick_interval(&self) -> Duration {
-        if self.animating() { ANIM_INTERVAL } else { DRAW_INTERVAL }
+        if self.hidden {
+            // 藏着的时候没人看，节拍回到最慢那一档；计时本身照常按真实差值推进
+            return DRAW_INTERVAL;
+        }
+        if self.shows_centis() && self.timer.running {
+            CENTIS_INTERVAL
+        } else if self.animating() {
+            ANIM_INTERVAL
+        } else {
+            DRAW_INTERVAL
+        }
     }
 
     /// 接收托盘线程发来的句柄（用于发通知）。
@@ -198,6 +229,22 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::ToggleCentiseconds => {
+                self.config.centiseconds = !self.config.centiseconds;
+                self.persist_appearance();
+            }
+            Command::SetTimePad(pad) => {
+                if self.config.time_pad != pad {
+                    self.config.time_pad = pad;
+                    self.persist_appearance();
+                }
+            }
+            Command::ToggleClockSeconds => {
+                self.config.clock_seconds = !self.config.clock_seconds;
+                self.persist_appearance();
+            }
+            Command::ToggleHidden => self.set_hidden(!self.hidden),
+            Command::SetHidden(v) => self.set_hidden(v),
             Command::Quit => return true,
         }
         false
@@ -285,12 +332,14 @@ impl Widget {
             None => status,
         };
         let status_color = Gradient::solid(0xA0A0AA);
-        // 时钟模式实时读取本地时间；其余模式显示计时秒数
+        // 时钟模式实时读取本地时间；其余模式显示计时秒数（或百分秒）
         let text = if self.timer.mode == Mode::Clock {
             let (h, m, s) = clock::now_hms();
-            clock::format_hms(h, m, s, self.config.clock_12h)
+            clock::format_clock(h, m, s, self.config.clock_12h, self.config.clock_seconds)
+        } else if self.shows_centis() {
+            render::format_centis(self.timer.display_centis(), self.config.time_pad)
         } else {
-            render::format_time(self.timer.display_secs())
+            render::format_time(self.timer.display_secs(), self.config.time_pad)
         };
 
         // 动画相位要进指纹，否则内容没变时脏检查会把每一帧都吃掉、特效就定住不动；
@@ -337,6 +386,17 @@ impl Widget {
         self.last_frame = None;
     }
 
+    /// 隐藏 / 显示挂件。隐藏期间后端整帧跳过呈现，计时器照常按真实时长推进。
+    fn set_hidden(&mut self, hidden: bool) {
+        if self.hidden == hidden {
+            return;
+        }
+        self.hidden = hidden;
+        // 重新显示时必须重画：脏检查只看内容指纹，而内容在隐藏期间可能压根没变过，
+        // 不 invalidate 的话表面会一直停在"没有缓冲"的空白状态
+        self.invalidate();
+    }
+
     /// 退出前把当前模式、倒计时总时长、缩放和窗口位置写回配置。
     pub fn persist(&mut self, pos: Option<(i32, i32)>) {
         self.config.duration_secs = self.timer.total;
@@ -357,6 +417,11 @@ mod tests {
     /// 最近一帧的状态行。内容只存在指纹里（`Frame` 不重复存一份），断言就从那儿读。
     fn last_status(w: &Widget) -> String {
         w.last_frame.as_ref().expect("还没有产出过帧").1.clone()
+    }
+
+    /// 最近一帧的数字行，读法同上——指纹的第 0 格。
+    fn last_text(w: &Widget) -> String {
+        w.last_frame.as_ref().expect("还没有产出过帧").0.clone()
     }
 
     #[test]
@@ -428,6 +493,64 @@ mod tests {
         let mut w = Widget::new(cfg, false);
         assert!(w.build_frame(200, 100, 1).is_some());
         assert!(w.build_frame(200, 100, 1).is_none(), "静态特效也该去重，否则白烧 CPU");
+    }
+
+    /// 隐藏只降心跳、不改计时，并且一定要标脏——否则放回来那一帧会被指纹吃掉。
+    #[test]
+    fn hiding_slows_the_heartbeat_and_forces_a_redraw() {
+        let cfg = Config { centiseconds: true, duration_secs: 60, ..Config::default() };
+        let mut w = Widget::new(cfg, true);
+        assert_eq!(w.tick_interval(), CENTIS_INTERVAL, "跑动中该是 20ms");
+        assert!(!w.handle_cmd(Command::ToggleHidden), "隐藏不是退出命令");
+        assert!(w.hidden());
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "藏着的时候不该白醒");
+        // 计时照常按真实时长推进
+        let t0 = Instant::now();
+        w.timer.tick_at(t0);
+        w.timer.tick_at(t0 + Duration::from_secs(30));
+        assert_eq!(w.timer.display_secs(), 30, "隐藏期间不该停表");
+        assert!(!w.handle_cmd(Command::SetHidden(false)));
+        assert!(!w.hidden());
+        assert_eq!(w.tick_interval(), CENTIS_INTERVAL);
+        assert!(w.build_frame(200, 100, 1).is_some(), "放回来必须重画一帧");
+        assert!(w.build_frame(200, 100, 1).is_none(), "之后照常去重");
+        // 设定值命令是幂等的：重复执行不会再翻一次
+        w.handle_cmd(Command::SetHidden(false));
+        assert!(!w.hidden());
+    }
+
+    /// 走动的百分秒要把心跳提到 20ms；停住了、以及时钟模式都不该提这一档。
+    #[test]
+    fn running_centiseconds_shorten_the_heartbeat() {
+        let cfg = Config { centiseconds: true, ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "没跑起来就不该白醒");
+        w.timer.start();
+        assert_eq!(w.tick_interval(), CENTIS_INTERVAL);
+        w.timer.pause();
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "冻住的读数不需要 50fps");
+        // 时钟模式显示的是系统时间，恒到秒
+        w.handle_cmd(Command::SetMode(Mode::Clock));
+        w.timer.start();
+        assert_eq!(w.tick_interval(), DRAW_INTERVAL, "时钟模式用不着 20ms");
+        // 和动画特效同时开着时取最快那一档
+        w.handle_cmd(Command::SetMode(Mode::Stopwatch));
+        w.config.text_effect = Effect::Liquid;
+        w.timer.start();
+        assert_eq!(w.tick_interval(), CENTIS_INTERVAL, "20ms 那一档顺带也带动了动画");
+    }
+
+    /// 数字行按 `centiseconds` 换格式。没在跑时百分位冻在 `.00`，读数是确定的。
+    #[test]
+    fn centiseconds_replace_the_number_row() {
+        let cfg = Config { centiseconds: true, duration_secs: 45, ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_text(&w), "45.00s");
+        w.config.centiseconds = false;
+        w.invalidate();
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_text(&w), "45s", "关掉就该回到原来的写法");
     }
 
     /// 动画特效 / 自动流动的渐变要把心跳提上去，否则 5fps 看不出流动。

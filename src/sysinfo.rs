@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 const STAT: &str = "/proc/stat";
 const MEMINFO: &str = "/proc/meminfo";
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
+const NET_DEV: &str = "/proc/net/dev";
 
 /// 一次采样的结果，百分比都是 0-100。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +17,9 @@ pub struct Sources {
     pub mem: u8,
     /// `None` = 这台机器没有电池（台式机 / 容器）。
     pub battery: Option<Battery>,
+    /// 下行 / 上行字节每秒，所有非 loopback 网卡之和。
+    pub net_down: u64,
+    pub net_up: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,10 +28,15 @@ pub struct Battery {
     pub charging: bool,
 }
 
-/// CPU 占用只能靠两次采样的差分算出，所以采样器自己留着上一次的计数。
+/// CPU 与网络速率都只能靠两次采样的差分算出，所以采样器自己留着上一次的计数。
 pub struct Sampler {
     prev: Option<(u64, u64)>,
     cpu: u8,
+    /// 上一次读到的网卡累计 `(接收, 发送)` 字节，以及读到它的时刻。
+    prev_net: Option<(u64, u64)>,
+    net_at: Instant,
+    net_down: u64,
+    net_up: u64,
     battery_at: Instant,
     /// 电池变化以分钟计，读勤了只是浪费 syscall。
     battery_every: Duration,
@@ -35,11 +44,15 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// 立刻取一次 CPU 计数做基准，第一次 `sample` 就能给出真实占用。
+    /// 立刻取一次 CPU 与网卡计数做基准，第一次 `sample` 就能给出真实占用。
     pub fn new() -> Self {
         let mut s = Self {
             prev: None,
             cpu: 0,
+            prev_net: read_netdev(),
+            net_at: Instant::now(),
+            net_down: 0,
+            net_up: 0,
             battery_at: Instant::now(),
             battery_every: Duration::from_secs(30),
             battery: read_battery(),
@@ -56,6 +69,17 @@ impl Sampler {
             };
             self.prev = Some(cur);
         }
+        if let Some(cur) = read_netdev() {
+            // 速率按**真实间隔**算而不是按节拍假定：采样挂在派发循环上，两拍之间
+            // 会有零点几秒的抖动，写死 1 秒会让读数跟着抖
+            let ms = self.net_at.elapsed().as_millis().max(1) as u64;
+            if let Some((prev_rx, prev_tx)) = self.prev_net {
+                self.net_down = bytes_per_sec(cur.0, prev_rx, ms);
+                self.net_up = bytes_per_sec(cur.1, prev_tx, ms);
+            }
+            self.prev_net = Some(cur);
+            self.net_at = Instant::now();
+        }
         if self.battery_at.elapsed() >= self.battery_every {
             self.battery_at = Instant::now();
             self.battery = read_battery();
@@ -64,6 +88,8 @@ impl Sampler {
             cpu: self.cpu,
             mem: read_to_string(MEMINFO).as_deref().and_then(parse_meminfo).unwrap_or(0),
             battery: self.battery,
+            net_down: self.net_down,
+            net_up: self.net_up,
         }
     }
 }
@@ -106,6 +132,46 @@ fn delta_percent(cur: (u64, u64), prev_busy: u64, prev_total: u64) -> u8 {
     }
     let d_busy = cur.0.saturating_sub(prev_busy).min(d_total);
     ((d_busy * 100) / d_total) as u8
+}
+
+/// 差分速率（字节/秒）。计数器回绕（重启 / 网卡重置）时差分为负，按 0 处理，与 CPU 同口径。
+fn bytes_per_sec(cur: u64, prev: u64, ms: u64) -> u64 {
+    cur.saturating_sub(prev) * 1000 / ms.max(1)
+}
+
+/// `/proc/net/dev` → 非 loopback 网卡的累计 `(接收, 发送)` 字节。
+fn read_netdev() -> Option<(u64, u64)> {
+    parse_netdev(&read_to_string(NET_DEV)?)
+}
+
+/// `/proc/net/dev` 文本 → 累计字节。
+///
+/// 每行形如 `wlan0: 12345 67 0 0 ... | 9999 12 ...`，冒号后先是 Receive 的 8 列
+/// （bytes 打头）再是 Transmit 的 8 列，所以 rx 取第 0 列、tx 取第 8 列。表头那两行
+/// 不含冒号，天然被跳过；只排 loopback，与 Catime 的口径一致。
+fn parse_netdev(text: &str) -> Option<(u64, u64)> {
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    let mut seen = false;
+    for line in text.lines() {
+        let Some((name, cols)) = line.split_once(':') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        let cols: Vec<&str> = cols.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        let (Ok(r), Ok(t)) = (cols[0].parse::<u64>(), cols[8].parse::<u64>()) else {
+            continue;
+        };
+        rx += r;
+        tx += t;
+        seen = true;
+    }
+    // 一块网卡都没读到（容器里没有 /proc/net/dev 的权限）时报 None，让调用方留着上次的值
+    seen.then_some((rx, tx))
 }
 
 /// `/proc/meminfo` → 占用百分比，按 `MemTotal - MemAvailable` 算。
@@ -196,6 +262,34 @@ mod tests {
         assert_eq!(delta_percent((10, 20), 100, 500), 0);
         // busy 增量超过 total 增量（不可能，但要夹紧）
         assert_eq!(delta_percent((900, 1000), 0, 990), 100);
+    }
+
+    /// 网卡累计字节：排掉 loopback，取 rx 第 0 列 / tx 第 8 列，junk 行整行不采信。
+    #[test]
+    fn netdev_sums_interfaces_and_skips_loopback() {
+        let text = "Inter-|   Receive                                                |  Transmit\n \
+face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n \
+   lo:  111111    890    0    0    0     0          0         0   222222    890    0    0    0     0       0          0\n \
+ wlan0: 1000000    890    0    0    0     0          0         0    50000    120    0    0    0     0       0          0\n \
+  veth1:  250000    100    0    0    0     0          0         0    10000    100    0    0    0     0       0          0\n";
+        assert_eq!(parse_netdev(text), Some((1_250_000, 60_000)));
+        // 只有 loopback / 空文件 / 列数不足 / 数字栏是 junk：都没有可信读数
+        assert_eq!(parse_netdev("    lo: 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\n"), None);
+        assert_eq!(parse_netdev(""), None);
+        assert_eq!(parse_netdev("  eth0: 1 2 3\n"), None);
+        assert_eq!(
+            parse_netdev(" eth0: bytes packets errs drop fifo frame compressed multicast bytes\n"),
+            None
+        );
+    }
+
+    /// 速率按真实间隔折算；计数器回绕（重启 / 网卡重置）报 0 而不是负数。
+    #[test]
+    fn net_rate_uses_the_real_interval() {
+        assert_eq!(bytes_per_sec(1000, 0, 1000), 1000);
+        assert_eq!(bytes_per_sec(500, 0, 500), 1000, "半秒读到 500B 该报 1000B/s");
+        assert_eq!(bytes_per_sec(0, 5000, 1000), 0);
+        assert_eq!(bytes_per_sec(100, 0, 0), 100_000, "间隔下限取 1ms，不许除零");
     }
 
     #[test]

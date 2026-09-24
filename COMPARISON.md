@@ -1,7 +1,7 @@
 # tinyticker vs Catime 功能对比
 
 > 更新日期：2026-09-24
-> tinyticker 版本：**0.5.0**（零第三方依赖重写：自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟）+ 工作区未提交改动（番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效）
+> tinyticker 版本：**0.5.0**（零第三方依赖重写：自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟）+ 工作区未提交改动（番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效、状态行中文、单实例参数转发、百分之一秒、补零三档与显示秒、网络速率图标、隐藏/显示挂件、配置原子写）
 > Catime 版本：**v1.6.2**（本地参考克隆 `../Catime`，`resource/resource.h:9`；其 README 顶栏仍写 1.5.0）
 >
 > 本表回答"谁有什么"。**"差在哪、为什么差、补要付多少"看 [GAP.md](GAP.md)**——那份是逐文件读码后的代码级差距分析（含 Catime 92 个配置项与 30 条特效/颜色参数的取证，以及按补齐成本排的序）。本表若与 GAP.md 冲突，以 GAP.md 为准。
@@ -13,7 +13,7 @@
 | 定位 | 极简悬浮计时器（自用 / 学习向） | 功能完整的轻量计时工具箱 |
 | 平台 | Linux（Wayland 优先，X11 可选编译）；目标就是只做 Linux，不做跨平台移植 | 仅 Windows |
 | 语言 / 技术栈 | Rust + 自研 Wayland 客户端（layer-shell + ARGB shm，直调 libwayland-client）+ 自研 X11 客户端（override-redirect ARGB，直调 libX11）+ 自研托盘（直调 libdbus） | 纯 C + Win32 API + GDI |
-| 二进制体积 | 0.56 MB（Wayland 版）/ 0.57 MB（含 X11），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
+| 二进制体积 | 0.57 MB 两个产物（Wayland 极小版 592 640 B / 含 X11 通用版 601 400 B），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
 | 许可 | MIT | Apache-2.0 |
 
 ## 二、功能对比表
@@ -23,12 +23,15 @@
 | **计时模式** | | |
 | 倒计时 | ✅（默认 60 秒，可配置） | ✅ |
 | 正计时 / 秒表 | ✅（0.2.0，托盘或 `-s` 切换） | ✅ |
-| 时钟显示 | ✅（0.4.0 `-k` 时钟挂件；0.4.1 `clock_12h` 可选 12 小时制带 AM/PM；0.5.0 起本地时间走自研 TZif + POSIX 规则解析，不再调 C 库时区 API） | ✅（12/24h） |
+| 时钟显示 | ✅（0.4.0 `-k` 时钟挂件；0.4.1 `clock_12h` 可选 12 小时制带 AM/PM；0.5.0 起本地时间走自研 TZif + POSIX 规则解析，不再调 C 库时区 API；工作区版本再加 `clock_seconds`——可以只到分） | ✅（12/24h，另有 `CLOCK_SHOW_SECONDS`） |
+| 计时数字补零 | ✅（工作区版本 `time_pad` = `none` / `zero` / `full` 三档，值串与它的 `TimeFormatType` 对齐；`zero`/`full` 同时去掉 `s` 后缀以固定宽度） | ✅（三档 `TimeFormatType`） |
 | 番茄钟 | ✅（0.4.0 专注/休息自动轮转 + 轮数显示；工作区版本补上**长休息与组数上限**：`pomo_work` / `pomo_break` / `pomo_long_break` / `pomo_rounds` / `pomo_cycles`。Catime 那边是「任意阶段序列 × 重复次数」，我们是固定经典配方——日常够用，但阶段序列不能自定义） | ✅（`POMODORO_TIME_OPTIONS` 序列 + `POMODORO_LOOP_COUNT`，默认 1 组） |
+| 百分之一秒显示 | ✅（工作区版本：`centiseconds` 或托盘「外观 ▸ 时间格式 ▸ 百分之一秒」，走 `45.32s` / `m:ss.cc` / `h:mm:ss.cc`；亚秒余量存在计时状态里，20 ms 心跳档只在跑动时开。倒计时显示百分秒时读向下取整、隐藏时读向上那一格，与它同规则。**不覆盖时钟挂件**，也没有专用热键——但 `tinyticker` 的套接字在，用户可以自己绑 DE 快捷键） | ✅（`CLOCK_SHOW_MILLISECONDS` + 专用热键，含时钟挂件） |
 | **窗口行为** | | |
 | 无边框悬浮窗 | ✅ | ✅ |
 | 半透明背景 | ✅（0.3.0，逐像素 alpha：Wayland 自研 ARGB shm 呈现，X11 走 depth-32 visual；`bg_alpha` 0-255 可调，工作区版本起托盘「外观」5 档即时生效。Catime 的 Ctrl+滚轮我们没有对应物——Wayland 的 pointer 事件不带 modifier，overlay 挂件也拿不到键盘焦点，改走托盘） | ✅ |
 | 置顶 | ✅（Wayland 走 layer-shell overlay 层，全屏之上仍可见；X11 走 `_NET_WM_STATE_ABOVE`） | ✅ |
+| 隐藏 / 显示挂件 | ✅（工作区版本：托盘「👻 隐藏挂件」+ `tinyticker --hide` / `--show` 经单实例套接字下命令，所以 DE 快捷键直接绑得到。计时照跑、心跳回落到最慢档。**Wayland 侧的约束**：layer-shell 不允许未锚定的表面尺寸为 0，`attach(NULL)` 会被合成器掐断，所以隐藏是一帧全透明 + 空输入区域——看不见也点不到，但窗口列表里还在；X11 是正经 `XUnmapWindow`） | ✅（专用热键 `HOTKEY_TOGGLE_VISIBILITY` + 菜单项，另有 `NO_DISPLAY` 启动模式） |
 | 拖动移动 | ✅（左键 drag_window） | ✅（编辑模式拖动） |
 | 窗口位置记忆 | ✅（0.2.0 退出保存、启动恢复；0.5.0 起 Wayland 的 layer-shell 路径也生效，坐标统一存逻辑像素） | ✅ |
 | 滚轮缩放 | ✅（0.4.0，`zoom` 0.5-3.0，自动持久化） | ✅ |
@@ -43,7 +46,7 @@
 | 字体 | 内置 8x8 位图字体（仅 ASCII，不支持中文显示） | 13 款内嵌 TTF（出厂即为裁剪过的 "Essence" 子集）+ 自定义字体目录 + 系统字体对话框。**裁剪工具在官网，不在仓库**（`tools/` 只有 icon/png/资源打包三个脚本） |
 | 托盘鼠标手势 | ✅（工作区版本：**左键 = 开始/暂停，中键 = 重置，右键 = 菜单，图标上滚轮 = 缩放**；`ItemIsMenu` 因此报 `false`） | ⚠️ 只有两种：**左键 = 计时控制菜单，右键 = 设置菜单**（`tray_click.c:44-48`）。中键与双击无实现，托盘滚轮是个**没有任何发送方的保留消息**（`resource_app_ids.h:34`）——这一项我们反而更多 |
 | 输入任意时长 | ❌（需要文本输入框，本项目只有 8x8 位图渲染器，且两端都拿不到键盘；改走托盘预设 + 命令行参数） | ✅（左键菜单再进一层弹多行输入框 `ShowCountdownInputDialog`；能弹框是因为它有完整对话框 + 键盘通路） |
-| 托盘实时显示 CPU/内存/电池 | ✅（工作区版本：托盘「外观 → 图标内容」四选一并带勾选，内盘自底向上涨水位，每秒重绘并发 `NewIcon`；数据来自 `/proc/stat` 差分、`MemAvailable`、`/sys/class/power_supply`，未引入任何 crate） | ✅ |
+| 托盘实时显示 CPU/内存/电池/网络 | ✅（工作区版本：托盘「外观 → 图标内容」**五选一**并带勾选，内盘自底向上涨水位，每秒重绘并发 `NewIcon`；数据来自 `/proc/stat` 差分、`MemAvailable`、`/sys/class/power_supply`、`/proc/net/dev` 差分（网络那一档是**对数水位**，1 KB/s 空盘 ~ 10 MB/s 满盘、上下行取大），未引入任何 crate） | ✅（每网卡上/下行 B/s 的**数字**读数，独立采样线程，单位按资源管理器口径缩放） |
 | 全局快捷键 | ⚠️ 不自己注册（Wayland 无统一协议），改由单实例套接字让 DE 的快捷键设置替我们做：绑一条 `tinyticker 25m` 即可 | ✅ **14 个**，全部默认 `None`（`config_defaults.c:110-123`），语法 `Ctrl+Alt+A` / `F1-F24` / `0xNN` / 34 个具名键 |
 | 单实例 / 二次启动下命令 | ✅（工作区版本，`src/ipc.rs`）：`$XDG_RUNTIME_DIR/tinyticker.sock`，0600；参数原样送过去由收端跑同一个解析器，命令复用既有的 `cmd_tx` 通道，两个后端一行没改 | ✅（`WM_COPYDATA` 转给已存在的窗口，`window_message_commands.c:74-105`） |
 | 右键关闭窗口 | ✅ | 编辑模式下右键退出编辑 |
@@ -57,7 +60,7 @@
 | 锁屏 / 关机 / 重启 | ✅（0.4.0，经 `on_finish` 命令，如 `loginctl lock-session`） | ✅ |
 | 打开文件 / 自定义命令 | ✅（0.4.0，`on_finish` 任意 shell 命令） | ✅ |
 | **扩展性** | | |
-| 配置持久化 | ✅（0.2.0 起，纯 std 手写格式；0.4.0 扩展为时长/模式/颜色/透明度/缩放/番茄钟/结束命令/窗口位置） | ✅ INI 文件，**92 个元数据项**（`config_defaults.c:18-129`）：改文件即时生效（目录 watcher + 200 ms 去抖 + 三元组复核），写入走临时文件原子替换，非法值自愈写回。我们改配置需重启，且非原子写 |
+| 配置持久化 | ✅（0.2.0 起，纯 std 手写格式；0.4.0 扩展为时长/模式/颜色/透明度/缩放/番茄钟/结束命令/窗口位置，工作区版本再加显示精度与文字字形） | ✅ INI 文件，**92 个元数据项**（`config_defaults.c:18-129`）：改文件即时生效（目录 watcher + 200 ms 去抖 + 三元组复核），写入走临时文件原子替换，非法值自愈写回。我们改配置需重启，且非原子写 |
 | 插件系统 | ⚠️ 只做显示那半边（工作区版本：`text_source` 指向的文件第一行顶替状态行，带 64 KB 上限与 (大小,mtime) 变化检测；**不执行任何外部程序**） | ✅（`output.txt` 文件通信 + `<notify>`/`<exit>` 行内控制标签 + 74 种脚本扩展名 + SHA-256 信任门 + Job Object 进程树回收 + 单插件热重载。注意：**脚本要用户在托盘菜单里逐个启动，并没有开机自动拉起**——先前记的"自动拉起"不准，见 GAP.md §十勘误 7） |
 | 国际化 | 无 UI 文本（托盘文案硬编码中文；挂件受 8x8 ASCII 字体限制画不出中文） | ✅ 10 个 locale（简体/繁體/英/法/德/日/韩/葡/俄/西），切换走托盘子菜单，另有带俄语三条复数规则与 CJK 去空格的本地化时长串 |
 | 安装分发 | GitHub Releases（版本化产物名 + SHA256SUMS + freedesktop 元数据）；AUR 待建 | winget / GitHub Releases |
@@ -116,4 +119,4 @@
 
 差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透，0.5.0 补上 Wayland 置顶与自定位（不再需要合成器规则），工作区版本清掉长休息/可配预设/文字特效/渐变/占用表/外部文本源六项，再补状态行中文（字形层）。本次逐文件读码另需修正本表 6 处（点击穿透、Catime 版本号、预设数、绝对时间语法、字体裁剪工具归属、插件启动方式）——见 GAP.md §十。
 
-> 体积验证：Wayland 极小版 0.56 MB / 含 X11 通用版 0.57 MB（未压缩，584 232 / 592 816 字节）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。
+> 体积验证：Wayland 极小版 0.57 MB / 含 X11 通用版 0.57 MB（未压缩，592 640 / 601 400 字节；这一批 #15+#2+#4+#7+#14+#18 六项合计长了 8.6 KB）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。

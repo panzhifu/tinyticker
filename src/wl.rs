@@ -116,6 +116,19 @@ struct Buffer {
     buffer: Obj,
 }
 
+/// 表面收输入的范围。做成枚举而不是 `Option<rect>` 是因为"空区域"既不是 `None`
+/// （那在协议里是整窗接收），也不能靠塞一个 0×0 矩形表达——niri 会直接判
+/// `invalid arguments for wl_surface.set_input_region` 掐断客户端。
+#[derive(Clone, Copy, PartialEq)]
+enum Input {
+    /// 整窗接收（没开点击穿透时）。协议里的 `NULL` 区域。
+    Whole,
+    /// 只有这块矩形接收（点击穿透开着）。
+    Rect((i32, i32, i32, i32)),
+    /// 什么都不收：挂件被藏起来时，透明的像素不该挡住下面的窗口。
+    None,
+}
+
 pub struct Client {
     wl: Wl,
     ifaces: &'static Ifaces,
@@ -134,7 +147,7 @@ pub struct Client {
     _relative: Option<Obj>,
     cursor: Option<Obj>,
     region: Option<Obj>,
-    input_rect: Option<(i32, i32, i32, i32)>,
+    input: Input,
     buffers: [Buffer; 2],
     pool: Obj,
     pool_bytes: usize,
@@ -145,6 +158,8 @@ pub struct Client {
     scale: f64,
     font_scale: u32,
     configured: bool,
+    /// 是否已经提交过"隐藏"那一帧全透明的内容（只提交一次，不每拍重发）。
+    blank: bool,
     quit: bool,
     drag_origin: (i32, i32),
     drag_acc: (f64, f64),
@@ -292,7 +307,7 @@ request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
             _relative: None,
             cursor: None,
             region: None,
-            input_rect: None,
+            input: Input::Whole,
             buffers: [
                 Buffer { map: std::ptr::null_mut(), buffer: std::ptr::null_mut() },
                 Buffer { map: std::ptr::null_mut(), buffer: std::ptr::null_mut() },
@@ -306,6 +321,7 @@ request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
             scale: 1.0,
             font_scale: 1,
             configured: false,
+            blank: false,
             quit: false,
             drag_origin: (0, 0),
             drag_acc: (0.0, 0.0),
@@ -573,33 +589,24 @@ client.commit();
         Ok(())
     }
 
-    /// 绘制一帧；内容未变化时整帧跳过（连 shm 都不提交）。
-    fn render(&mut self) {
-        if !self.configured || self.pool.is_null() {
-            return;
-        }
-        let (bw, bh) = self.physical_size();
-        let Some(frame) = self.widget.build_frame(bw, bh, self.font_scale) else {
-            return;
-        };
-        // 挑一块已释放的缓冲；两块都被合成器占着就跳过本帧
+    /// 挑一块已释放的缓冲并占用它；两块都被合成器占着时返回 `None`。
+    fn take_buffer(&mut self) -> Option<usize> {
         let back = self.front ^ 1;
         let index = if self.events.released[back].get() {
             back
         } else if self.events.released[self.front].get() {
             self.front
         } else {
-            return;
+            return None;
         };
-        let n = (bw * bh) as usize;
-        unsafe {
-            let px = std::slice::from_raw_parts_mut(self.buffers[index].map as *mut u32, n);
-            let mut canvas = Canvas::new(px, bw, bh);
-            frame.paint(&mut canvas);
-        }
         self.events.released[index].set(false);
         self.front = index;
+        Some(index)
+    }
 
+    /// 提交一帧：attach + damage + commit。输入区域也是双缓冲状态，调用方要在
+    /// commit **之前**设好。
+    fn attach_damage_commit(&mut self, index: usize, bw: u32, bh: u32) {
         request(
             &self.wl,
             self.surface,
@@ -618,22 +625,88 @@ client.commit();
             opcode,
             &[int(0), int(0), int(bw as i32), int(bh as i32)],
         );
-        self.apply_input_region(&frame);
         self.commit();
+    }
+
+    /// 隐藏挂件：提交一帧全透明内容 + 空输入区域，之后不再提交。
+    ///
+    /// 不能用 `attach(NULL)`：layer-shell 规定**未锚定**的表面尺寸为 0 就是协议错误，
+    /// niri 会直接 error 掉客户端（`width 0 requested without setting left and right
+    /// anchors`）。所以"看不见"只能靠一帧完全透明的像素 + 不收输入的区域来实现；
+    /// 计时器照常在主循环里推进。
+    fn paint_blank(&mut self) {
+        if self.blank {
+            return; // 只提交一次，藏着的挂件不该继续占 CPU
+        }
+        let (bw, bh) = self.physical_size();
+        let Some(index) = self.take_buffer() else {
+            return; // 下一拍再试；内容指纹还没被消费，不需要 invalidate
+        };
+        let n = (bw * bh) as usize;
+        unsafe {
+            let px = std::slice::from_raw_parts_mut(self.buffers[index].map as *mut u32, n);
+            Canvas::new(px, bw, bh).fill(0);
+        }
+        self.set_input(Input::None);
+        self.attach_damage_commit(index, bw, bh);
+        self.blank = true;
+    }
+
+    /// 绘制一帧；内容未变化时整帧跳过（连 shm 都不提交）。
+    fn render(&mut self) {
+        if !self.configured || self.pool.is_null() {
+            return;
+        }
+        if self.widget.hidden() {
+            self.paint_blank();
+            return;
+        }
+        let (bw, bh) = self.physical_size();
+        let Some(frame) = self.widget.build_frame(bw, bh, self.font_scale) else {
+            return;
+        };
+        let Some(index) = self.take_buffer() else {
+            // 这一帧已经消费掉指纹了，不标脏的话下次 build_frame 会返回 None，
+            // 内容就永远停在"没画出来"的状态——刚从隐藏里放回来时最容易撞上
+            self.widget.invalidate();
+            return;
+        };
+        let n = (bw * bh) as usize;
+        unsafe {
+            let px = std::slice::from_raw_parts_mut(self.buffers[index].map as *mut u32, n);
+            let mut canvas = Canvas::new(px, bw, bh);
+            frame.paint(&mut canvas);
+        }
+        self.apply_input_region(&frame);
+        self.attach_damage_commit(index, bw, bh);
+        self.blank = false;
     }
 
     /// 点击穿透：把输入区域收缩到文字包围盒（surface 逻辑坐标）。
     fn apply_input_region(&mut self, frame: &Frame) {
-        let target = frame.input_rect(self.scale as f32);
-        if self.input_rect == target {
+        let want = match frame.input_rect(self.scale as f32) {
+            Some(rect) => Input::Rect(rect),
+            None => Input::Whole,
+        };
+        self.set_input(want);
+    }
+
+    /// 设定输入区域，语义见 [`Input`]。
+    fn set_input(&mut self, want: Input) {
+        if self.input == want {
             return;
         }
-        let new_region = target.map(|(x, y, w, h)| {
-            let region =
-                request_new(&self.wl, self.compositor, 1, self.ifaces.region, &mut [WlArgument::NIL]);
-            request(&self.wl, region, 0, &[int(x), int(y), int(w), int(h)]);
-            region
-        });
+        let new_region = match want {
+            // 协议里 NULL = 整窗接收
+            Input::Whole => None,
+            // "什么都不收"要一块没加过任何矩形的区域
+            Input::None => Some(self.new_region()),
+            Input::Rect((x, y, w, h)) => {
+                let region = self.new_region();
+                request(&self.wl, region, 0, &[int(x), int(y), int(w), int(h)]);
+                Some(region)
+            }
+        };
         request(
             &self.wl,
             self.surface,
@@ -644,11 +717,15 @@ client.commit();
             unsafe { (self.wl.destroy)(old) };
         }
         self.region = new_region;
-        self.input_rect = target;
+        self.input = want;
+    }
+
+    fn new_region(&self) -> Obj {
+        request_new(&self.wl, self.compositor, 1, self.ifaces.region, &mut [WlArgument::NIL])
     }
 
     /// 事件循环：每 `Widget::tick_interval` 至少推进一次，其余时间阻塞在 Wayland socket 上。
-    /// （动画特效开着时这个间隔会缩到 50ms，静态时是 200ms。）
+    /// （动画特效开着时这个间隔会缩到 50ms，显示百分秒且在跑动时 20ms，静态时 200ms。）
     fn event_loop(
         &mut self,
         cmd_rx: &Receiver<Command>,

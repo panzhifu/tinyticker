@@ -73,6 +73,8 @@ pub struct Client {
     image: *mut c_void,
     /// 已下发的输入区域，避免每帧重复 Shape 请求。
     last_input: Option<(i32, i32, i32, i32)>,
+    /// 窗口当前是不是被"隐藏挂件"unmap 掉了（只登记一次请求，不每帧重发）。
+    unmapped: bool,
     quit: bool,
 }
 
@@ -178,6 +180,7 @@ impl Client {
             buf: Vec::new(),
             image: std::ptr::null_mut(),
             last_input: None,
+            unmapped: false,
             quit: false,
         };
         client.rebuild_image();
@@ -229,6 +232,20 @@ impl Client {
 
     /// 画一帧：内容没变就整帧跳过（脏检查在 `Widget::build_frame` 里）。
     fn draw(&mut self) {
+        if self.widget.hidden() {
+            // 隐藏 = 直接 unmap。窗口、缓冲、GC 都不销毁，回来只是一次 MapRaised
+            if !self.unmapped {
+                unsafe { (self.x.XUnmapWindow)(self.dpy, self.win) };
+                self.unmapped = true;
+            }
+            return;
+        }
+        if self.unmapped {
+            unsafe { (self.x.XMapRaised)(self.dpy, self.win) };
+            self.unmapped = false;
+            // Expose 也会 invalidate，但那是异步的：先自己标脏，免得这一帧被指纹吃掉
+            self.widget.invalidate();
+        }
         let (w, h) = self.size;
         if self.image.is_null() || w == 0 || h == 0 {
             return;

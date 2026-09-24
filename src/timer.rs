@@ -1,4 +1,6 @@
-//! 计时状态机：倒计时 / 秒表 / 番茄钟 / 时钟挂件，秒级精度。
+//! 计时状态机：倒计时 / 秒表 / 番茄钟 / 时钟挂件。
+//! 整秒是状态（[`Timer::secs`]），不足一秒的余量也是状态（[`Timer::cs`]），
+//! 两者由同一次 [`Timer::tick_at`] 采样推进，所以显示到百分之一秒不会与秒位错帧。
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -91,6 +93,11 @@ pub struct Timer {
     pub total: u32,
     /// 倒计时为剩余秒数，秒表为已进行秒数；时钟模式不使用。
     pub secs: u32,
+    /// 距 `secs` 那一格又走过去了几百分之一秒（0-99）。
+    ///
+    /// 只在运行时累计，所以这一格会被原样冻住：暂停前显示 `9.30`，暂停期间一直是
+    /// `9.30`，恢复后从 `9.29` 接着走。
+    cs: u32,
     pub running: bool,
     finished: Option<Finished>, // 每次结束置位一次，由 take_finished 消费
     last_tick: Cell<Option<Instant>>,
@@ -109,6 +116,7 @@ impl Timer {
             mode,
             total,
             secs: 0,
+            cs: 0,
             running: false,
             finished: None,
             last_tick: Cell::new(None),
@@ -124,6 +132,21 @@ impl Timer {
     /// 当前显示的秒数（倒计时为剩余，秒表为已进行）。
     pub fn display_secs(&self) -> u32 {
         self.secs
+    }
+
+    /// 当前显示的百分之一秒数（含整秒部分），供带百分秒的格式化用。
+    ///
+    /// 与 [`Timer::display_secs`] 取自同一份状态，所以秒位与百分位不可能一个已经进位、
+    /// 另一个还没跟上。显示百分秒时倒计时读的是**向下取整**的剩余量（`9.30` 而不是
+    /// `10`）——隐藏百分秒时才回到 `secs` 那一格，两种读法本来就不该相等。
+    pub fn display_centis(&self) -> u32 {
+        let whole = self.secs.saturating_mul(100);
+        match self.mode {
+            Mode::Stopwatch => whole.saturating_add(self.cs),
+            Mode::Countdown | Mode::Pomodoro => whole.saturating_sub(self.cs),
+            // 时钟模式显示的是实时读到的系统时间，与计时状态无关
+            Mode::Clock => whole,
+        }
     }
 
     /// 计时是否已收工：倒计时归零，或番茄钟跑满设定的组数。
@@ -159,6 +182,7 @@ impl Timer {
             }
         }
         self.running = false;
+        self.cs = 0;
         self.finished = None;
         self.last_tick.set(None);
     }
@@ -294,15 +318,28 @@ impl Timer {
             self.last_tick.set(Some(now)); // 首次调用仅建立基准
             return;
         };
-        let elapsed = now.duration_since(last).as_secs();
-        if elapsed == 0 {
+        // 停住时只重新对基准而不累计，于是暂停期间 secs 和 cs 都原样冻着，
+        // 恢复后正好接上暂停前那一格
+        if !self.running {
+            self.last_tick.set(Some(now));
             return;
         }
-        // 基准只前进整数秒，保留亚秒余量，保证长期走时不漂移；
-        // 停顿（休眠恢复、高负载）期间的整秒也要补齐
-        self.last_tick.set(Some(last + Duration::from_secs(elapsed)));
-        for _ in 0..elapsed {
+        // 只把"整百分秒"那段算进状态，基准也只前进那么多——不足一百分秒的零头留在
+        // 基准里。心跳周期不是 10ms 的整数倍（poll 的超时按毫秒取整，真实周期约
+        // 19.5ms），要是每次都对到 now，被截掉的那点就会每格都丢，读数系统性偏慢。
+        let centis = (now.duration_since(last).as_micros() / 10_000) as u64;
+        if centis == 0 {
+            return;
+        }
+        self.last_tick.set(Some(last + Duration::from_micros(centis * 10_000)));
+        // 一次采样的差值同时喂给百分位与秒位：停顿（休眠恢复、高负载）期间走过的
+        // 整秒也在这里一次补齐
+        let total = self.cs as u64 + centis;
+        self.cs = (total % 100) as u32;
+        let mut whole = total / 100;
+        while whole > 0 {
             self.tick();
+            whole -= 1;
             if !self.running {
                 break; // 倒计时已归零，无需继续补齐
             }
@@ -372,6 +409,94 @@ mod tests {
         assert_eq!(t.secs, 5);
         assert!(t.running);
         assert_eq!(t.take_finished(), None); // 秒表没有"结束"概念
+    }
+
+    /// 百分位与秒位同源：跨过整秒边界时不许跳号，也不许出现 `.100`。
+    #[test]
+    fn stopwatch_centiseconds_roll_into_the_second() {
+        let mut t = Timer::new(Mode::Stopwatch, 0);
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0); // 建立基准
+        assert_eq!(t.display_centis(), 0);
+        t.tick_at(t0 + Duration::from_millis(500));
+        assert_eq!(t.display_centis(), 50);
+        t.tick_at(t0 + Duration::from_millis(1200));
+        assert_eq!((t.secs, t.display_centis()), (1, 120));
+        t.tick_at(t0 + Duration::from_secs(60));
+        assert_eq!(t.display_centis(), 6000);
+        assert_eq!(t.display_secs(), 60, "整秒读法不受百分位影响");
+    }
+
+    /// 倒计时显示向下取整的剩余量：还剩 2.3 秒读 `230`，隐藏百分秒时才回到 `3`。
+    #[test]
+    fn countdown_centiseconds_descend_through_the_second_boundary() {
+        let mut t = Timer::new(Mode::Countdown, 3);
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        assert_eq!(t.display_centis(), 300);
+        t.tick_at(t0 + Duration::from_millis(700));
+        assert_eq!((t.display_secs(), t.display_centis()), (3, 230));
+        t.tick_at(t0 + Duration::from_millis(1000));
+        assert_eq!(t.display_centis(), 200, "230 之后该是 200，不该跳号");
+        t.tick_at(t0 + Duration::from_millis(2990));
+        assert_eq!(t.display_centis(), 1);
+        t.tick_at(t0 + Duration::from_millis(3000));
+        assert_eq!(t.display_centis(), 0);
+        assert_eq!(t.take_finished(), Some(Finished::Countdown));
+    }
+
+    /// 暂停要把百分位一起冻住：恢复后接着数，不回 `.00` 也不倒退。
+    #[test]
+    fn centiseconds_freeze_across_a_pause() {
+        let mut t = Timer::new(Mode::Stopwatch, 0);
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        t.tick_at(t0 + Duration::from_millis(1300));
+        assert_eq!(t.display_centis(), 130);
+        t.pause();
+        t.tick_at(t0 + Duration::from_secs(30));
+        assert_eq!((t.display_secs(), t.display_centis()), (1, 130), "暂停期间读数不动");
+        t.start();
+        t.tick_at(t0 + Duration::from_secs(31));
+        assert_eq!(t.display_centis(), 230, "该从 1.30 接着走，而不是从 2.00 重来");
+    }
+
+    /// 重置要连百分位一起清掉，否则重新开始会带着上一次的余量。
+    #[test]
+    fn reset_clears_the_centisecond_remainder() {
+        let mut t = Timer::new(Mode::Stopwatch, 0);
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        t.tick_at(t0 + Duration::from_millis(750));
+        assert_eq!(t.display_centis(), 75);
+        t.reset();
+        assert_eq!(t.display_centis(), 0);
+    }
+
+    /// 心跳周期不是 10ms 的整数倍（`poll` 的超时按毫秒取整，真实周期约 19.5ms），
+    /// 每次被截掉的亚百分秒零头必须留在基准里。对到 `now` 会把零头丢掉：20 次
+    /// 19.5ms 只算出 20 百分秒而不是 39，跑动中的读数会系统性慢一半。
+    #[test]
+    fn sub_hundredth_heartbeat_jitter_does_not_slow_the_clock() {
+        let mut t = Timer::new(Mode::Stopwatch, 0);
+        t.start();
+        let t0 = Instant::now();
+        t.tick_at(t0);
+        for i in 1..=20 {
+            t.tick_at(t0 + Duration::from_micros(19_500 * i));
+        }
+        // 20 × 19.5ms = 390ms
+        assert_eq!(t.display_centis(), 39, "零头被丢掉了 → 读数偏慢");
+        for i in 21..=1000 {
+            t.tick_at(t0 + Duration::from_micros(19_500 * i));
+        }
+        // 1000 × 19.5ms = 19.5s，一格不许漏
+        assert_eq!(t.display_centis(), 1950, "长期走时漂移了");
+        assert_eq!(t.display_secs(), 19);
     }
 
     #[test]

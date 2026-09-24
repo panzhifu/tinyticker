@@ -555,13 +555,15 @@ fn weekday_from_days(days: i64) -> u32 {
     (days + 4).rem_euclid(7) as u32
 }
 
-/// 格式化时间；`use_12h` 为 true 时输出 12 小时制并带 AM/PM。
+/// 格式化挂钟读数。`use_12h` 为 true 时走 12 小时制并带 AM/PM；`show_seconds` 为 false
+/// 时把秒整段压掉（与 Catime 的 `CLOCK_SHOW_SECONDS` 同义，默认显示）。
 ///
-/// - 24 小时制：`"HH:MM:SS"`（8 字符）
-/// - 12 小时制：`"hh:mm:ss AM"`（11 字符，仍容纳于 200px 宽的默认窗口）
-pub fn format_hms(h: u32, m: u32, s: u32, use_12h: bool) -> String {
+/// - 24 小时制：`"HH:MM:SS"`（8 字符）/ `"HH:MM"`（5 字符）
+/// - 12 小时制：`"hh:mm:ss AM"`（11 字符）/ `"hh:mm AM"`（8 字符），仍容纳于 200px 宽的默认窗口
+pub fn format_clock(h: u32, m: u32, s: u32, use_12h: bool, show_seconds: bool) -> String {
+    let sec = if show_seconds { format!(":{s:02}") } else { String::new() };
     if !use_12h {
-        return format!("{h:02}:{m:02}:{s:02}");
+        return format!("{h:02}:{m:02}{sec}");
     }
     let (h12, suffix) = match h {
         0 => (12, "AM"),  // 午夜
@@ -569,7 +571,7 @@ pub fn format_hms(h: u32, m: u32, s: u32, use_12h: bool) -> String {
         12 => (12, "PM"), // 正午
         _ => (h - 12, "PM"),
     };
-    format!("{h12:02}:{m:02}:{s:02} {suffix}")
+    format!("{h12:02}:{m:02}{sec} {suffix}")
 }
 
 #[cfg(test)]
@@ -761,19 +763,28 @@ mod tests {
 
     #[test]
     fn hms_formatting_24h() {
-        assert_eq!(format_hms(0, 0, 0, false), "00:00:00");
-        assert_eq!(format_hms(9, 5, 3, false), "09:05:03");
-        assert_eq!(format_hms(23, 59, 59, false), "23:59:59");
+        assert_eq!(format_clock(0, 0, 0, false, true), "00:00:00");
+        assert_eq!(format_clock(9, 5, 3, false, true), "09:05:03");
+        assert_eq!(format_clock(23, 59, 59, false, true), "23:59:59");
     }
 
     #[test]
     fn hms_formatting_12h() {
         // 午夜与正午是 12 小时制最容易错的两个点
-        assert_eq!(format_hms(0, 0, 0, true), "12:00:00 AM");
-        assert_eq!(format_hms(12, 30, 0, true), "12:30:00 PM");
-        assert_eq!(format_hms(9, 5, 3, true), "09:05:03 AM");
-        assert_eq!(format_hms(13, 5, 3, true), "01:05:03 PM");
-        assert_eq!(format_hms(23, 59, 59, true), "11:59:59 PM");
+        assert_eq!(format_clock(0, 0, 0, true, true), "12:00:00 AM");
+        assert_eq!(format_clock(12, 30, 0, true, true), "12:30:00 PM");
+        assert_eq!(format_clock(9, 5, 3, true, true), "09:05:03 AM");
+        assert_eq!(format_clock(13, 5, 3, true, true), "01:05:03 PM");
+        assert_eq!(format_clock(23, 59, 59, true, true), "11:59:59 PM");
+    }
+
+    /// 关掉秒是整段抹掉，不是"截断到 5 字符"那种做法：12 小时制的 AM/PM 要留着。
+    #[test]
+    fn seconds_can_be_hidden() {
+        assert_eq!(format_clock(9, 5, 3, false, false), "09:05");
+        assert_eq!(format_clock(23, 59, 59, false, false), "23:59");
+        assert_eq!(format_clock(13, 5, 3, true, false), "01:05 PM");
+        assert_eq!(format_clock(0, 0, 0, true, false), "12:00 AM");
     }
 
     #[test]

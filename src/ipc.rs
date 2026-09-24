@@ -56,6 +56,9 @@ pub struct Intent {
     pub duration: Option<u32>,
     /// `-r`：立即开始。
     pub autostart: bool,
+    /// `--hide` / `--show`：把挂件的可见性设成给定值。
+    /// 只对**已在跑的那个实例**有意义，冷启动时新实例总是可见的（见 `main.rs` 的提示）。
+    pub hidden: Option<bool>,
 }
 
 impl Intent {
@@ -70,6 +73,8 @@ impl Intent {
                 "-p" | "--pomodoro" => intent.mode = Some(Mode::Pomodoro),
                 "-k" | "--clock" => intent.mode = Some(Mode::Clock),
                 "-r" | "--running" => intent.autostart = true,
+                "--hide" => intent.hidden = Some(true),
+                "--show" => intent.hidden = Some(false),
                 other => {
                     // 时长：相对写法（"25m"）或绝对时刻（"14:30"，已过算明天同一时刻）
                     let secs = parse::parse_duration(other).or_else(|| {
@@ -101,6 +106,10 @@ impl Intent {
     /// 于是 `tinyticker -p` 落到番茄钟上，而 `tinyticker 25m` 是一条会自己开始的倒计时。
     pub fn commands(&self) -> Vec<Command> {
         let mut out = Vec::new();
+        // 可见性排在最前：`--hide` 之后不管换成什么模式，结果都是"藏着跑"
+        if let Some(hidden) = self.hidden {
+            out.push(Command::SetHidden(hidden));
+        }
         if let Some(mode) = self.mode {
             out.push(Command::SetMode(mode));
         }
@@ -304,6 +313,20 @@ mod tests {
             vec![Command::Start]
         );
         assert!(Intent::parse(&[]).unwrap().commands().is_empty());
+    }
+
+    /// `--hide` / `--show` 是设定值而不是翻面，所以重复执行同一个命令结果不变。
+    #[test]
+    fn visibility_flags_map_to_set_hidden() {
+        assert_eq!(Intent::parse(&["--hide".into()]).unwrap().hidden, Some(true));
+        assert_eq!(Intent::parse(&["--show".into()]).unwrap().hidden, Some(false));
+        assert_eq!(Intent::parse(&[]).unwrap().hidden, None);
+        assert_eq!(Intent::parse(&["--hide".into()]).unwrap().commands(), vec![Command::SetHidden(true)]);
+        assert_eq!(
+            Intent::parse(&["--hide".into(), "25m".into()]).unwrap().commands(),
+            vec![Command::SetHidden(true), Command::Preset(1500)],
+            "可见性该排在其它命令之前"
+        );
     }
 
     #[test]

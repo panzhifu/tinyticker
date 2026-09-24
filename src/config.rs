@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::effect::{Effect, Gradient};
 use crate::parse::parse_duration;
-use crate::render::{parse_color, rgb};
+use crate::render::{Pad, parse_color, rgb};
 use crate::timer::{Mode, Pomo};
 use crate::tray::IconMode;
 
@@ -161,6 +161,13 @@ pub struct Config {
     pub click_through: bool,
     /// 时钟挂件是否用 12 小时制（带 AM/PM）；false 为 24 小时制。
     pub clock_12h: bool,
+    /// 时钟挂件要不要显示秒；false 则只到分（`HH:MM`）。
+    pub clock_seconds: bool,
+    /// 计时数字行的补零档位（`none` / `zero` / `full`）。
+    pub time_pad: Pad,
+    /// 数字行是否显示百分之一秒（`45.32s` / `m:ss.cc`）。
+    /// 开启且计时器在跑时心跳从 200ms 提到 20ms——实测单核 0.9%，整秒档 < 0.1%。
+    pub centiseconds: bool,
     /// 托盘图标显示什么：真实时表盘、CPU / 内存 / 电量的水位占用表，或动图。
     pub tray_icon: IconMode,
     /// 动图图标的路径（`tray_icon = gif` 时才有意义）。支持开头的 `~/`。
@@ -195,6 +202,9 @@ impl Default for Config {
             zoom: 1.0,
             click_through: false,
             clock_12h: false,
+            clock_seconds: true,
+            time_pad: Pad::default(),
+            centiseconds: false,
             tray_icon: IconMode::Clock,
             tray_gif: None,
             pomo: Pomo::default(),
@@ -239,6 +249,32 @@ pub fn config_path() -> Option<PathBuf> {
     Some(dir.join(env!("CARGO_PKG_NAME")).join(CONFIG_FILE))
 }
 
+/// 原子写：先写同目录的临时文件、`sync_all` 落盘，再 `rename` 覆盖目标。
+///
+/// 同目录 `rename` 在 POSIX 下是原子的，所以掉电或进程被杀最多丢掉这一次写回，不会留下
+/// 半截配置——那会让下次启动读到截断的键值。（目录项本身没有 fsync，所以极端掉电下的
+/// 后果是"退回上一版配置"，而不是"配置被写坏"。）
+fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    // 临时名带上 pid：同时有两个进程在写（例如另一份 HOME 起了第二个实例）也不互相踩
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+    let out = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        // 数据先落盘再 rename：反过来做，掉电后可能剩下一个空的正式文件
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if out.is_err() {
+        let _ = fs::remove_file(&tmp); // 半截的临时文件不该留在配置目录里
+    }
+    out
+}
+
 impl Config {
     /// 读取配置；文件不存在或读取失败时返回默认值。
     pub fn load() -> Config {
@@ -256,13 +292,7 @@ impl Config {
         let Some(path) = config_path() else {
             return;
         };
-        let write = |text: &str| -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir)?;
-            }
-            fs::write(&path, text)
-        };
-        if let Err(e) = write(&self.serialize()) {
+        if let Err(e) = write_atomic(&path, &self.serialize()) {
             eprintln!("⚠️ 无法保存配置 {}: {e}", path.display());
         }
     }
@@ -315,15 +345,22 @@ impl Config {
                         cfg.zoom = z;
                     }
                 }
-                "click_through" | "clock_12h" => {
+                "click_through" | "clock_12h" | "clock_seconds" | "centiseconds" => {
                     let on = matches!(
                         value.to_ascii_lowercase().as_str(),
                         "true" | "1" | "yes" | "on"
                     );
-                    if key == "click_through" {
-                        cfg.click_through = on;
-                    } else {
-                        cfg.clock_12h = on;
+                    match key {
+                        "click_through" => cfg.click_through = on,
+                        "clock_12h" => cfg.clock_12h = on,
+                        "clock_seconds" => cfg.clock_seconds = on,
+                        _ => cfg.centiseconds = on,
+                    }
+                }
+                "time_pad" => {
+                    // 认不出来的值留默认档：这一档写错只是不补零，不像路径那样需要警告
+                    if let Some(p) = Pad::from_name(value) {
+                        cfg.time_pad = p;
                     }
                 }
                 "presets" => {
@@ -418,6 +455,9 @@ impl Config {
         out.push_str(&format!("zoom = {:.2}\n", self.zoom));
         out.push_str(&format!("click_through = {}\n", self.click_through));
         out.push_str(&format!("clock_12h = {}\n", self.clock_12h));
+        out.push_str(&format!("clock_seconds = {}\n", self.clock_seconds));
+        out.push_str(&format!("time_pad = {}\n", self.time_pad.name()));
+        out.push_str(&format!("centiseconds = {}\n", self.centiseconds));
         out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
         if let Some(path) = &self.tray_gif {
             out.push_str(&format!("tray_gif = {path}\n"));
@@ -463,6 +503,9 @@ mod tests {
             color_done: Gradient::solid(0xAABBCC),
             bg_alpha: 120,
             zoom: 1.75,
+            centiseconds: true,
+            clock_seconds: false,
+            time_pad: Pad::Full,
             tray_icon: IconMode::Gif,
             tray_gif: Some("~/pics/spin.gif".into()),
             pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 },
@@ -650,21 +693,41 @@ mod tests {
         assert_eq!(bad.pomo, Pomo::default());
     }
 
+    /// 布尔开关共用同一套值串。默认值也一起钉住：百分秒与"显示秒"里，前者默认关
+    /// （代价是心跳），后者默认开（v0.5.0 以来的行为）。
     #[test]
-    fn click_through_parses_boolean_aliases() {
-        for on in ["true", "1", "yes", "on", "TRUE", "Yes"] {
-            assert!(
-                Config::from_str(&format!("click_through = {on}\n")).click_through,
-                "{on} 应解析为 true"
-            );
-        }
-        for off in ["false", "0", "no", "off", "", "whatever"] {
-            assert!(
-                !Config::from_str(&format!("click_through = {off}\n")).click_through,
-                "{off} 应解析为 false"
-            );
+    fn boolean_keys_parse_the_same_aliases() {
+        let get = |cfg: &Config, key: &str| match key {
+            "click_through" => cfg.click_through,
+            "clock_12h" => cfg.clock_12h,
+            "clock_seconds" => cfg.clock_seconds,
+            _ => cfg.centiseconds,
+        };
+        for key in ["click_through", "clock_12h", "clock_seconds", "centiseconds"] {
+            for on in ["true", "1", "yes", "on", "TRUE", "Yes"] {
+                let cfg = Config::from_str(&format!("{key} = {on}\n"));
+                assert!(get(&cfg, key), "{key} = {on} 应解析为 true");
+            }
+            for off in ["false", "0", "no", "off", "", "whatever"] {
+                let cfg = Config::from_str(&format!("{key} = {off}\n"));
+                assert!(!get(&cfg, key), "{key} = {off} 应解析为 false");
+            }
         }
         assert!(!Config::default().click_through); // 默认整窗可拖动
+        assert!(!Config::default().centiseconds);
+        assert!(Config::default().clock_seconds);
+    }
+
+    /// `time_pad` 只认那三个值串，写错留默认档而不是把配置丢掉。
+    #[test]
+    fn time_pad_parses_and_rejects_unknown() {
+        assert_eq!(Config::from_str("time_pad = zero\n").time_pad, Pad::Zero);
+        assert_eq!(Config::from_str("time_pad = full\n").time_pad, Pad::Full);
+        assert_eq!(Config::from_str("time_pad = half\n").time_pad, Pad::None);
+        for p in [Pad::None, Pad::Zero, Pad::Full] {
+            let cfg = Config { time_pad: p, ..Config::default() };
+            assert_eq!(Config::from_str(&cfg.serialize()).time_pad, p);
+        }
     }
 
     /// `text_font` 的三态要能原样往返：路径值一旦在写回时被规范化或丢掉，
@@ -700,6 +763,26 @@ mod tests {
         // temp_dir 总是绝对路径，正向用例因此与主机无关
         let abs = std::env::temp_dir();
         assert_eq!(absolute(Some(abs.clone().into_os_string())), Some(abs));
+    }
+
+    /// 原子写：内容正确、能覆盖已有文件、不在配置目录留下临时文件。
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("tinyticker-atomic-{}", std::process::id()));
+        let path = dir.join("config.conf");
+        let _ = fs::remove_dir_all(&dir);
+        // 目录不存在也要能写（首次启动就是这个情况）
+        write_atomic(&path, "a = 1\n").expect("首次写该成功");
+        write_atomic(&path, "a = 2\n").expect("覆盖写该成功");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 2\n");
+        let extras: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.conf")
+            .collect();
+        assert!(extras.is_empty(), "临时文件没清掉: {extras:?}");
+        assert!(fs::remove_dir_all(&dir).is_ok());
     }
 
     #[test]
