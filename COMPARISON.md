@@ -116,4 +116,4 @@
 
 差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透，0.5.0 补上 Wayland 置顶与自定位（不再需要合成器规则），工作区版本清掉长休息/可配预设/文字特效/渐变/占用表/外部文本源六项，再补状态行中文（字形层）。本次逐文件读码另需修正本表 6 处（点击穿透、Catime 版本号、预设数、绝对时间语法、字体裁剪工具归属、插件启动方式）——见 GAP.md §十。
 
-> 体积验证：Wayland 极小版 0.56 MB / 含 X11 通用版 0.57 MB（未压缩，583 512 / 592 080 字节）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。
+> 体积验证：Wayland 极小版 0.56 MB / 含 X11 通用版 0.57 MB（未压缩，584 232 / 592 816 字节）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc 与 libgcc_s。

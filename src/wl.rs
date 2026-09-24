@@ -101,41 +101,6 @@ struct Events {
     frame: Cell<bool>,
     /// 最近一次指针事件 serial（设光标形状要用）
     serial: Cell<u32>,
-    /// —— 拖动诊断计数（`TINYTICKER_TRACE=1` 时才打印，计数本身常开且零分配）——
-    /// 用来回答"鼠标走了 N 像素、窗口为什么只走了 M"：三段链路各自的量都记下来。
-    rel_n: Cell<u32>,
-    rel_sum: Cell<(f64, f64)>,
-    unacc_sum: Cell<(f64, f64)>,
-    motion_n: Cell<u32>,
-    enter_n: Cell<u32>,
-    leave_n: Cell<u32>,
-    margin_n: Cell<u32>,
-    /// 实际改给 layer-shell 的累计位移，用来和"指针报告的位移"直接对比
-    applied: Cell<(f64, f64)>,
-    /// 表面局部坐标（`wl_pointer.motion` 的 sx/sy）。如果它大幅变化而 relative_motion
-    /// 合计≈0，就说明合成器给的"相对位移"是相对表面算的，窗口一跟手它就归零。
-    ptr_xy: Cell<(f64, f64)>,
-    press_xy: Cell<(f64, f64)>,
-    /// `dx` 的**原始定点位数**（未除 256）。用来分清"单位读错了"和"光标真没走"：
-    /// 一次正常鼠标移动应该是 ±256 的整数倍量级（1 px = 256），
-    /// 若每格只有个位数就跑满一屏，就是缩放常数错了。
-    raw_dx_sum: Cell<i64>,
-    raw_dx_peak: Cell<i32>,
-    enter_xy: Cell<(f64, f64)>,
-}
-
-/// 是否输出拖动诊断。只在按下/松开各打一行，正常运行时一个字节都不写。
-fn trace_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TINYTICKER_TRACE").is_some_and(|v| v == "1"))
-}
-
-/// 只诊断不移动：`TINYTICKER_NODEMOVE=1` 时拖动完全不改 margin。
-/// 用来判定"局部坐标与 relative 合计都接近 0"到底是事件源的问题，
-/// 还是"窗口跟随指针 → 局部坐标自我抵消"这个闭环造成的。
-fn nodmove() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TINYTICKER_NODEMOVE").is_some_and(|v| v == "1"))
 }
 
 /// `wl_buffer.release` 回调要区分是哪块缓冲，data 指针带上下标。
@@ -500,14 +465,7 @@ client.commit();
     }
 
     fn set_margin(&mut self, (x, y): (i32, i32)) {
-        let (px, py) = self.margin;
         self.margin = (x, y);
-        if trace_on() {
-            let e = self.events;
-            e.margin_n.set(e.margin_n.get() + 1);
-            let (ax, ay) = e.applied.get();
-            e.applied.set((ax + (x - px) as f64, ay + (y - py) as f64));
-        }
         request(
             &self.wl,
             self.layer,
@@ -562,15 +520,8 @@ client.commit();
                 self.drag_origin.1 + self.drag_acc.1.round() as i32,
             );
             if next != self.margin {
-                if nodmove() {
-                    // 只记次数不真的挪窗口，用来测"不动窗口时指针能报多少位移"
-                    self.events.margin_n.set(self.events.margin_n.get() + 1);
-                    let (ax, ay) = self.events.applied.get();
-                    self.events.applied.set((ax + (next.0 - self.margin.0) as f64, ay + (next.1 - self.margin.1) as f64));
-                } else {
-                    self.set_margin(next);
-                    self.commit();
-                }
+                self.set_margin(next);
+                self.commit();
             }
         }
         if e.frame.get() {
@@ -869,31 +820,15 @@ unsafe extern "C" fn on_buffer_release(data: *mut c_void, _buffer: Obj) {
 }
 
 /// wl_pointer 的十个事件，顺序必须与协议一致（enter…axis_value120）。
-unsafe extern "C" fn on_ptr_enter(data: *mut c_void, _o: Obj, serial: u32, _s: Obj, x: i32, y: i32) {
+unsafe extern "C" fn on_ptr_enter(data: *mut c_void, _o: Obj, serial: u32, _s: Obj, _x: i32, _y: i32) {
     let e = unsafe { &*(data as *const Events) };
     e.serial.set(serial);
     e.frame.set(true);
-    e.enter_n.set(e.enter_n.get() + 1);
-    // enter 也带局部坐标：按下前若没有 motion，press_xy 就得从这里取
-    let xy = (fixed(x), fixed(y));
-    e.enter_xy.set(xy);
-    e.ptr_xy.set(xy);
 }
 
-unsafe extern "C" fn on_ptr_leave(data: *mut c_void, _o: Obj, _serial: u32, _s: Obj) {
-    // 不清 left_down：隐式 grab 期间仍要接着算位移。但**计数**要记——
-    // 拖动中途出现 leave 就说明焦点被抢走，relative_motion 可能随之停供。
-    let e = unsafe { &*(data as *const Events) };
-    e.leave_n.set(e.leave_n.get() + 1);
-}
+unsafe extern "C" fn on_ptr_leave(_data: *mut c_void, _o: Obj, _serial: u32, _s: Obj) {}
 
-unsafe extern "C" fn on_ptr_motion(data: *mut c_void, _o: Obj, _time: u32, x: i32, y: i32) {
-    // 局部坐标不参与计算（窗口跟着它走，算不出位移），但要记下来：
-    // 它大幅变化而 relative_motion 合计≈0，就证明合成器给的相对位移是相对表面的。
-    let e = unsafe { &*(data as *const Events) };
-    e.motion_n.set(e.motion_n.get() + 1);
-    e.ptr_xy.set((fixed(x), fixed(y)));
-}
+unsafe extern "C" fn on_ptr_motion(_data: *mut c_void, _o: Obj, _time: u32, _x: i32, _y: i32) {}
 
 unsafe extern "C" fn on_ptr_noop(_data: *mut c_void, _o: Obj, _a: u32, _b: u32) {}
 
@@ -915,59 +850,11 @@ unsafe extern "C" fn on_ptr_button(
             e.left_pressed.set(true);
             e.rel_dx.set(0.0);
             e.rel_dy.set(0.0);
-            // 每次按下重新起算，松开时给一份完整账目
-            e.rel_n.set(0);
-            e.motion_n.set(0);
-            e.enter_n.set(0);
-            e.leave_n.set(0);
-            e.margin_n.set(0);
-            e.rel_sum.set((0.0, 0.0));
-            e.unacc_sum.set((0.0, 0.0));
-            e.applied.set((0.0, 0.0));
-            // 按下那一刻的局部坐标就是拖动零点（enter 已经给过一次 motion）
-            e.press_xy.set(e.ptr_xy.get());
-            e.raw_dx_sum.set(0);
-            e.raw_dx_peak.set(0);
         }
         (BTN_LEFT, false) => {
             e.left_down.set(false);
             e.rel_dx.set(0.0);
             e.rel_dy.set(0.0);
-            if trace_on() {
-                let (rx, ry) = e.rel_sum.get();
-                let (ux, uy) = e.unacc_sum.get();
-                let (ax, ay) = e.applied.get();
-                eprintln!(
-                    "[拖动] 指针报告 ({rx:.1}, {ry:.1}) → 实际改 margin ({ax:.1}, {ay:.1})  \
-                     增益 x{:.2} y{:.2}",
-                    if rx.abs() < 0.5 { 0.0 } else { ax / rx },
-                    if ry.abs() < 0.5 { 0.0 } else { ay / ry },
-                );
-                eprintln!(
-                    "       relative_motion {} 次 | unaccel ({ux:.1}, {uy:.1}) | motion {} 次 \
-                     | enter {} / leave {} | set_margin {} 次",
-                    e.rel_n.get(),
-                    e.motion_n.get(),
-                    e.enter_n.get(),
-                    e.leave_n.get(),
-                    e.margin_n.get(),
-                );
-                let (px, py) = e.press_xy.get();
-                let (cx, cy) = e.ptr_xy.get();
-                eprintln!(
-                    "       局部坐标 按下 ({px:.1}, {py:.1}) → 松开 ({cx:.1}, {cy:.1})  差 ({:.1}, {:.1})",
-                    cx - px,
-                    cy - py,
-                );
-                eprintln!(
-                    "       dx 原始定点位 合计 {} (每次 {:.0}) | 单次峰值 {} | enter 局部 ({:.1}, {:.1})",
-                    e.raw_dx_sum.get(),
-                    e.raw_dx_sum.get() as f64 / e.rel_n.get().max(1) as f64,
-                    e.raw_dx_peak.get(),
-                    e.enter_xy.get().0,
-                    e.enter_xy.get().1,
-                );
-            }
         }
         (BTN_RIGHT, true) => e.right_pressed.set(true),
         _ => {}
@@ -1007,22 +894,14 @@ unsafe extern "C" fn on_relative_motion(
     _utime_lo: u32,
     dx: i32,
     dy: i32,
-    dx_unaccel: i32,
-    dy_unaccel: i32,
+    _dx_unaccel: i32,
+    _dy_unaccel: i32,
 ) {
     // 用加速后的 dx/dy：那才是屏幕上指针真正移动的量，挂件才能 1:1 跟手。
     // 增量与窗口跟随无关，不会像表面局部坐标那样反馈死锁。
     let e = unsafe { &*(data as *const Events) };
-    let (ax, ay) = (fixed(dx), fixed(dy));
-    e.rel_dx.set(e.rel_dx.get() + ax);
-    e.rel_dy.set(e.rel_dy.get() + ay);
-    e.rel_n.set(e.rel_n.get() + 1);
-    e.rel_sum.set((e.rel_sum.get().0 + ax, e.rel_sum.get().1 + ay));
-    e.unacc_sum.set((e.unacc_sum.get().0 + fixed(dx_unaccel), e.unacc_sum.get().1 + fixed(dy_unaccel)));
-    e.raw_dx_sum.set(e.raw_dx_sum.get() + dx as i64);
-    if dx.abs() > e.raw_dx_peak.get().abs() {
-        e.raw_dx_peak.set(dx);
-    }
+    e.rel_dx.set(e.rel_dx.get() + fixed(dx));
+    e.rel_dy.set(e.rel_dy.get() + fixed(dy));
 }
 
 #[cfg(test)]
