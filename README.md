@@ -1,10 +1,10 @@
 # TinyTicker
 
-极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，内置 8x8 位图字体，单二进制 0.5 MB，零第三方 crate，无任何运行时字体或 UI 依赖。
+极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，数字用内置 8x8 位图字体、状态行的中文由运行时 dlopen 的 libfreetype 补，单二进制 0.57 MB，零第三方 crate。
 
 ![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.5.0-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
 
-未压缩体积：**Wayland 极小版 0.47 MB**、通用版（Wayland + X11）0.48 MB——X11 后端只多 9 KB。UPX 压缩后的发布产物体积待下次发版按 CI 实测更新（v0.4.1 为 0.38 / 0.50 MB）。
+未压缩体积：**Wayland 极小版 0.56 MB**、通用版（Wayland + X11）0.57 MB——X11 后端只多 8.4 KB。UPX 压缩后的发布产物体积待下次发版按 CI 实测更新（v0.4.1 为 0.38 / 0.50 MB）。
 
 ## 功能
 
@@ -16,8 +16,11 @@
 - **无边框透明悬浮窗**：逐像素预乘 ARGB，`bg_alpha` 从 0（全透明，只剩文字）到 255（不透明）自由调节
 - **浮在全屏窗口之上**：Wayland 上走 layer-shell 的 overlay 层，网页视频全屏时依然可见（协议限制下这是唯一办法）；X11 走 `_NET_WM_STATE_ABOVE`
 - **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–3.0，自动持久化）；**在托盘图标上滚动同样缩放**（SNI `Scroll`，挂件太小或开着点击穿透时更顺手）
-- **外观即时可调**：托盘「外观」子菜单——5 档背景透明度 + 6 套配色预设 + 4 种图标内容，点击立刻生效并写回配置，不必重启；菜单带勾选，看得出当前用的是哪一项
-- **外部文本源**：`text_source` 指向一个由别的进程写的文件，它的第一行顶替状态行（编译进度、下载百分比之类）。靠 `(大小, mtime)` 判断要不要重读，超过 64 KB 直接不采信，文件缺失或清空就交还状态行。**只读不执行**——不像 Catime 那样替你启动插件脚本，生产者得自己跑
+- **外观即时可调**：托盘「外观」子菜单——5 档背景透明度 + 6 套配色预设 + 8 种文字特效 + 4 种图标内容，点击立刻生效并写回配置，不必重启；菜单带勾选，看得出当前用的是哪一项
+- **文字特效与渐变**：`text_effect` 七种特效（辉光 / 玻璃 / 霓虹 / 全息 / 液态 / 水波 / 复古投影）全部在自研软渲染器里实现——文字先栅格化成单通道覆盖度图，在其上做可分离盒模糊、腐蚀求轮廓、梯度求边、正弦与 value-noise 位移，再按预乘 alpha 合成回画布；三色可写成 `_` 分隔的横向渐变，超过两个停靠点自动流动。不引入任何图像库，也不依赖 GPU
+- **状态行能写中文**：数字行保持内置 8x8 点阵按整数倍放大的像素风（所有特效的模糊半径与位移量都是照它标定的），而点阵覆盖不到的码位——中文、Latin-1、带圈数字这类符号——由运行时 `dlopen` 出来的 libfreetype 光栅宿主字体补齐，两种字形按同一条基线混排。字体自动发现（先试 Noto Sans CJK / Source Han / 文泉驿 / 霞鹜文楷 的常见路径，再按名字偏好扫 `$XDG_DATA_HOME/fonts` 等字体根），也可以用 `text_font` 指定文件；`text_font = off` 就退回"非 ASCII 一律留空位"。整行都是 ASCII 时 freetype 一次都不会被调用，画面与以前逐字节相同
+- **单实例，二次启动 = 下命令**：已经在跑的时候再敲 `tinyticker 25m` 不会多开一个窗口，而是把同样的参数交给那个实例（Unix 套接字，`$XDG_RUNTIME_DIR/tinyticker.sock`，权限 0600）。**全局快捷键因此不必我们自己实现**——Wayland 没有统一的快捷键协议，你在 KDE / GNOME / niri 的快捷键设置里绑一条 `tinyticker 25m` 就完了
+- **外部文本源**：`text_source` 指向一个由别的进程写的文件，它的第一行顶替状态行（编译进度、下载百分比之类）。靠 `(大小, mtime)` 判断要不要重读，超过 64 KB 直接不采信，文件缺失或清空就交还状态行。**只读不执行**——Catime 那套插件也要用户在托盘里逐个手动启动并显式信任，我们则连启动这一步都不做，生产者自己跑
 - **时长输入**：相对时长 `25m` / `1h30m` / `90`，或**绝对时刻** `14:30`（已过则算明天）
 - **托盘控制**：**左键开始/暂停、中键重置**，右键打开完整菜单——时长预设（档位由 `presets` 配置，出厂 1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）、四模式切换、外观、退出
 - **托盘图标会走**：`tray_icon` 选真实时表盘（指针按本地时间摆）、CPU / 内存 / 电量的水位占用表，或**你自己的 GIF 动图**（`tray_gif`）。占用数据读 `/proc/stat`、`/proc/meminfo`、`/sys/class/power_supply`；图标按派发节拍重绘，像素变了才发 `NewIcon`
@@ -59,11 +62,11 @@ mkdir -p ~/.config/autostart && cp "$APP_ID.desktop" ~/.config/autostart/   # �
 
 ## 构建
 
-依赖：Rust 1.88+（edition 2024 + let-chains），Linux。不需要任何 X11 / Wayland / D-Bus 的 `-dev` 包——三边都是运行时 `dlopen` 发行版自带的共享库。
+依赖：Rust 1.88+（edition 2024 + let-chains），Linux。不需要任何 X11 / Wayland / D-Bus / FreeType 的 `-dev` 包——四边都是运行时 `dlopen` 发行版自带的共享库。
 
 ```sh
-cargo build --release                          # Wayland + X11 通用版（约 0.48 MB）
-cargo build --release --no-default-features    # 仅 Wayland 极小版（约 0.47 MB）
+cargo build --release                          # Wayland + X11 通用版（约 0.55 MB）
+cargo build --release --no-default-features    # 仅 Wayland 极小版（约 0.54 MB）
 ```
 
 也可直接从 [Releases](https://github.com/panzhifu/tinyticker/releases) 下载预编译二进制（见上一节，UPX 压缩）。打 tag 会自动触发构建、校验和生成与上传。
@@ -95,14 +98,23 @@ tinyticker 25m          # 25 分钟倒计时
 tinyticker 14:30        # 倒计时到今天 14:30
 tinyticker -p -r        # 立即开始番茄钟
 tinyticker -k           # 桌面时钟挂件
+
+# 已经开着挂件时，上面这些命令是「给在跑的那个下命令」而不是再开一个窗口：
+tinyticker 25m          # → 当前那个立刻开始 25 分钟倒计时
+tinyticker -k           # → 当前那个切到时钟模式
 ```
+
+把 `tinyticker 25m` 绑进 KDE / GNOME / niri 的自定义快捷键，就等于有了全局快捷键——
+我们不需要实现任何快捷键协议，只需要那个套接字。转发成功时会在 stderr 留一行
+`已把这条命令交给正在运行的实例 …（本进程不另开窗口）`，免得看不出窗口为什么没变多；
+想知道是谁在听，看 `/run/user/1000/tinyticker.sock` 与 `pgrep -x tinyticker` 即可。
 
 悬浮窗交互：左键按住拖动，右键关闭，滚轮缩放。
 
 托盘交互：左键开始/暂停，中键重置，右键打开完整菜单，在图标上滚动即可缩放。为此 `ItemIsMenu`
 报的是 `false`——规范要求「只有菜单、没有自己的激活行为」的项才报 `true`，而宿主据此会把左键
 直接吞成弹菜单，`Activate` 就永远到不了我们这里。挂件上没有做「点击输入时长」：那需要一个文本
-输入框，而本项目只有一个 8x8 位图渲染器；设时长走托盘预设或命令行参数。
+输入框，而本项目拿不到键盘（layer-shell 的键盘交互恒为 0）；设时长走托盘预设或命令行参数。
 透明度与配色走托盘「外观」子菜单，点一下即时生效；改 `bg_alpha` / `color_*` 也行，但要重启。
 
 ## 配置
@@ -145,11 +157,23 @@ presets = 60, 300, 900, 1500, 2700, 3600
 on_finish = loginctl lock-session   # 计时结束执行的命令（可选，省略则只通知）
                        # 经 sh -c 解释，例如锁屏 loginctl lock-session、关机 systemctl poweroff
 text_source = ~/tmp/build.out       # 外部文本源（可选）：第一行顶替状态行，支持开头的 ~/
-                       # 只能显示 ASCII（内置 8x8 字体），非 ASCII 字符会留空位
+                       # 截断按**实测像素宽**算，不是按字数——中文一格放不下就整字退让
+text_font = auto      # 点阵补不到的码位（中文、Latin-1、符号）用什么字形
+                       # auto = dlopen libfreetype 并自动找一块中文字体（默认）
+                       # off  = 完全不用外部字体，非 ASCII 留空位
+                       # 其它值 = 字体文件路径，支持开头的 ~/；打不开会警告并退回自动发现
+                       # 数字行恒用 8x8 点阵，这个开关只影响状态行里点阵没有的那些字
 color_bg = 0f0f14      # 背景色（#RRGGBB / 0xRRGGBB / RRGGBB 均可）
-color_running = ffffff # 运行中
-color_paused = ffc850  # 暂停
-color_done = 50dc78    # 结束
+color_running = ffffff # 运行中；可写渐变，如 #FF5E96_#56C6FF（`_` 分隔 2-20 个停靠点，
+                       # 横向铺满文字采样；超过 2 个会自动流动，与 Catime 同规则）
+color_paused = ffc850  # 暂停（同上，可写渐变）
+color_done = 50dc78    # 结束（同上，可写渐变）
+text_effect = none     # 文字特效：none | glow | glass | neon | holographic | liquid | aqua | retro
+                       # 辉光 / 玻璃 / 霓虹 / 全息 / 液态 / 水波 / 复古投影，值串与 Catime 的
+                       # TEXT_EFFECT 逐字一致。液态与水波会动，此时心跳自动从 200ms 提到 50ms
+                       # 这一项也能从托盘「外观 → 文字特效」直接点选，改完即时生效
+                       # 注意：特效的模糊半径与位移量都按 8x8 位图字形的尺寸重定过，
+                       # 不是照抄 Catime 那套针对几十像素 TTF 字形的常数
 window_x = 100         # 窗口位置（逻辑像素，成对出现才生效；layer-shell 与 X11 生效）
 window_y = 200
 ```
@@ -169,6 +193,7 @@ src/
 │   ├── mod.rs     # dlopen / dlsym 封装
 │   ├── wayland.rs # libwayland-client 声明 + 手写扩展协议接口描述符
 │   ├── dbus.rs    # libdbus-1 声明（消息迭代器 / vtable / 总线与连接）
+│   ├── freetype.rs # libfreetype 声明：只按探测出的字节偏移读需要的字段，不镜像整份结构体
 │   └── x11.rs     # libX11 / libXext 声明（事件 union 与结构体逐字段照 Xlib.h）
 ├── x11.rs     # X11 客户端：直调 libX11，override-redirect ARGB 窗口
 │              #   XPutImage 软渲染 + 拖动/滚轮/右键 + 点击穿透（libXext SHAPE），仅 `x11` feature
@@ -177,8 +202,10 @@ src/
 ├── sysinfo.rs # 系统状态采样（CPU 差分 / MemAvailable / 电量），只读 /proc 与 /sys
 ├── gif.rs     # 最小 GIF89a 解码器（LZW + 交错 + 子矩形 + disposal），托盘动图图标用
 ├── textsrc.rs # 外部文本源：读一个文件的第一行顶替状态行，带大小上限与变化检测
+├── ipc.rs     # 命令行意图解析 + 单实例转发（Unix 套接字）；二次启动 = 下命令
 ├── timer.rs   # 计时状态机（倒计时 / 秒表 / 番茄钟 / 时钟），含走时补齐
-├── render.rs  # 像素画布、8x8 字形渲染、时间格式化
+├── text.rs    # 字形层：8x8 点阵优先，点阵没有的码位交给 libfreetype；含字体自动发现
+├── render.rs  # 像素画布、字形绘制（点阵整数放大 / 灰度覆盖度贴图）、时间格式化
 ├── config.rs  # 配置持久化（纯 std 文件 IO）
 ├── parse.rs   # 相对时长与绝对时刻解析
 ├── tray.rs    # 自研托盘：StatusNotifierItem + dbusmenu 菜单 + 通知 + 每秒重绘的图标
@@ -190,17 +217,21 @@ packaging/   # 随 release 发布的 freedesktop 资产
 └── io.github.panzhifu.tinyticker.metainfo.xml # AppStream 元数据
 ```
 
-技术栈：Wayland 侧不用任何 Rust GUI/协议库——`src/sys/wayland.rs` 声明 libwayland-client 的 C API 并在运行时 dlopen，扩展协议（layer-shell / viewporter / fractional-scale / relative-pointer / cursor-shape）的接口描述符按协议 XML 手写。托盘与通知同理：`src/sys/dbus.rs` 声明 libdbus-1 的 C API，`src/tray.rs` 自己实现 StatusNotifierItem + com.canonical.dbusmenu + 通知发送。因此 **Wayland 极小版零第三方 crate，`ldd` 只有 libc 与 libgcc_s**。
+技术栈：Wayland 侧不用任何 Rust GUI/协议库——`src/sys/wayland.rs` 声明 libwayland-client 的 C API 并在运行时 dlopen，扩展协议（layer-shell / viewporter / fractional-scale / relative-pointer / cursor-shape）的接口描述符按协议 XML 手写。托盘与通知同理：`src/sys/dbus.rs` 声明 libdbus-1 的 C API，`src/tray.rs` 自己实现 StatusNotifierItem + com.canonical.dbusmenu + 通知发送。字形也是同一手法：`src/sys/freetype.rs` 运行时 dlopen `libfreetype.so.6` 取六个函数，按 `offsetof` 探测出的偏移读槽位字段，取不到库或字体就退回内置点阵。因此 **Wayland 极小版零第三方 crate，`ldd` 只有 libc 与 libgcc_s**——构建不需要任何 `-dev` 包，freetype 与 fontconfig 一样都是发行版自带的运行时库。
 
-X11 侧同理：`src/sys/x11.rs` 逐字段照 `Xlib.h` 镜像 ABI，`src/x11.rs` 自己建 override-redirect 的 depth-32 ARGB 窗口、`XPutImage` 软渲染、`XShapeCombineRectangles` 做点击穿透，拖动靠 `XGrabPointer` + 根坐标。因此**两种构建都零第三方 crate**（`Cargo.lock` 里只有 tinyticker 自己），实测只硬链 `libc` 与 `libgcc_s`，X11 / Wayland / D-Bus 全部运行时 dlopen。
+X11 侧同理：`src/sys/x11.rs` 逐字段照 `Xlib.h` 镜像 ABI，`src/x11.rs` 自己建 override-redirect 的 depth-32 ARGB 窗口、`XPutImage` 软渲染、`XShapeCombineRectangles` 做点击穿透，拖动靠 `XGrabPointer` + 根坐标。因此**两种构建都零第三方 crate**（`Cargo.lock` 里只有 tinyticker 自己），实测只硬链 `libc` 与 `libgcc_s`，X11 / Wayland / D-Bus / FreeType 全部运行时 dlopen。
 
 ## 已知限制
 
-- 内置字体仅 ASCII，不支持中文等非 ASCII 字符显示
+与 Catime 的逐条代码级差距分析（差在哪、为什么差、补齐要付多少）见 [GAP.md](GAP.md)；功能对照表见 [COMPARISON.md](COMPARISON.md)。
+
+- **数字行只有 ASCII**：那是刻意的——8x8 点阵按整数倍放大才有这套像素风，且所有文字特效的模糊半径与位移量都是照 `8 × scale` 的字形尺寸标定的。中文只出现在状态行
+- 状态行的非 ASCII 依赖机器上有 `libfreetype.so.6` 和一块中文字体；两者任一缺失就退回原行为（非 ASCII 留空位），不会报错也不影响其余功能。`text_font = off` 可以显式要这个原行为
+- **不做文本 shaping**：逐码位查字形、水平推进，所以连字、从右到左书写、以及"字母 + 组合附加符"这类需要排字引擎的写法都不处理。状态行只显示它拿到的那一行，不换行
 - 托盘动图**只支持 GIF**：WebP 要整个 VP8 codec、PNG 要 inflate + 滤波、JPG 要 DCT，为零第三方依赖的 0.5 MB 二进制都不划算（Catime 那几个格式是靠 Windows 自带的 WIC 解的，Linux 没有等价物）。自写解码器还设了界：画布 ≤128×128、帧数 ≤64、文件 ≤2 MB，超出一律拒收
 - `tray_icon = gif` 但 `tray_gif` 没配（或文件不可用）时，图标退回真实时表盘；托盘菜单里那一档会**置灰**并把原因写进标签（「GIF 动图（未配置 tray_gif）」），点了不会有动作
 - 鼠标穿透为可选项：默认整窗接收输入（好拖动），开启 `click_through` 后只有文字可点——二者不可兼得
-- 无全局快捷键（Wayland 无统一协议）
+- 我们自己不注册全局快捷键（Wayland 无统一协议，X11 走 `XGrabKey` 又会与合成器抢键）。替代路径是单实例套接字：把 `tinyticker 25m` 绑进 DE 的自定义快捷键即可，见「用法」一节
 - 挂件上没有 Ctrl/Shift+滚轮：Wayland 的 pointer 事件不带 modifier，而 overlay 层挂件默认拿不到键盘焦点，读不到修饰键状态。连续调节一律走托盘（图标上滚动 = 缩放，菜单 = 透明度/配色），X11 侧同样如此，两端行为一致
 - 依赖 layer-shell：合成器不提供该协议时（如 GNOME 裸机）直接报错退出，不再退回普通窗口——退回也没意义，全屏会被盖住
 - X11 侧的透明需要合成器（picom / KWin / Xwayland）；没有合成器时背景会显示成不透明黑底。缩放系数取 `Xft.dpi / 96`，X11 没有分数缩放协议
