@@ -69,7 +69,7 @@
 | 开机自启 | ✅（工作区版本：托盘「🚀 开机自启」勾选框，写 / 删 `~/.config/autostart/io.github.panzhifu.tinyticker.desktop`，`Exec` 用 `current_exe()` 的真实路径。判据就是那个文件在不在，所以用户在系统设置里关掉我们也立刻看得到） | ❌（没有自启注册，交给安装器） |
 | 多实例 / 配置路径覆盖 | ✅（工作区版本：`--config-dir <目录>` 或 `TINYTICKER_CONFIG_DIR`——配置与**套接字**一起搬进那个目录，于是可以同时跑两套互不相干的挂件；实测两个目录各自起一个实例、互不转发） | ❌（单一 INI 路径） |
 | 恢复默认 / 重置位置 | ✅（工作区版本：托盘「↺ 恢复默认设置」与「⌂ 重置窗口位置」，都立刻写盘；位置是当场挪回出厂值，不必重启） | ✅（`Reset` 重建配置并重注册热键，`window_commands_reset.c:55-94`） |
-| 安装分发 | GitHub Releases（版本化产物名 + SHA256SUMS + freedesktop 元数据）；AUR 待建 | winget / GitHub Releases |
+| 安装分发 | GitHub Releases（版本化产物名 + SHA256SUMS + freedesktop 元数据，自 v0.6.0 起附 `packaging/PKGBUILD` 可直推 AUR） | winget / GitHub Releases |
 
 ## 三、tinyticker 的差异化优势
 

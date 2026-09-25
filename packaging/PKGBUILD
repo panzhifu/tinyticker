@@ -1,0 +1,43 @@
+# Maintainer: panzhifu <panzhifu@users.noreply.github.com>
+# 本文件同时是 AUR 的提交形态：源码走 GitHub tag 归档，与仓库一起维护。
+pkgname=tinyticker
+pkgver=0.6.0
+pkgrel=1
+pkgdesc="极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件（零第三方 crate）"
+arch=('x86_64')
+url="https://github.com/panzhifu/tinyticker"
+license=('MIT')
+# 构建只需要 rust（内含 cargo）；运行期不需要任何 -dev 包——
+# Wayland / X11 / D-Bus / FreeType / ALSA 全是运行时 dlopen 发行版自带的 .so
+makedepends=('rust')
+optdepends=(
+    'noto-fonts-cjk: 状态行中文显示（libfreetype 自动发现宿主字体）'
+    'network-manager-applet: 托盘图标走 StatusNotifierItem 需要支持 SNI 的面板'
+)
+source=("$pkgname-v$pkgver.tar.gz::https://github.com/panzhifu/tinyticker/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('128990ab723e29e36db6c48f1ea715ffb7847fd1644aa5a9a62dc7cf40ad8174')
+
+build() {
+  cd "$srcdir/tinyticker-$pkgver"
+  # 默认特征即 Wayland + X11 通用版（极小版是 --no-default-features，
+  # Arch 上装通用版才对：面板与 XWayland 会话都可能用到）
+  cargo build --release
+}
+
+check() {
+  cd "$srcdir/tinyticker-$pkgver"
+  cargo test --release
+}
+
+package() {
+  cd "$srcdir/tinyticker-$pkgver"
+  install -Dm755 target/release/tinyticker "$pkgdir/usr/bin/tinyticker"
+
+  # freedesktop 集成：应用菜单入口、图标、AppStream 元数据
+  local app=io.github.panzhifu.tinyticker
+  install -Dm644 "packaging/$app.desktop"      "$pkgdir/usr/share/applications/$app.desktop"
+  install -Dm644 "packaging/$app.svg"          "$pkgdir/usr/share/icons/hicolor/scalable/apps/$app.svg"
+  install -Dm644 "packaging/$app.metainfo.xml" "$pkgdir/usr/share/metainfo/$app.metainfo.xml"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
