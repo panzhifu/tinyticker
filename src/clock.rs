@@ -26,6 +26,17 @@ pub fn now_hms() -> (u32, u32, u32) {
     default_zone().hms(epoch)
 }
 
+/// 当前本地时间 (时, 分, 秒, 百分之一秒)。时钟挂件的百分秒档用（GAP §一
+/// "#15 没收掉的"那半句：取整秒的那条路拿不到亚秒，这里从同一个
+/// `duration_since` 里把零头一起读了，两个粒度同源，不会一个在走另一个冻着）。
+pub fn now_hms_cs() -> (u32, u32, u32, u32) {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let (h, m, s) = default_zone().hms(d.as_secs() as i64);
+    (h, m, s, d.subsec_micros() / 10_000)
+}
+
 /// 进程内解析一次：transition 表与规则串都是静态数据，跨 DST 边界无需重读文件。
 fn default_zone() -> &'static Zone {
     static ZONE: OnceLock<Zone> = OnceLock::new();
@@ -135,14 +146,8 @@ fn parse_tzif(data: &[u8]) -> Option<Zone> {
     }
     let version = data[4];
     let (isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt) = header(&data[20..44])?;
-    let v1_len = 44
-        + timecnt * 4
-        + timecnt
-        + typecnt * 6
-        + charcnt
-        + leapcnt * 8
-        + isstdcnt
-        + isutcnt;
+    let v1_len =
+        44 + timecnt * 4 + timecnt + typecnt * 6 + charcnt + leapcnt * 8 + isstdcnt + isutcnt;
     // v1 只有 32 位时刻，2038 年会溢出；有 v2+ 就读它
     let (start, time_width) = if version == 0 || version == b'1' {
         (0usize, 4usize)
@@ -175,7 +180,8 @@ fn parse_tzif(data: &[u8]) -> Option<Zone> {
         .collect();
 
     // 表尾：`\n` POSIX 规则串 `\n`
-    let rule = data.get(end..)?
+    let rule = data
+        .get(end..)?
         .iter()
         .position(|&b| b == b'\n')
         .and_then(|nl| {
@@ -265,7 +271,8 @@ impl PosixRule {
         let jan1 = days_from_civil(year, 1, 1) * SECS_PER_DAY;
         // start 按标准时计，end 按夏令时计（故要减回一个 DST 增量）
         let start_at = jan1 + start.day.second_of_year(year) + start.at as i64;
-        let end_at = jan1 + end.day.second_of_year(year) + end.at as i64 - (dst_off - self.std_off) as i64;
+        let end_at =
+            jan1 + end.day.second_of_year(year) + end.at as i64 - (dst_off - self.std_off) as i64;
 
         let in_dst = if start_at <= end_at {
             std_local >= start_at && std_local < end_at
@@ -311,7 +318,10 @@ struct Spec<'a> {
 
 impl<'a> Spec<'a> {
     fn new(s: &'a str) -> Self {
-        Self { b: s.as_bytes(), i: 0 }
+        Self {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -339,7 +349,10 @@ impl<'a> Spec<'a> {
             return self.i > start && self.eat(b'>');
         }
         let start = self.i;
-        while self.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        {
             self.i += 1;
         }
         self.i > start
@@ -353,7 +366,10 @@ impl<'a> Spec<'a> {
         if self.i == start {
             return None;
         }
-        std::str::from_utf8(&self.b[start..self.i]).ok()?.parse().ok()
+        std::str::from_utf8(&self.b[start..self.i])
+            .ok()?
+            .parse()
+            .ok()
     }
 
     /// `[+-]h[:mm[:ss]]`，缺省符号为正；POSIX 里符号表示「UTC + offset」。
@@ -453,19 +469,22 @@ fn parse_posix(spec: &str) -> Option<PosixRule> {
     }
     // POSIX 的 offset 是「本地 + offset = UTC」，内部用的是「UTC + off = 本地」，故取负
     let std_off = -s.read_offset()?;
-    let rule = PosixRule {
-        std_off,
-        dst: None,
-    };
+    let rule = PosixRule { std_off, dst: None };
     // 名字之后没有内容，或压根不是名字 → 只有标准时
-    if !s.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == b'<') {
+    if !s
+        .peek()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'<')
+    {
         return Some(rule);
     }
     if !s.read_name() {
         return Some(rule);
     }
     // DST 偏移缺省为标准时 +1 小时
-    let dst_off = if s.peek().is_some_and(|c| c.is_ascii_digit() || c == b'-' || c == b'+') {
+    let dst_off = if s
+        .peek()
+        .is_some_and(|c| c.is_ascii_digit() || c == b'-' || c == b'+')
+    {
         -s.read_offset()?
     } else {
         std_off + 3600
@@ -542,7 +561,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// 某年第 m 月第 w 个星期 d 的月内日序（0 基，相对当月 1 日）。
 fn nth_weekday_of_month(year: i64, month: u32, week: u32, dow: u32) -> i64 {
     let first_dow = weekday_from_days(days_from_civil(year, month, 1));
-    let mut day = 1i64 + (dow as i64 - first_dow as i64).rem_euclid(7) + (week.saturating_sub(1) as i64) * 7;
+    let mut day =
+        1i64 + (dow as i64 - first_dow as i64).rem_euclid(7) + (week.saturating_sub(1) as i64) * 7;
     let last = days_in_month(year, month);
     if day > last {
         day -= 7; // 第 5 周不足时取该月最后一个
@@ -561,17 +581,40 @@ fn weekday_from_days(days: i64) -> u32 {
 /// - 24 小时制：`"HH:MM:SS"`（8 字符）/ `"HH:MM"`（5 字符）
 /// - 12 小时制：`"hh:mm:ss AM"`（11 字符）/ `"hh:mm AM"`（8 字符），仍容纳于 200px 宽的默认窗口
 pub fn format_clock(h: u32, m: u32, s: u32, use_12h: bool, show_seconds: bool) -> String {
-    let sec = if show_seconds { format!(":{s:02}") } else { String::new() };
+    let sec = if show_seconds {
+        format!(":{s:02}")
+    } else {
+        String::new()
+    };
     if !use_12h {
         return format!("{h:02}:{m:02}{sec}");
     }
     let (h12, suffix) = match h {
-        0 => (12, "AM"),  // 午夜
+        0 => (12, "AM"), // 午夜
         1..=11 => (h, "AM"),
         12 => (12, "PM"), // 正午
         _ => (h - 12, "PM"),
     };
     format!("{h12:02}:{m:02}{sec} {suffix}")
+}
+
+/// 挂钟读数带百分之一秒：`HH:MM:SS.cc` / `hh:mm:ss.cc AM`。
+///
+/// 只有显示秒这一档才有百分秒（关秒时连百分秒一起压掉，与 Catime 的
+/// `drawing_time_format.c:255-263` 同规则）。百分位紧跟秒位、AM/PM 留在末尾：
+/// 读数主体始终是时间，后缀只是修饰。12 小时制带百分秒是 14 字符，比默认窗口宽，
+/// 由调用方（`Widget::build_frame`）按实测像素宽裁剪。
+pub fn format_clock_cs(h: u32, m: u32, s: u32, cs: u32, use_12h: bool) -> String {
+    if !use_12h {
+        return format!("{h:02}:{m:02}:{s:02}.{cs:02}");
+    }
+    let (h12, suffix) = match h {
+        0 => (12, "AM"),
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        _ => (h - 12, "PM"),
+    };
+    format!("{h12:02}:{m:02}:{s:02}.{cs:02} {suffix}")
 }
 
 #[cfg(test)]
@@ -791,5 +834,16 @@ mod tests {
     fn now_is_in_range() {
         let (h, m, s) = now_hms();
         assert!(h < 24 && m < 60 && s < 60);
+    }
+
+    /// 百分秒档：紧跟秒位、AM/PM 留在末尾；取时路径的亚秒零头不许越 0-99。
+    #[test]
+    fn clock_centiseconds_format() {
+        assert_eq!(format_clock_cs(9, 5, 3, 7, false), "09:05:03.07");
+        assert_eq!(format_clock_cs(23, 59, 59, 99, false), "23:59:59.99");
+        assert_eq!(format_clock_cs(0, 0, 0, 0, true), "12:00:00.00 AM");
+        assert_eq!(format_clock_cs(13, 5, 3, 42, true), "01:05:03.42 PM");
+        let (_, _, _, cs) = now_hms_cs();
+        assert!(cs < 100, "百分位出界: {cs}");
     }
 }

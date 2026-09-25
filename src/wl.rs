@@ -24,7 +24,7 @@ use crate::render::Canvas;
 use crate::sys::wayland::{Ifaces, Obj, Wl, WlArgument, WlInterface};
 use crate::sys::{Lib, POLL_IN, PollFd, poll};
 use crate::tray::Command;
-use crate::widget::{LOGICAL_SIZE, Frame, Widget};
+use crate::widget::{Frame, LOGICAL_SIZE, Widget};
 
 /// Linux input-event 按键码，`wl_pointer.button` 原样透传。
 const BTN_LEFT: u32 = 0x110;
@@ -59,8 +59,14 @@ const LAYER_ACK_CONFIGURE: u32 = 6;
 // —— 共享库调用：mmap / poll / memfd / close ——
 
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64)
-    -> *mut c_void;
+    fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        off: i64,
+    ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn memfd_create(name: *const c_char, flags: u32) -> c_int;
@@ -177,9 +183,10 @@ pub fn run(
     handle_rx: &Receiver<TrayHandle>,
     config: Config,
     autostart: bool,
+    wake_rx: &crate::wake::WakeReader,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::new(config, autostart)?;
-    client.event_loop(cmd_rx, handle_rx)?;
+    client.event_loop(cmd_rx, handle_rx, wake_rx)?;
     Ok(())
 }
 
@@ -192,7 +199,7 @@ impl Client {
         let events: &'static Events = Box::leak(Box::default());
         let edata = events as *const Events as *mut c_void;
 
-let display = unsafe { (wl.connect)(std::ptr::null()) };
+        let display = unsafe { (wl.connect)(std::ptr::null()) };
         if display.is_null() {
             return Err("无法连接 Wayland 显示".into());
         }
@@ -203,7 +210,10 @@ let display = unsafe { (wl.connect)(std::ptr::null()) };
             cb(on_global as *const c_void),
             cb(on_global_remove as *const c_void),
         ]);
-        check(unsafe { (wl.add_listener)(registry, table, edata) }, "registry 监听")?;
+        check(
+            unsafe { (wl.add_listener)(registry, table, edata) },
+            "registry 监听",
+        )?;
         if unsafe { (wl.roundtrip)(display) } < 0 {
             return Err("registry roundtrip 失败".into());
         }
@@ -228,7 +238,8 @@ let display = unsafe { (wl.connect)(std::ptr::null()) };
         // layer-shell 是这条路径的前提
         let (shell_id, shell_ver) = need("zwlr_layer_shell_v1")?;
         let shell = bind_to(shell_id, shell_ver, ifaces.layer_shell, 4);
-        let compositor = bind_by("wl_compositor", ifaces.compositor, 6).ok_or("没有 wl_compositor")?;
+        let compositor =
+            bind_by("wl_compositor", ifaces.compositor, 6).ok_or("没有 wl_compositor")?;
         let shm = bind_by("wl_shm", ifaces.shm, 1).ok_or("没有 wl_shm")?;
         // 能力位在 roundtrip 期间就会送到，必须先挂监听
         let seat = bind_by("wl_seat", ifaces.seat, 5).inspect(|s| {
@@ -243,8 +254,7 @@ let display = unsafe { (wl.connect)(std::ptr::null()) };
         let margin = widget.config.window_pos.unwrap_or(DEFAULT_POS);
         let logical = zoomed_logical(widget.zoom);
 
-        let surface =
-            request_new(&wl, compositor, 0, ifaces.surface, &mut [WlArgument::NIL]);
+        let surface = request_new(&wl, compositor, 0, ifaces.surface, &mut [WlArgument::NIL]);
         // get_layer_surface 签名 "no?ous"：output 传 NULL 由合成器选屏
         let ns = CString::new("tinyticker").unwrap();
         let layer = request_new(
@@ -261,7 +271,12 @@ let display = unsafe { (wl.connect)(std::ptr::null()) };
             ],
         );
 
-request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
+        request(
+            &wl,
+            layer,
+            LAYER_SET_SIZE,
+            &[uint(logical.0), uint(logical.1)],
+        );
         request(&wl, layer, LAYER_SET_ANCHOR, &[uint(ANCHOR_TOP_LEFT)]);
         request(&wl, layer, LAYER_SET_EXCLUSIVE_ZONE, &[int(0)]); // 不独占空间
         request(&wl, layer, LAYER_SET_KEYBOARD, &[uint(0)]); // 永不抢焦点
@@ -279,22 +294,31 @@ request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
 
         // 分数缩放：缓冲按物理像素画，viewport 把表面缩回逻辑尺寸（buffer_scale 保持 1）
         let viewport = bind_by("wp_viewporter", ifaces.viewporter, 1).map(|vp| {
-            request_new(&wl, vp, 1, ifaces.viewport, &mut [WlArgument::NIL, WlArgument::obj(surface)])
+            request_new(
+                &wl,
+                vp,
+                1,
+                ifaces.viewport,
+                &mut [WlArgument::NIL, WlArgument::obj(surface)],
+            )
         });
-        let fractional = bind_by("wp_fractional_scale_manager_v1", ifaces.fractional_manager, 1).map(
-            |mgr| {
-                let obj = request_new(
-                    &wl,
-                    mgr,
-                    1,
-                    ifaces.fractional_scale,
-                    &mut [WlArgument::NIL, WlArgument::obj(surface)],
-                );
-                let t = leak_listeners(vec![cb(on_preferred_scale as *const c_void)]);
-                unsafe { (wl.add_listener)(obj, t, edata) };
-                obj
-            },
-        );
+        let fractional = bind_by(
+            "wp_fractional_scale_manager_v1",
+            ifaces.fractional_manager,
+            1,
+        )
+        .map(|mgr| {
+            let obj = request_new(
+                &wl,
+                mgr,
+                1,
+                ifaces.fractional_scale,
+                &mut [WlArgument::NIL, WlArgument::obj(surface)],
+            );
+            let t = leak_listeners(vec![cb(on_preferred_scale as *const c_void)]);
+            unsafe { (wl.add_listener)(obj, t, edata) };
+            obj
+        });
 
         let mut client = Self {
             wl,
@@ -315,8 +339,14 @@ request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
             region: None,
             input: Input::Whole,
             buffers: [
-                Buffer { map: std::ptr::null_mut(), buffer: std::ptr::null_mut() },
-                Buffer { map: std::ptr::null_mut(), buffer: std::ptr::null_mut() },
+                Buffer {
+                    map: std::ptr::null_mut(),
+                    buffer: std::ptr::null_mut(),
+                },
+                Buffer {
+                    map: std::ptr::null_mut(),
+                    buffer: std::ptr::null_mut(),
+                },
             ],
             pool: std::ptr::null_mut(),
             pool_bytes: 0,
@@ -340,7 +370,7 @@ request(&wl, layer, LAYER_SET_SIZE, &[uint(logical.0), uint(logical.1)]);
             eprintln!("⚠️ 合成器未提供 wl_seat，挂件无法接收鼠标输入");
         }
         // 只提交状态：configure 要等首次 commit 之后才下发
-client.commit();
+        client.commit();
         Ok(client)
     }
 
@@ -375,7 +405,13 @@ client.commit();
 
         // 拖动位移取自增指针：局部坐标会跟着窗口一起动，算不出位移
         if let Some((id, have)) = self.find_global("zwp_relative_pointer_manager_v1") {
-            let mgr = bind(&self.wl, self.registry, id, self.ifaces.relative_manager, have);
+            let mgr = bind(
+                &self.wl,
+                self.registry,
+                id,
+                self.ifaces.relative_manager,
+                have,
+            );
             let rel = request_new(
                 &self.wl,
                 mgr,
@@ -391,7 +427,13 @@ client.commit();
         }
         // 光标形状：现代协议由合成器画，省掉主题图标加载
         if let Some((id, have)) = self.find_global("wp_cursor_shape_manager_v1") {
-            let mgr = bind(&self.wl, self.registry, id, self.ifaces.cursor_manager, have);
+            let mgr = bind(
+                &self.wl,
+                self.registry,
+                id,
+                self.ifaces.cursor_manager,
+                have,
+            );
             let dev = request_new(
                 &self.wl,
                 mgr,
@@ -434,7 +476,9 @@ client.commit();
             }
             self.pool = std::ptr::null_mut();
         }
-        let fd = unsafe { memfd_create(c"tinyticker-shm".as_ptr(), 2 /* MFD_CLOEXEC */) };
+        let fd = unsafe {
+            memfd_create(c"tinyticker-shm".as_ptr(), 2 /* MFD_CLOEXEC */)
+        };
         if fd < 0 {
             return Err("memfd_create 失败".into());
         }
@@ -462,9 +506,11 @@ client.commit();
                 int((w * 4) as i32),
                 uint(0), // ARGB8888
             ];
-            let sink = Box::leak(Box::new(BufSink { events: self.events, index: i }));
-            let buffer =
-                request_new(&self.wl, self.pool, 0, self.ifaces.buffer, &mut args);
+            let sink = Box::leak(Box::new(BufSink {
+                events: self.events,
+                index: i,
+            }));
+            let buffer = request_new(&self.wl, self.pool, 0, self.ifaces.buffer, &mut args);
             let t = leak_listeners(vec![cb(on_buffer_release as *const c_void)]);
             unsafe { (self.wl.add_listener)(buffer, t, sink as *const BufSink as *mut c_void) };
             slot.buffer = buffer;
@@ -713,7 +759,12 @@ client.commit();
             Input::None => Some(self.new_region()),
             Input::Rect((x, y, w, h)) => {
                 let region = self.new_region();
-                request(&self.wl, region, REGION_ADD, &[int(x), int(y), int(w), int(h)]);
+                request(
+                    &self.wl,
+                    region,
+                    REGION_ADD,
+                    &[int(x), int(y), int(w), int(h)],
+                );
                 Some(region)
             }
         };
@@ -731,17 +782,29 @@ client.commit();
     }
 
     fn new_region(&self) -> Obj {
-        request_new(&self.wl, self.compositor, 1, self.ifaces.region, &mut [WlArgument::NIL])
+        request_new(
+            &self.wl,
+            self.compositor,
+            1,
+            self.ifaces.region,
+            &mut [WlArgument::NIL],
+        )
     }
 
     /// 事件循环：每 `Widget::tick_interval` 至少推进一次，其余时间阻塞在 Wayland socket 上。
-    /// （动画特效开着时这个间隔会缩到 50ms，显示百分秒且在跑动时 20ms，静态时 200ms。）
+    /// （走针时钟 250ms，静态 200ms，动画 50ms，百分秒 20ms，空闲 1s。）
+    /// 空闲档睡得不虚：托盘/套接字发完命令会摸一下唤醒管道，它的读端与 Wayland 的 fd
+    /// 一起 `poll`，命令到了立刻醒（`src/wake.rs`）。
     fn event_loop(
         &mut self,
         cmd_rx: &Receiver<Command>,
         handle_rx: &Receiver<TrayHandle>,
+        wake: &crate::wake::WakeReader,
     ) -> Result<(), Box<dyn std::error::Error>> {
         while !self.quit {
+            // 先排空唤醒字节再收命令：顺序反了也不会丢（字节在管道里留着，下一拍
+            // 的 try_recv 照样收得到），只是白醒一次
+            wake.drain();
             while let Ok(handle) = handle_rx.try_recv() {
                 self.widget.accept_tray_handle(handle);
             }
@@ -771,8 +834,20 @@ client.commit();
                 let fd = unsafe { (self.wl.get_fd)(self.display) };
                 let budget = deadline.saturating_duration_since(Instant::now());
                 let ms = budget.as_millis().min(c_int::MAX as u128) as c_int;
-                let mut pfd = [PollFd { fd, events: POLL_IN, revents: 0 }];
-                let _ = unsafe { poll(pfd.as_mut_ptr(), 1, ms) };
+                // 两个 fd 一起等：Wayland 事件或唤醒字节，谁先到算谁
+                let mut pfd = [
+                    PollFd {
+                        fd,
+                        events: POLL_IN,
+                        revents: 0,
+                    },
+                    PollFd {
+                        fd: wake.fd(),
+                        events: POLL_IN,
+                        revents: 0,
+                    },
+                ];
+                let _ = unsafe { poll(pfd.as_mut_ptr(), pfd.len() as u64, ms) };
                 if unsafe { (self.wl.read_events)(self.display) } < 0 {
                     unsafe { (self.wl.cancel_read)(self.display) };
                     return Err("读取 Wayland 事件失败".into());
@@ -802,7 +877,10 @@ fn zoomed_logical(zoom: f32) -> (u32, u32) {
 /// 参数写成 `*const c_void`：函数名若直接进泛型会推断成零宽的 fn item，
 /// 先转成指针才拿得到真正的函数地址。
 fn cb(f: *const c_void) -> unsafe extern "C" fn() {
-    debug_assert_eq!(size_of::<*const c_void>(), size_of::<unsafe extern "C" fn()>());
+    debug_assert_eq!(
+        size_of::<*const c_void>(),
+        size_of::<unsafe extern "C" fn()>()
+    );
     unsafe { std::mem::transmute(f) }
 }
 
@@ -882,7 +960,9 @@ unsafe extern "C" fn on_global(
     version: u32,
 ) {
     let e = unsafe { &*(data as *const Events) };
-    let iface = unsafe { CStr::from_ptr(interface) }.to_string_lossy().into_owned();
+    let iface = unsafe { CStr::from_ptr(interface) }
+        .to_string_lossy()
+        .into_owned();
     e.globals.borrow_mut().push((name, iface, version));
 }
 
@@ -912,7 +992,14 @@ unsafe extern "C" fn on_buffer_release(data: *mut c_void, _buffer: Obj) {
 }
 
 /// wl_pointer 的十个事件，顺序必须与协议一致（enter…axis_value120）。
-unsafe extern "C" fn on_ptr_enter(data: *mut c_void, _o: Obj, serial: u32, _s: Obj, _x: i32, _y: i32) {
+unsafe extern "C" fn on_ptr_enter(
+    data: *mut c_void,
+    _o: Obj,
+    serial: u32,
+    _s: Obj,
+    _x: i32,
+    _y: i32,
+) {
     let e = unsafe { &*(data as *const Events) };
     e.serial.set(serial);
     e.frame.set(true);
@@ -999,9 +1086,7 @@ unsafe extern "C" fn on_relative_motion(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        REGION_ADD, SURFACE_ATTACH, SURFACE_COMMIT, SURFACE_SET_INPUT_REGION, fixed,
-    };
+    use super::{REGION_ADD, SURFACE_ATTACH, SURFACE_COMMIT, SURFACE_SET_INPUT_REGION, fixed};
 
     /// `wl_fixed_t` 是 24.8，不是 16.16：线上 1 px 的位移就是 256。
     /// 这条钉住换算常数——写成 ÷65536 会让所有位移缩水 256 倍，
@@ -1046,7 +1131,10 @@ mod tests {
         // wl_surface: destroy=0, attach=1, damage=2, frame=3, opaque=4, input=5, commit=6
         assert_eq!(SURFACE_ATTACH, 1);
         assert_eq!(SURFACE_SET_INPUT_REGION, 5);
-        assert_eq!(SURFACE_COMMIT, 6, "commit 与 set_input_region 只差一位，别写串");
+        assert_eq!(
+            SURFACE_COMMIT, 6,
+            "commit 与 set_input_region 只差一位，别写串"
+        );
         // wl_compositor: create_surface=0, create_region=1（`new_region` 用的就是 1）
     }
 }

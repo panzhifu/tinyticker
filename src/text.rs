@@ -17,15 +17,30 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::config::{TextFont, expand_tilde};
+use crate::config::{DEFAULT_STATUS_FONT_PX, TextFont, expand_tilde};
 use crate::font8x8::FONT8X8_BASIC;
 use crate::sys::freetype::{FreeType, Ink};
 
-/// TTF 字形的像素高 = `12 × cell`。比 `8 × cell` 的点阵盒高出一截，多出的部分向上长进
-/// 两行之间那条 `4 × cell` 的缝隙，所以布局不必为它改算法。
-const TTF_PX_PER_CELL: u32 = 12;
+/// TTF 字形的像素高 = `px_per_cell() × cell`。比 `8 × cell` 的点阵盒高出一截，
+/// 多出的部分向上长进两行之间那条 `4 × cell` 的缝隙，所以布局不必为它改算法。
+///
+/// 提成运行时可调（配置项 `status_font_px`，GAP §六「字体大小」的我们的版本）：
+/// 数字行恒为 8×8 点阵，调它只动状态行里那些点阵补不到的码位。
+/// 热加载直接改这个原子量——字形缓存的键本来就带像素高，换档不会读到旧尺寸的缓存。
+static PX_PER_CELL: AtomicU32 = AtomicU32::new(DEFAULT_STATUS_FONT_PX);
+
+/// 落定状态行 TTF 字号（启动与热加载/菜单各调一次）。越界值钳回可用区间。
+pub fn set_px_per_cell(px: u32) {
+    PX_PER_CELL.store(px.clamp(8, 24), Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn px_per_cell() -> u32 {
+    PX_PER_CELL.load(Ordering::Relaxed)
+}
 
 /// 缓存里最多留多少个 (码位, 像素高) 组合。状态行实际用到的量级是几十个，
 /// 这个上限只是防一手 pathological 的长外部文本。
@@ -329,7 +344,7 @@ fn glyph(ch: char, cell: u32) -> Option<(u32, GlyphBody)> {
         ));
     }
     // ② freetype。没有后端就到此为止，非 ASCII 照旧留空位。
-    let ink = rasterize(ch, TTF_PX_PER_CELL * cell)?;
+    let ink = rasterize(ch, px_per_cell() * cell)?;
     Some((
         ink.advance.max(1),
         GlyphBody::Gray {
@@ -473,5 +488,24 @@ mod tests {
             roots.iter().all(|p| seen.insert(p.clone())),
             "不该有重复的根"
         );
+    }
+
+    /// 状态行字号可调，但越界值会被钳回可用区间；点阵那半边不受它管——
+    /// ASCII 行的度量在调档前后逐像素相同。
+    #[test]
+    fn px_per_cell_is_adjustable_bitmap_unaffected() {
+        let before = px_per_cell();
+        assert_eq!(
+            before, DEFAULT_STATUS_FONT_PX,
+            "默认值就是字形层一直在用的 12"
+        );
+        set_px_per_cell(20);
+        assert_eq!(px_per_cell(), 20);
+        set_px_per_cell(999);
+        assert_eq!(px_per_cell(), 24, "越上界该钳回来而不是直接收下");
+        set_px_per_cell(3);
+        assert_eq!(px_per_cell(), 8, "越下界同理");
+        assert_eq!(shape("1:00", 2, 0).width, 4 * 8 * 2, "调档不该动点阵度量");
+        set_px_per_cell(before);
     }
 }

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::effect::{Effect, Gradient};
+use crate::lang::Language;
 use crate::parse::parse_duration;
 use crate::render::{Pad, parse_color, rgb};
 use crate::timer::{MAX_POMO_STEPS, Mode, Pomo};
@@ -30,8 +31,14 @@ pub const ZOOM_MAX: f32 = 6.0;
 /// 出厂时长预设（秒）。菜单标签由 [`preset_label`] 现算，不再手写。
 pub const DEFAULT_PRESETS: [u32; 6] = [60, 300, 900, 1500, 2700, 3600];
 
-/// 预设条数上限：菜单再长就该分页了，而我们不分页。
-const MAX_PRESETS: usize = 24;
+/// 预设条数上限，对齐 Catime 的 `MAX_TIME_OPTIONS`（`include/timer/timer.h:22-24`）。
+/// 超过 20 条时托盘菜单会把余下的折进「更多 ▸」子菜单（`tray/menu.rs` 的分页），
+/// 不再是"菜单再长就该分页了而我们不分页"的那个理由。
+const MAX_PRESETS: usize = 50;
+
+/// 预设子菜单里平铺多少项，剩下的进「更多 ▸」。20 是拍的：一屏菜单里
+/// 常用档位要直接看得见，不必多点一层。
+pub const PRESET_PAGE: usize = 20;
 
 /// 番茄钟轮数与组数的上限，免得一个手滑配出几千轮。
 const MAX_ROUNDS: u32 = 100;
@@ -59,9 +66,9 @@ fn parse_span_list(value: &str, max: usize) -> Option<Vec<u32>> {
 /// 取能整除的最大单位，所以写出去再读回来一定是同一个数——`pomo_seq` 要靠这一点
 /// 保证往返不漂移。
 fn span_token(secs: u32) -> String {
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -73,9 +80,29 @@ fn parse_span(value: &str, min: u32) -> Option<u32> {
     parse_duration(value).filter(|s| (min..=MAX_SPAN).contains(s))
 }
 
-/// 把秒数写成菜单上的中文时长。
-///
-/// 只念非零的位：`3600 → "1 小时"`、`5400 → "1 小时 30 分"`、`90 → "1 分 30 秒"`。
+/// 把秒数写成菜单上的时长标签。中文版 `90 → "1 分 30 秒"`、`5400 → "1 小时 30 分"`；
+/// 英文版走紧凑单位 `90 → "1m 30s"`、`5400 → "1h 30m"`——菜单列宽有限，
+/// "hours" 全称会把标签挤成两行。
+#[must_use]
+pub fn preset_label_in(secs: u32, lang: Language) -> String {
+    if lang.resolve() == Language::En {
+        let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+        let mut parts = Vec::new();
+        if h > 0 {
+            parts.push(format!("{h}h"));
+        }
+        if m > 0 {
+            parts.push(format!("{m}m"));
+        }
+        if s > 0 || parts.is_empty() {
+            parts.push(format!("{s}s"));
+        }
+        return parts.join(" ");
+    }
+    preset_label(secs)
+}
+
+/// 秒数 → 中文菜单标签（英文版见 [`preset_label_in`]）。
 pub fn preset_label(secs: u32) -> String {
     let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
     let mut parts = Vec::new();
@@ -144,6 +171,8 @@ pub fn color_label(value: &str) -> String {
 /// 要么编辑配置文件（工作区版本起改了即时生效）。
 pub struct Palette {
     pub name: &'static str,
+    /// 英文名：菜单按当前语言取一。
+    pub name_en: &'static str,
     pub bg: u32,
     pub running: u32,
     pub paused: u32,
@@ -152,23 +181,65 @@ pub struct Palette {
 
 /// 覆盖暗色 / 亮色 / 高对比三类场景；第一项就是出厂默认。
 pub const PALETTES: [Palette; 6] = [
-    Palette { name: "默认", bg: 0x0F0F14, running: 0xFFFFFF, paused: 0xFFC850, done: 0x50DC78 },
-    Palette { name: "海洋", bg: 0x0A1420, running: 0x9AD4FF, paused: 0x5AA9FF, done: 0x7CF0C4 },
-    Palette { name: "落日", bg: 0x1A0F0A, running: 0xFFD28A, paused: 0xFF9E3D, done: 0xFF5C7A },
-    Palette { name: "紫罗兰", bg: 0x140A18, running: 0xE0B3FF, paused: 0xB366FF, done: 0x66FFB3 },
-    Palette { name: "高对比", bg: 0x000000, running: 0xFFFFFF, paused: 0xFFFF00, done: 0x00FF00 },
-    Palette { name: "纸白", bg: 0xF2F0EB, running: 0x1A1A1A, paused: 0x8A6D1A, done: 0x1F6F32 },
+    Palette {
+        name: "默认",
+        name_en: "Default",
+        bg: 0x0F0F14,
+        running: 0xFFFFFF,
+        paused: 0xFFC850,
+        done: 0x50DC78,
+    },
+    Palette {
+        name: "海洋",
+        name_en: "Ocean",
+        bg: 0x0A1420,
+        running: 0x9AD4FF,
+        paused: 0x5AA9FF,
+        done: 0x7CF0C4,
+    },
+    Palette {
+        name: "落日",
+        name_en: "Sunset",
+        bg: 0x1A0F0A,
+        running: 0xFFD28A,
+        paused: 0xFF9E3D,
+        done: 0xFF5C7A,
+    },
+    Palette {
+        name: "紫罗兰",
+        name_en: "Violet",
+        bg: 0x140A18,
+        running: 0xE0B3FF,
+        paused: 0xB366FF,
+        done: 0x66FFB3,
+    },
+    Palette {
+        name: "高对比",
+        name_en: "High contrast",
+        bg: 0x000000,
+        running: 0xFFFFFF,
+        paused: 0xFFFF00,
+        done: 0x00FF00,
+    },
+    Palette {
+        name: "纸白",
+        name_en: "Paper",
+        bg: 0xF2F0EB,
+        running: 0x1A1A1A,
+        paused: 0x8A6D1A,
+        done: 0x1F6F32,
+    },
 ];
 
-/// 托盘「外观 → 透明度」子菜单的档位（`bg_alpha`，0-255）。
+/// 托盘「外观 → 透明度」子菜单的档位（`bg_alpha`，0-255）。标签是 `(中文, 英文)`。
 ///
 /// 文字始终不透明，所以 0 档不是「看不见」而是「只剩文字」。
-pub const ALPHA_STEPS: [(&str, u8); 5] = [
-    ("全透明（只剩文字）", 0),
-    ("淡", 48),
-    ("中", 96),
-    ("浓", 160),
-    ("不透明", 255),
+pub const ALPHA_STEPS: [(&str, &str, u8); 5] = [
+    ("全透明（只剩文字）", "Transparent (text only)", 0),
+    ("淡", "Faint", 48),
+    ("中", "Medium", 96),
+    ("浓", "Opaque-ish", 160),
+    ("不透明", "Opaque", 255),
 ];
 
 /// 状态行里点阵覆盖不到的码位（中文、Latin-1、符号）用什么字形补。
@@ -204,6 +275,11 @@ impl TextFont {
         }
     }
 }
+
+/// 状态行字号的默认与边界：12px/cell 是字形层一直在用的值；下限不低于 8 才与
+/// 点阵同量级，上限 24 再大两行就挤不进气隙里了。
+pub const DEFAULT_STATUS_FONT_PX: u32 = 12;
+const STATUS_FONT_PX_RANGE: (u32, u32) = (8, 24);
 
 // zoom 为 f32（非 Eq），整体只做 PartialEq 比较
 #[derive(Clone, Debug, PartialEq)]
@@ -269,6 +345,11 @@ pub struct Config {
     pub text_source: Option<String>,
     /// 点阵补不出的码位（中文等）用什么字形。
     pub text_font: TextFont,
+    /// 状态行里 TTF 字形的像素高 = `status_font_px × cell`。点阵补不到的码位才用它；
+    /// 数字行恒为 8×8 点阵，不受这一项影响（GAP §六「字体大小」那行的我们的版本）。
+    pub status_font_px: u32,
+    /// 托盘文案语言。`Auto` 按环境变量落定；挂件上那两行字不受它管（R2）。
+    pub language: Language,
     /// 上次退出时的窗口位置（逻辑像素）：layer-shell 的 margin 与 X11 的窗口坐标。
     pub window_pos: Option<(i32, i32)>,
 }
@@ -302,6 +383,8 @@ impl Default for Config {
             notify_text: None,
             text_source: None,
             text_font: TextFont::default(),
+            status_font_px: DEFAULT_STATUS_FONT_PX,
+            language: Language::default(),
             window_pos: None,
         }
     }
@@ -311,13 +394,20 @@ impl Default for Config {
 /// 中间出现的 `~` 不展开；`HOME` 不在时原样返回。
 pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
     let raw = raw.trim();
-    let Some(rest) = raw.strip_prefix("~/").or(if raw == "~" { Some("") } else { None }) else {
+    let Some(rest) = raw
+        .strip_prefix("~/")
+        .or(if raw == "~" { Some("") } else { None })
+    else {
         return PathBuf::from(raw);
     };
     let Some(home) = std::env::var_os("HOME") else {
         return PathBuf::from(raw);
     };
-    if rest.is_empty() { PathBuf::from(home) } else { PathBuf::from(home).join(rest) }
+    if rest.is_empty() {
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(home).join(rest)
+    }
 }
 
 /// 环境变量值只有是非空绝对路径时才算数：相对路径会让配置跟着当前工作目录漂移。
@@ -359,7 +449,11 @@ fn base_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
 ///
 /// `explicit` = `--config-dir` / `$TINYTICKER_CONFIG_DIR`；它给的是**相对路径**时按
 /// 当前工作目录解释——本进程不会 chdir，所以这是稳定的。
-fn resolve_config_dir(explicit: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+fn resolve_config_dir(
+    explicit: Option<&str>,
+    xdg: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
     if let Some(p) = explicit.filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(p));
     }
@@ -447,7 +541,10 @@ fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
     }
     // 临时名带上 pid：同时有两个进程在写（例如另一份 HOME 起了第二个实例）也不互相踩
-    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
     let out = (|| -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
@@ -566,9 +663,7 @@ impl Config {
                     // 空值 = 关掉序列回到经典配方；非法则整条不采信（同 `presets` 的规矩）
                     if value.trim().is_empty() {
                         cfg.pomo.seq = Vec::new();
-                    } else if let Some(list) =
-                        parse_span_list(value, crate::timer::MAX_POMO_STEPS)
-                    {
+                    } else if let Some(list) = parse_span_list(value, MAX_POMO_STEPS) {
                         cfg.pomo.seq = list;
                     }
                 }
@@ -598,7 +693,9 @@ impl Config {
                 }
                 "pomo_cycles" => {
                     // 0 是合法值：不限组数，一直轮转
-                    if let Ok(n) = value.parse::<u32>() && n <= MAX_ROUNDS {
+                    if let Ok(n) = value.parse::<u32>()
+                        && n <= MAX_ROUNDS
+                    {
                         cfg.pomo.cycles = n;
                     }
                 }
@@ -626,6 +723,18 @@ impl Config {
                 // 不在解析阶段悄悄丢掉——那样用户无从知道自己拼错了。
                 "text_font" => {
                     cfg.text_font = TextFont::from_value(value);
+                }
+                "status_font_px" => {
+                    if let Ok(px) = value.parse::<u32>()
+                        && (STATUS_FONT_PX_RANGE.0..=STATUS_FONT_PX_RANGE.1).contains(&px)
+                    {
+                        cfg.status_font_px = px;
+                    }
+                }
+                "language" => {
+                    if let Some(l) = Language::from_name(value) {
+                        cfg.language = l;
+                    }
                 }
                 "color_bg" => {
                     if let Some(c) = parse_color(value) {
@@ -660,7 +769,8 @@ impl Config {
     }
 
     fn serialize(&self) -> String {
-        let mut out = String::from("# tinyticker 配置（手动编辑后即时生效，见 README「配置」一节）\n");
+        let mut out =
+            String::from("# tinyticker 配置（手动编辑后即时生效，见 README「配置」一节）\n");
         out.push_str(&format!("duration = {}\n", self.duration_secs));
         let presets: Vec<String> = self.presets.iter().map(u32::to_string).collect();
         out.push_str(&format!("presets = {}\n", presets.join(", ")));
@@ -679,7 +789,13 @@ impl Config {
             out.push_str(&format!("tray_gif = {path}\n"));
         }
         if !self.pomo.seq.is_empty() {
-            let text = self.pomo.seq.iter().map(|s| span_token(*s)).collect::<Vec<_>>().join(",");
+            let text = self
+                .pomo
+                .seq
+                .iter()
+                .map(|s| span_token(*s))
+                .collect::<Vec<_>>()
+                .join(",");
             out.push_str(&format!("pomo_seq = {text}\n"));
         }
         out.push_str(&format!("pomo_work = {}\n", self.pomo.work));
@@ -701,6 +817,8 @@ impl Config {
             out.push_str(&format!("text_source = {path}\n"));
         }
         out.push_str(&format!("text_font = {}\n", self.text_font.to_value()));
+        out.push_str(&format!("status_font_px = {}\n", self.status_font_px));
+        out.push_str(&format!("language = {}\n", self.language.name()));
         out.push_str(&format!("color_bg = {:06x}\n", self.color_bg & 0xFFFFFF));
         for (key, grad) in [
             ("color_running", &self.color_running),
@@ -735,7 +853,12 @@ pub struct Watch {
 impl Watch {
     /// 以当前磁盘状态为基准：启动时刚读过，不该立刻又算一次"变了"。
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut w = Self { path, stamp: None, at: Instant::now(), every: Duration::from_millis(250) };
+        let mut w = Self {
+            path,
+            stamp: None,
+            at: Instant::now(),
+            every: Duration::from_millis(250),
+        };
         w.sync();
         w
     }
@@ -788,7 +911,14 @@ mod tests {
             time_pad: Pad::Full,
             tray_icon: IconMode::Gif,
             tray_gif: Some("~/pics/spin.gif".into()),
-            pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 , seq: Vec::new() },
+            pomo: Pomo {
+                work: 1800,
+                short_break: 600,
+                long_break: 1200,
+                rounds: 3,
+                cycles: 2,
+                seq: Vec::new(),
+            },
             presets: vec![90, 600, 5400],
             on_finish: Some("loginctl lock-session".into()),
             timeout_text: Some("时间到".into()),
@@ -810,7 +940,9 @@ mod tests {
 
     #[test]
     fn tilde_expansion_only_applies_at_the_front() {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
         assert_eq!(expand_tilde("~/x/y"), home.join("x/y"));
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("  ~/a  "), home.join("a"));
@@ -842,13 +974,14 @@ mod tests {
 
     #[test]
     fn alpha_steps_ascend_and_roundtrip() {
-        assert_eq!(ALPHA_STEPS[0].1, 0);
-        assert_eq!(ALPHA_STEPS[ALPHA_STEPS.len() - 1].1, 255);
-        assert!(ALPHA_STEPS.windows(2).all(|w| w[0].1 < w[1].1));
-        // 每一档都得能被序列化-解析原样取回
-        for &(label, value) in &ALPHA_STEPS {
+        assert_eq!(ALPHA_STEPS[0].2, 0);
+        assert_eq!(ALPHA_STEPS[ALPHA_STEPS.len() - 1].2, 255);
+        assert!(ALPHA_STEPS.windows(2).all(|w| w[0].2 < w[1].2));
+        // 每一档都得能被序列化-解析原样取回；两种语言的标签都不许空
+        for (zh, en, value) in &ALPHA_STEPS {
             let cfg = Config::from_str(&format!("bg_alpha = {value}\n"));
-            assert_eq!(cfg.bg_alpha, value, "{label} 档没走通");
+            assert_eq!(cfg.bg_alpha, *value, "{zh} 档没走通");
+            assert!(!zh.is_empty() && !en.is_empty());
         }
     }
 
@@ -864,13 +997,25 @@ mod tests {
     /// 预设既认逗号也认空格；序列化后要能原样读回。
     #[test]
     fn presets_parse_both_separators_and_roundtrip() {
-        assert_eq!(Config::from_str("presets = 1m,5m,1h\n").presets, vec![60, 300, 3600]);
-        assert_eq!(Config::from_str("presets = 90 300\n").presets, vec![90, 300]);
-        let cfg = Config { presets: vec![90, 5400], ..Config::default() };
+        assert_eq!(
+            Config::from_str("presets = 1m,5m,1h\n").presets,
+            vec![60, 300, 3600]
+        );
+        assert_eq!(
+            Config::from_str("presets = 90 300\n").presets,
+            vec![90, 300]
+        );
+        let cfg = Config {
+            presets: vec![90, 5400],
+            ..Config::default()
+        };
         assert_eq!(Config::from_str(&cfg.serialize()).presets, cfg.presets);
         // 出厂那几档必须原样写回，否则升级一次配置就把用户菜单换了
         let d = Config::default();
-        assert_eq!(Config::from_str(&d.serialize()).presets, DEFAULT_PRESETS.to_vec());
+        assert_eq!(
+            Config::from_str(&d.serialize()).presets,
+            DEFAULT_PRESETS.to_vec()
+        );
     }
 
     /// 一段非法就整条作废：宁可回到默认 6 档，也不要一个悄悄少了一格的菜单。
@@ -891,20 +1036,59 @@ mod tests {
         }
         // 条数超限同样整条作废
         let too_many = format!("presets = {}\n", vec!["1m"; MAX_PRESETS + 1].join(","));
-        assert_eq!(Config::from_str(&too_many).presets, DEFAULT_PRESETS.to_vec());
         assert_eq!(
-            Config::from_str(&format!("presets = {}\n", vec!["1m"; MAX_PRESETS].join(",")))
-                .presets
-                .len(),
-            MAX_PRESETS,
-            "刚好 24 段该收"
+            Config::from_str(&too_many).presets,
+            DEFAULT_PRESETS.to_vec()
         );
+        assert_eq!(
+            Config::from_str(&format!(
+                "presets = {}\n",
+                vec!["1m"; MAX_PRESETS].join(",")
+            ))
+            .presets
+            .len(),
+            MAX_PRESETS,
+            "刚好 {MAX_PRESETS} 段该收"
+        );
+    }
+
+    /// 状态行字号与语言两个新键：越界/认不出回落默认，写出去要读得回来。
+    #[test]
+    fn status_font_px_and_language_round_trip() {
+        assert_eq!(Config::default().status_font_px, DEFAULT_STATUS_FONT_PX);
+        let cfg = Config::from_str("status_font_px = 16\nlanguage = en\n");
+        assert_eq!(cfg.status_font_px, 16);
+        assert_eq!(cfg.language, Language::En);
+        let again = Config::from_str(&cfg.serialize());
+        assert_eq!((again.status_font_px, again.language), (16, Language::En));
+        // 越界与乱写都回落，不能静默挪到另一档
+        let bad = Config::from_str("status_font_px = 999\nlanguage = de\n");
+        assert_eq!(bad.status_font_px, DEFAULT_STATUS_FONT_PX);
+        assert_eq!(bad.language, Language::Auto);
+        let small = Config::from_str("status_font_px = 3\n");
+        assert_eq!(small.status_font_px, DEFAULT_STATUS_FONT_PX, "低于下限不收");
+    }
+
+    /// 英文预设标签走紧凑单位；中文那半由 `preset_label_reads_like_chinese` 钉着。
+    #[test]
+    fn preset_labels_are_compact_in_english() {
+        let en = |s: u32| preset_label_in(s, Language::En);
+        assert_eq!(en(45), "45s");
+        assert_eq!(en(90), "1m 30s");
+        assert_eq!(en(1500), "25m");
+        assert_eq!(en(5400), "1h 30m");
+        assert_eq!(en(0), "0s");
+        // 中文版不经 `resolve` 的环境变量路径：显式 Zh 与旧函数同值
+        assert_eq!(preset_label_in(90, Language::Zh), preset_label(90));
     }
 
     /// 空格是分隔符，所以 "1h 30m" 是两段而不是一小时半——连写请用 "1h30m"。
     #[test]
     fn spaces_split_presets_rather_than_compose() {
-        assert_eq!(Config::from_str("presets = 1h 30m\n").presets, vec![3600, 1800]);
+        assert_eq!(
+            Config::from_str("presets = 1h 30m\n").presets,
+            vec![3600, 1800]
+        );
         assert_eq!(Config::from_str("presets = 1h30m\n").presets, vec![5400]);
     }
 
@@ -940,12 +1124,18 @@ mod tests {
         let cfg = Config::from_str(
             "color_running = #FF5E96_#56C6FF\ncolor_done = 50dc78\ntext_effect = neon\n",
         );
-        assert_eq!(cfg.color_running, Gradient::parse("#FF5E96_#56C6FF").unwrap());
+        assert_eq!(
+            cfg.color_running,
+            Gradient::parse("#FF5E96_#56C6FF").unwrap()
+        );
         assert_eq!(cfg.color_done, Gradient::solid(0x50DC78));
         assert_eq!(cfg.text_effect, Effect::Neon);
         let text = cfg.serialize();
         // 单色仍写成裸 16 进制，别把老配置重写出一堆噪声
-        assert!(text.contains("color_done = 50dc78\n"), "单色写法变了: {text}");
+        assert!(
+            text.contains("color_done = 50dc78\n"),
+            "单色写法变了: {text}"
+        );
         assert_eq!(Config::from_str(&text), cfg);
         // 背景不接受渐变；非法特效名回落 none
         let bad = Config::from_str("color_bg = #111111_#222222\ntext_effect = bloom\n");
@@ -960,8 +1150,14 @@ mod tests {
         let on = Config::from_str("tray_numbers = true\n");
         assert!(on.tray_numbers);
         assert!(on.serialize().contains("tray_numbers = true\n"));
-        assert!(Config::from_str(&on.serialize()).tray_numbers, "写出去要读得回来");
-        assert!(!Config::from_str("tray_numbers = maybe\n").tray_numbers, "认不出当关");
+        assert!(
+            Config::from_str(&on.serialize()).tray_numbers,
+            "写出去要读得回来"
+        );
+        assert!(
+            !Config::from_str("tray_numbers = maybe\n").tray_numbers,
+            "认不出当关"
+        );
     }
 
     /// `pomo_seq`：逗号或空格都行，写出去要能读回同一串；空值回到经典配方；
@@ -971,7 +1167,10 @@ mod tests {
         let cfg = Config::from_str("pomo_seq = 25m,5m,15m\n");
         assert_eq!(cfg.pomo.seq, vec![1500, 300, 900]);
         let text = cfg.serialize();
-        assert!(text.contains("pomo_seq = 25m,5m,15m\n"), "往返写法变了: {text}");
+        assert!(
+            text.contains("pomo_seq = 25m,5m,15m\n"),
+            "往返写法变了: {text}"
+        );
         assert_eq!(Config::from_str(&text).pomo.seq, cfg.pomo.seq);
         // 空格分隔 + 不整除的秒数也要能原样回来
         let odd = Config::from_str("pomo_seq = 90s 1h30m 7s\n");
@@ -992,15 +1191,24 @@ mod tests {
     #[test]
     fn tray_throttle_parses_and_round_trips() {
         assert_eq!(Config::default().tray_throttle, Throttle::Off, "默认不限速");
-        for (text, want) in
-            [("off", Throttle::Off), ("cpu", Throttle::Cpu), ("memory", Throttle::Memory)]
-        {
+        for (text, want) in [
+            ("off", Throttle::Off),
+            ("cpu", Throttle::Cpu),
+            ("memory", Throttle::Memory),
+        ] {
             let cfg = Config::from_str(&format!("tray_throttle = {text}\n"));
             assert_eq!(cfg.tray_throttle, want);
-            assert!(cfg.serialize().contains(&format!("tray_throttle = {text}\n")));
+            assert!(
+                cfg.serialize()
+                    .contains(&format!("tray_throttle = {text}\n"))
+            );
         }
         let junk = Config::from_str("tray_throttle = gpu\n");
-        assert_eq!(junk.tray_throttle, Throttle::Off, "认不出就保持默认，别静默改成别的档");
+        assert_eq!(
+            junk.tray_throttle,
+            Throttle::Off,
+            "认不出就保持默认，别静默改成别的档"
+        );
     }
 
     /// 颜色的四种写法要能穿过**配置文件**这条路（不只是 `parse_color` 单测）：
@@ -1015,7 +1223,10 @@ mod tests {
         assert_eq!(cfg.color_running, Gradient::solid(0x008080), "CSS 名");
         // 名与三元组可以混在一条渐变里
         let mixed = Config::from_str("color_running = gold_rgb(0, 128, 128)\n");
-        assert_eq!(mixed.color_running, Gradient::parse("#FFD700_#008080").unwrap());
+        assert_eq!(
+            mixed.color_running,
+            Gradient::parse("#FFD700_#008080").unwrap()
+        );
         // 认不出的写法整条作废，回落默认值而不是画半截颜色
         let bad = Config::from_str("color_running = notacolor\n");
         assert_eq!(bad.color_running, Config::default().color_running);
@@ -1035,7 +1246,10 @@ mod tests {
     #[test]
     fn pomo_new_keys_parse_and_reject_out_of_range() {
         let cfg = Config::from_str("pomo_long_break = 20m\npomo_rounds = 6\npomo_cycles = 2\n");
-        assert_eq!((cfg.pomo.long_break, cfg.pomo.rounds, cfg.pomo.cycles), (1200, 6, 2));
+        assert_eq!(
+            (cfg.pomo.long_break, cfg.pomo.rounds, cfg.pomo.cycles),
+            (1200, 6, 2)
+        );
         // long_break = 0 是"关闭"、cycles = 0 是"不限"，都得收
         let off = Config::from_str("pomo_long_break = 0\npomo_cycles = 0\n");
         assert_eq!((off.pomo.long_break, off.pomo.cycles), (0, 0));
@@ -1055,7 +1269,13 @@ mod tests {
             "notify" => cfg.notify,
             _ => cfg.centiseconds,
         };
-        for key in ["click_through", "clock_12h", "clock_seconds", "notify", "centiseconds"] {
+        for key in [
+            "click_through",
+            "clock_12h",
+            "clock_seconds",
+            "notify",
+            "centiseconds",
+        ] {
             for on in ["true", "1", "yes", "on", "TRUE", "Yes"] {
                 let cfg = Config::from_str(&format!("{key} = {on}\n"));
                 assert!(get(&cfg, key), "{key} = {on} 应解析为 true");
@@ -1078,7 +1298,10 @@ mod tests {
         assert_eq!(Config::from_str("time_pad = full\n").time_pad, Pad::Full);
         assert_eq!(Config::from_str("time_pad = half\n").time_pad, Pad::None);
         for p in [Pad::None, Pad::Zero, Pad::Full] {
-            let cfg = Config { time_pad: p, ..Config::default() };
+            let cfg = Config {
+                time_pad: p,
+                ..Config::default()
+            };
             assert_eq!(Config::from_str(&cfg.serialize()).time_pad, p);
         }
     }
@@ -1087,9 +1310,18 @@ mod tests {
     /// 用户指定的字体就再也找不回来了。
     #[test]
     fn text_font_round_trips_all_three_states() {
-        assert_eq!(Config::from_str("text_font = off\n").text_font, TextFont::Off);
-        assert_eq!(Config::from_str("text_font = none\n").text_font, TextFont::Off);
-        assert_eq!(Config::from_str("text_font = auto\n").text_font, TextFont::Auto);
+        assert_eq!(
+            Config::from_str("text_font = off\n").text_font,
+            TextFont::Off
+        );
+        assert_eq!(
+            Config::from_str("text_font = none\n").text_font,
+            TextFont::Off
+        );
+        assert_eq!(
+            Config::from_str("text_font = auto\n").text_font,
+            TextFont::Auto
+        );
         // 缺键与空值都回到 auto，而不是把上一次的显式设置吃掉
         assert_eq!(Config::from_str("").text_font, TextFont::Auto);
         assert_eq!(Config::from_str("text_font =\n").text_font, TextFont::Auto);
@@ -1151,11 +1383,20 @@ mod tests {
         assert!(!w.changed(t0), "刚建立基准不该立刻算变了");
         fs::write(&path, "duration = 1500\n").unwrap();
         assert!(!w.changed(t0), "节流窗口内不该去 stat");
-        assert!(w.changed(t0 + Duration::from_millis(300)), "文件变了要认出来");
-        assert!(!w.changed(t0 + Duration::from_millis(600)), "同一份内容不该报第二次");
+        assert!(
+            w.changed(t0 + Duration::from_millis(300)),
+            "文件变了要认出来"
+        );
+        assert!(
+            !w.changed(t0 + Duration::from_millis(600)),
+            "同一份内容不该报第二次"
+        );
         fs::write(&path, "duration = 900\n").unwrap();
         w.sync();
-        assert!(!w.changed(t0 + Duration::from_millis(1000)), "自己的写入该被抹掉");
+        assert!(
+            !w.changed(t0 + Duration::from_millis(1000)),
+            "自己的写入该被抹掉"
+        );
         // 文件正被编辑器 rename 走：不认、不 panic，基准留着等下一拍
         fs::remove_file(&path).unwrap();
         assert!(!w.changed(t0 + Duration::from_millis(1300)));

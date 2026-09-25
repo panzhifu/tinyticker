@@ -34,6 +34,7 @@ use crate::parse;
 use crate::sys;
 use crate::timer::Mode;
 use crate::tray::Command;
+use crate::wake::WakeSender;
 
 /// 参数之间的分隔符。不能用空格：`"1h 30m 10s"` 本身就是一个参数。
 const SEP: char = '\u{1f}';
@@ -64,6 +65,13 @@ pub struct Intent {
     /// `--edit` / `--no-edit`：把编辑态设成给定值。同样**只在内存里**，冷启动不生效
     /// （见 `main.rs` 的提示）——留下一个"右键关不掉"的挂件是灾难。
     pub edit: Option<bool>,
+    /// `--centis` / `--no-centis`：把百分秒设成给定值。它**进配置**（与模式同族），
+    /// 所以下一次冷启动也该记得——设定值而非翻面，快捷键重复绑同一条命令结果不变。
+    pub centiseconds: Option<bool>,
+    /// `--pause` / `--toggle` / `--reset`：无时长语义的动作，排在时长之后执行。
+    pub pause: bool,
+    pub toggle: bool,
+    pub reset: bool,
 }
 
 impl Intent {
@@ -83,6 +91,11 @@ impl Intent {
                 "--show" => intent.hidden = Some(false),
                 "--edit" => intent.edit = Some(true),
                 "--no-edit" => intent.edit = Some(false),
+                "--centis" => intent.centiseconds = Some(true),
+                "--no-centis" => intent.centiseconds = Some(false),
+                "--pause" => intent.pause = true,
+                "--toggle" => intent.toggle = true,
+                "--reset" => intent.reset = true,
                 // 带值参数：`--and 锁屏.cmd` / `--and=...` 两种写法
                 "--and" | "--then" => {
                     intent.and_then = Some(it.next().cloned().ok_or("--and 后面要跟一条命令")?);
@@ -115,6 +128,9 @@ impl Intent {
         if let Some(secs) = self.duration {
             config.duration_secs = secs;
         }
+        if let Some(on) = self.centiseconds {
+            config.centiseconds = on;
+        }
         self.autostart
     }
 
@@ -138,6 +154,21 @@ impl Intent {
         } else if self.autostart {
             // 只给 `-r` 时是"把当前这个跑起来"，而不是重新按一个预设
             out.push(Command::Start);
+        }
+        // 百分秒是设定值：排在时长之后，这样 `-p 25m --centis` 两条都落得住
+        if let Some(on) = self.centiseconds {
+            out.push(Command::SetCentiseconds(on));
+        }
+        // 无时长语义的动作排在最后：它们作于"刚定下来的那个计时器"上。
+        // 同时给好几个时取最后一个——参数写重了是用户的笔误，不是我们的歧义。
+        if self.pause {
+            out.push(Command::Pause);
+        }
+        if self.toggle {
+            out.push(Command::Toggle);
+        }
+        if self.reset {
+            out.push(Command::Reset);
         }
         // 一次性结束命令放最后：它武装的是"这一次跑完干什么"，得等计时器先定下来
         if let Some(cmd) = &self.and_then {
@@ -190,7 +221,10 @@ pub fn forward(args: &[String]) -> bool {
     if !forward_to(&path, args) {
         return false;
     }
-    eprintln!("已把这条命令交给正在运行的实例 {}（本进程不另开窗口）", path.display());
+    eprintln!(
+        "已把这条命令交给正在运行的实例 {}（本进程不另开窗口）",
+        path.display()
+    );
     true
 }
 
@@ -216,15 +250,16 @@ fn forward_to(path: &Path, args: &[String]) -> bool {
 }
 
 /// 起一个线程接后续实例的电话。命令经既有的 `cmd_tx` 通道进主循环——两个后端都在
-/// 自己的 poll 里 `try_recv` 排空它，所以后端一行都不用改。
+/// 自己的 poll 里 `try_recv` 排空它，所以后端一行都不用改；排空之外的时间主循环可能
+/// 睡在最长 1 秒的空闲心跳上，所以每投递一条都要摸一下唤醒管道。
 ///
 /// 绑定失败只意味着本实例不接电话，照常工作，因此不向上抛错。
-pub fn serve(cmd_tx: Sender<Command>) {
-    serve_at(&socket_path(), cmd_tx);
+pub fn serve(cmd_tx: Sender<Command>, wake: WakeSender) {
+    serve_at(&socket_path(), cmd_tx, wake);
 }
 
 /// [`serve`] 的可指定路径版本，测试用。
-fn serve_at(path: &Path, cmd_tx: Sender<Command>) {
+fn serve_at(path: &Path, cmd_tx: Sender<Command>, wake: WakeSender) {
     let Ok(listener) = bind(path) else {
         return;
     };
@@ -233,7 +268,7 @@ fn serve_at(path: &Path, cmd_tx: Sender<Command>) {
             let Ok(stream) = stream else { continue };
             // 只有一条接受循环，所以一个连上却不说话的客户端就能把后面所有转发永久
             // 卡死。给它一个读超时，哑巴连接会被丢掉而不是拖死整条队列。
-            match handle_conn(stream, &cmd_tx) {
+            match handle_conn(stream, &cmd_tx, &wake) {
                 Conn::Done => {}
                 Conn::ChannelGone => return,
             }
@@ -249,13 +284,22 @@ enum Conn {
 /// 处理一次连接。**任何**走到终点的分支都要回一个 ACK——发端正阻塞等它，
 /// 不回就等于把对方挂死（无参数的 `tinyticker` 只发一个换行，正好落进"没有命令"
 /// 那条分支，这就是原来那个挂死的成因）。
-fn handle_conn(mut stream: UnixStream, cmd_tx: &Sender<Command>) -> Conn {
+fn handle_conn(mut stream: UnixStream, cmd_tx: &Sender<Command>, wake: &WakeSender) -> Conn {
     let _ = stream.set_read_timeout(Some(ACCEPT_TIMEOUT));
     if let Some(text) = read_line(&mut stream) {
-        for cmd in Intent::parse(&decode(&text)).map(|i| i.commands()).unwrap_or_default() {
+        let mut sent = false;
+        for cmd in Intent::parse(&decode(&text))
+            .map(|i| i.commands())
+            .unwrap_or_default()
+        {
             if cmd_tx.send(cmd).is_err() {
                 return Conn::ChannelGone;
             }
+            sent = true;
+        }
+        // 投递过东西才唤醒：空参数那条命令没有，不必白摸一次管道
+        if sent {
+            wake.wake();
         }
     }
     let _ = stream.write_all(&[ACK]);
@@ -314,6 +358,11 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
+    /// 测试里造一对唤醒管道：`serve_at` 要发送端，接收端得活着握住（握丢就 EOF）。
+    fn wake_pair() -> (WakeSender, crate::wake::WakeReader) {
+        crate::wake::pair()
+    }
+
     #[test]
     fn flags_map_to_modes() {
         for (flag, mode) in [
@@ -347,7 +396,8 @@ mod tests {
     /// `--and` 带一条命令，两种写法都认；缺值要报错而不是把下一条参数吃掉当默认。
     #[test]
     fn and_arms_a_one_shot_finish_command() {
-        let i = Intent::parse(&["25m".into(), "--and".into(), "loginctl lock-session".into()]).unwrap();
+        let i =
+            Intent::parse(&["25m".into(), "--and".into(), "loginctl lock-session".into()]).unwrap();
         assert_eq!(i.duration, Some(1500));
         assert_eq!(i.and_then.as_deref(), Some("loginctl lock-session"));
         assert_eq!(
@@ -360,29 +410,51 @@ mod tests {
         );
         // 等号写法：整条命令里带空格也不用拆成两个参数
         assert_eq!(
-            Intent::parse(&["--and=notify-send 好了".into()]).unwrap().and_then.as_deref(),
+            Intent::parse(&["--and=notify-send 好了".into()])
+                .unwrap()
+                .and_then
+                .as_deref(),
             Some("notify-send 好了")
         );
         // 别名
-        assert!(Intent::parse(&["--then".into(), "x".into()]).unwrap().and_then.is_some());
+        assert!(
+            Intent::parse(&["--then".into(), "x".into()])
+                .unwrap()
+                .and_then
+                .is_some()
+        );
         // 缺值：报错，不能静默把后面的时长参数吞掉
         assert!(Intent::parse(&["--and".into()]).is_err());
-        assert!(Intent::parse(&["--and".into(), "25m".into()])
-            .unwrap()
-            .and_then
-            .as_deref()
-            == Some("25m"), "带值参数吃掉的那一条不该再被当成时长");
+        assert!(
+            Intent::parse(&["--and".into(), "25m".into()])
+                .unwrap()
+                .and_then
+                .as_deref()
+                == Some("25m"),
+            "带值参数吃掉的那一条不该再被当成时长"
+        );
     }
 
     /// `--hide` / `--show` 是设定值而不是翻面，所以重复执行同一个命令结果不变。
     #[test]
     fn visibility_flags_map_to_set_hidden() {
-        assert_eq!(Intent::parse(&["--hide".into()]).unwrap().hidden, Some(true));
-        assert_eq!(Intent::parse(&["--show".into()]).unwrap().hidden, Some(false));
-        assert_eq!(Intent::parse(&[]).unwrap().hidden, None);
-        assert_eq!(Intent::parse(&["--hide".into()]).unwrap().commands(), vec![Command::SetHidden(true)]);
         assert_eq!(
-            Intent::parse(&["--hide".into(), "25m".into()]).unwrap().commands(),
+            Intent::parse(&["--hide".into()]).unwrap().hidden,
+            Some(true)
+        );
+        assert_eq!(
+            Intent::parse(&["--show".into()]).unwrap().hidden,
+            Some(false)
+        );
+        assert_eq!(Intent::parse(&[]).unwrap().hidden, None);
+        assert_eq!(
+            Intent::parse(&["--hide".into()]).unwrap().commands(),
+            vec![Command::SetHidden(true)]
+        );
+        assert_eq!(
+            Intent::parse(&["--hide".into(), "25m".into()])
+                .unwrap()
+                .commands(),
             vec![Command::SetHidden(true), Command::Preset(1500)],
             "可见性该排在其它命令之前"
         );
@@ -393,17 +465,65 @@ mod tests {
     #[test]
     fn edit_flags_map_to_set_edit() {
         assert_eq!(Intent::parse(&["--edit".into()]).unwrap().edit, Some(true));
-        assert_eq!(Intent::parse(&["--no-edit".into()]).unwrap().edit, Some(false));
-        assert_eq!(Intent::parse(&[]).unwrap().edit, None);
-        assert_eq!(Intent::parse(&["--edit".into()]).unwrap().commands(), vec![Command::SetEdit(true)]);
         assert_eq!(
-            Intent::parse(&["--no-edit".into(), "25m".into()]).unwrap().commands(),
+            Intent::parse(&["--no-edit".into()]).unwrap().edit,
+            Some(false)
+        );
+        assert_eq!(Intent::parse(&[]).unwrap().edit, None);
+        assert_eq!(
+            Intent::parse(&["--edit".into()]).unwrap().commands(),
+            vec![Command::SetEdit(true)]
+        );
+        assert_eq!(
+            Intent::parse(&["--no-edit".into(), "25m".into()])
+                .unwrap()
+                .commands(),
             vec![Command::SetEdit(false), Command::Preset(1500)],
         );
         // 冷启动时它不进配置：`apply` 只碰 Config 上真有的那几个键
         let mut cfg = Config::default();
         Intent::parse(&["--edit".into()]).unwrap().apply(&mut cfg);
         assert_eq!(cfg, Config::default(), "编辑态不该落到配置里");
+    }
+
+    /// 无时长语义的动作：各自翻成既有命令，与 --edit 同族都是"给在跑的那个下命令"。
+    #[test]
+    fn action_flags_map_to_timer_commands() {
+        assert_eq!(
+            Intent::parse(&["--pause".into()]).unwrap().commands(),
+            vec![Command::Pause]
+        );
+        assert_eq!(
+            Intent::parse(&["--toggle".into()]).unwrap().commands(),
+            vec![Command::Toggle]
+        );
+        assert_eq!(
+            Intent::parse(&["--reset".into()]).unwrap().commands(),
+            vec![Command::Reset]
+        );
+        // 排在时长之后：先定读数再停表
+        assert_eq!(
+            Intent::parse(&["25m".into(), "--pause".into()])
+                .unwrap()
+                .commands(),
+            vec![Command::Preset(1500), Command::Pause]
+        );
+    }
+
+    /// `--centis` 是设定值不是翻面：冷启动时它进配置（与模式同族），
+    /// 转发时它是可重复的 `SetCentiseconds`。
+    #[test]
+    fn centis_flag_is_a_set_not_a_toggle() {
+        let i = Intent::parse(&["--centis".into()]).unwrap();
+        assert_eq!(i.centiseconds, Some(true));
+        assert_eq!(i.commands(), vec![Command::SetCentiseconds(true)]);
+        assert_eq!(
+            Intent::parse(&["--no-centis".into()]).unwrap().commands(),
+            vec![Command::SetCentiseconds(false)]
+        );
+        let mut cfg = Config::default();
+        i.apply(&mut cfg);
+        assert!(cfg.centiseconds, "它该进配置，下次冷启动也记得");
     }
 
     #[test]
@@ -471,12 +591,13 @@ mod tests {
     #[test]
     fn forward_round_trips_into_the_channel() {
         let (tx, rx) = channel();
+        let (wake, _keep) = wake_pair();
         let path = std::env::temp_dir().join(format!(
             "tt-ipc-test-{}-{}.sock",
             std::process::id(),
             unique()
         ));
-        serve_at(&path, tx);
+        serve_at(&path, tx, wake);
         // bind 是同步的，serve_at 返回时已经能连
         assert!(
             forward_to(&path, &["-p".to_string(), "600".to_string()]),
@@ -524,11 +645,19 @@ mod tests {
     #[test]
     fn empty_invocation_is_acked_not_hung() {
         let (tx, rx) = channel();
-        let path = std::env::temp_dir().join(format!("tt-ipc-empty-{}-{}.sock", std::process::id(), unique()));
-        serve_at(&path, tx);
+        let (wake, _keep) = wake_pair();
+        let path = std::env::temp_dir().join(format!(
+            "tt-ipc-empty-{}-{}.sock",
+            std::process::id(),
+            unique()
+        ));
+        serve_at(&path, tx, wake);
         let started = std::time::Instant::now();
         assert!(forward_to(&path, &[]), "空参数没被接住");
-        assert!(started.elapsed() < Duration::from_secs(2), "空参数把调用方挂住了");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "空参数把调用方挂住了"
+        );
         // 没有任何命令产生，但调用方已经拿到回音、可以安心退出
         assert!(rx.try_recv().is_err(), "空参数不该产生命令");
         let _ = std::fs::remove_file(&path);
@@ -540,15 +669,30 @@ mod tests {
     #[test]
     fn silent_client_does_not_wedge_the_listener() {
         let (tx, rx) = channel();
-        let path = std::env::temp_dir().join(format!("tt-ipc-silent-{}-{}.sock", std::process::id(), unique()));
-        serve_at(&path, tx);
+        let (wake, _keep) = wake_pair();
+        let path = std::env::temp_dir().join(format!(
+            "tt-ipc-silent-{}-{}.sock",
+            std::process::id(),
+            unique()
+        ));
+        serve_at(&path, tx, wake);
         // 故意保持连接打开且不写任何字节（注意 `let _ = mute` 不会提前析构一个具名变量，
         // 必须显式 drop 才能造出"哑巴但在线"的客户端）
         let mute = UnixStream::connect(&path).unwrap();
         let started = std::time::Instant::now();
-        assert!(forward_to(&path, &["25m".to_string()]), "哑巴连接把后面的转发卡死了");
-        assert!(started.elapsed() < Duration::from_secs(2), "耗时 {:?} 超出预算", started.elapsed());
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Command::Preset(1500));
+        assert!(
+            forward_to(&path, &["25m".to_string()]),
+            "哑巴连接把后面的转发卡死了"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "耗时 {:?} 超出预算",
+            started.elapsed()
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Command::Preset(1500)
+        );
         drop(mute);
         let _ = std::fs::remove_file(&path);
     }

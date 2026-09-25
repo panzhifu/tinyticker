@@ -23,8 +23,7 @@ pub const fn premultiply(color: u32, alpha: u8) -> u32 {
 ///
 /// 表压成一条 `"name=rrggbb …"` 而不是 30 个 `(&str, u32)`：后者每条要一对胖指针再
 /// 加对齐，实测光那 30 条数组就多占 1.1 KB。
-const NAMED: &str =
-    "white=ffffff black=000000 red=ff0000 lime=00ff00 blue=0000ff yellow=ffff00 cyan=00ffff magenta=ff00ff silver=c0c0c0 gray=808080 maroon=800000 olive=808000 green=008000 purple=800080 teal=008080 navy=000080 orange=ffa500 pink=ffc0cb brown=a52a2a violet=ee82ee indigo=4b0082 gold=ffd700 coral=ff7f50 salmon=fa8072 khaki=f0e68c plum=dda0dd azure=f0ffff ivory=fffff0 wheat=f5deb3 snow=fffafa";
+const NAMED: &str = "white=ffffff black=000000 red=ff0000 lime=00ff00 blue=0000ff yellow=ffff00 cyan=00ffff magenta=ff00ff silver=c0c0c0 gray=808080 maroon=800000 olive=808000 green=008000 purple=800080 teal=008080 navy=000080 orange=ffa500 pink=ffc0cb brown=a52a2a violet=ee82ee indigo=4b0082 gold=ffd700 coral=ff7f50 salmon=fa8072 khaki=f0e68c plum=dda0dd azure=f0ffff ivory=fffff0 wheat=f5deb3 snow=fffafa";
 
 /// 解析颜色，四种写法都收：
 /// - `#RRGGBB` / `0xRRGGBB` / 裸 6 位十六进制
@@ -134,12 +133,14 @@ impl Pad {
         }
     }
 
-    /// 托盘菜单上的标签。
-    pub fn label(self) -> &'static str {
+    /// 托盘菜单上的标签。两种语言的取值都在 `label_in` 的词条里；
+    /// 菜单构建与单测都传显式语言，不读进程级全局（并行测试互不掰语言）。
+    pub fn label_in(self, lang: crate::lang::Language) -> &'static str {
+        use crate::lang::tr_in;
         match self {
-            Pad::None => "不补零（45s）",
-            Pad::Zero => "补两位（00:45）",
-            Pad::Full => "总是时分秒（00:00:45）",
+            Pad::None => tr_in(lang, "不补零（45s）", "No padding (45s)"),
+            Pad::Zero => tr_in(lang, "补两位（00:45）", "Pad units (00:45)"),
+            Pad::Full => tr_in(lang, "总是时分秒（00:00:45）", "Always h:mm:ss (00:00:45)"),
         }
     }
 }
@@ -239,7 +240,11 @@ impl<'a> Canvas<'a> {
             let s = (src >> shift) & 0xFF;
             let d = (dst >> shift) & 0xFF;
             // 预乘空间里 src-over 就是 src + dst×(1-srcA)；alpha 通道同理
-            let v = if additive { (s + d).min(255) } else { s + d * keep / 255 };
+            let v = if additive {
+                (s + d).min(255)
+            } else {
+                s + d * keep / 255
+            };
             out |= v << shift;
         }
         self.buf[idx] = out;
@@ -292,7 +297,11 @@ impl<'a> Canvas<'a> {
                         for dx in 0..scale {
                             let px = x + (col as u32 * scale + dx) as i32;
                             let py = y + (row as u32 * scale + dy) as i32;
-                            if px >= 0 && py >= 0 && (px as u32) < self.width && (py as u32) < self.height {
+                            if px >= 0
+                                && py >= 0
+                                && (px as u32) < self.width
+                                && (py as u32) < self.height
+                            {
                                 self.buf[py as usize * self.width as usize + px as usize] = color;
                             }
                         }
@@ -342,7 +351,10 @@ mod tests {
     fn pad_names_roundtrip() {
         for p in [Pad::None, Pad::Zero, Pad::Full] {
             assert_eq!(Pad::from_name(p.name()), Some(p));
-            assert!(!p.label().is_empty());
+            // 两种语言的标签都不许空
+            for lang in [crate::lang::Language::Zh, crate::lang::Language::En] {
+                assert!(!p.label_in(lang).is_empty());
+            }
         }
         assert_eq!(Pad::from_name("half"), None);
         assert_eq!(Pad::default(), Pad::None, "默认档必须是不改变旧行为的那个");
@@ -427,8 +439,16 @@ mod tests {
         assert_eq!(parse_color("1,2"), None);
         assert_eq!(parse_color("1,2,3,4"), None);
         assert_eq!(parse_color("rgb(1,2,x)"), None);
-        assert_eq!(parse_color("RGB(1,2,3)"), Some(0x010203), "前缀也大小写无关");
-        assert_eq!(parse_color("rgba(1,2,3,255)"), None, "alpha 没地方放，宁可不收");
+        assert_eq!(
+            parse_color("RGB(1,2,3)"),
+            Some(0x010203),
+            "前缀也大小写无关"
+        );
+        assert_eq!(
+            parse_color("rgba(1,2,3,255)"),
+            None,
+            "alpha 没地方放，宁可不收"
+        );
         // 关键取舍：不带分隔符也不带 `rgb` 前缀的串不许当三元组，
         // 否则裸 6 位十六进制会被抢走
         assert_eq!(parse_color("102030"), Some(0x102030));

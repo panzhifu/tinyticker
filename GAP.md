@@ -3,7 +3,7 @@
 > 生成日期：2026-09-24。配套阅读 [COMPARISON.md](COMPARISON.md)——那份是"谁有什么"的对比表，这份是"差在哪、为什么差、补要付多少"的差距分析。
 >
 > **取证基准**
-> - tinyticker：`main` 分支工作区（2026-09-25 那批已提交），194 项内联测试全通过；`cargo build --release` 实测 635 416 B（0.606 MiB），`--no-default-features` 625 920 B（0.597 MiB）。本文档写完后又长了字形层、套接字与这一批格式/图标项，见 §5.1、§九 与各表的"已做"标注。
+> - tinyticker：`main` 分支工作区（2026-09-25 两批已提交：第二梯队清完之后又补了"零散 XS"整批，见 §十二 末），212 项内联测试全通过、clippy 零告警；`cargo build --release` 实测 649 720 B（0.620 MiB），`--no-default-features` 640 544 B（0.611 MiB）——零散那一批合计 **+14 KB**。本文档写完后又长了字形层、套接字与这一批格式/图标/语言/分页项，见 §5.1、§九 与各表的"已做"标注。
 > - Catime：本地克隆 `../Catime`，`resource/resource.h:9` 写的是 **1.6.2**（README 顶栏还停在 1.5.0），约 99 178 行 C，配置项 **92 个**（`src/config/config_defaults.c:18-129` 的 `CONFIG_METADATA[]`）。
 > - 下文 Catime 的每条断言都给了 `文件:行`；tinyticker 的每条都给本仓库的 `文件:行`。凡是只读到声明没读到实现的，标注"未证"。
 
@@ -35,8 +35,8 @@ Catime 的计时核心比"整数秒 + 心跳"精密一档，而且它的精度�
 
 | 差距 | Catime 怎么做 | tinyticker 现状 | 障碍与成本 |
 |---|---|---|---|
-| **百分之一秒显示** | `TimeComponents.centiseconds`（`include/drawing/drawing_time_format.h:15-20`），`(ms%1000)/10`；`CLOCK_SHOW_MILLISECONDS`（`src/config/config_defaults.c:59`）+ 专用热键 | **已做（2026-09-24）**：亚秒余量进了状态（`Timer::cs`，`timer.rs:100`），`tick_at` 一次采样的差值同时喂给秒位与百分位（`timer.rs:316`），`display_centis`（`timer.rs:142`）→ `render::format_centis`（`render.rs:54`）出 `45.32s` / `m:ss.cc` / `h:mm:ss.cc`；心跳多了 20ms 一档（`CENTIS_INTERVAL`，`widget.rs:38`），开关是 `centiseconds` 配置项 + 托盘「外观 ▸ 百分之一秒」勾选框 | 与 Catime 还差两点：① **时钟挂件不覆盖**（那一行显示的是 `localtime` 换算出的整秒，要百分秒得先换一条取时路径）；② 没有专用热键——CLI 侧还没开这个开关，但套接字在，用户暂时只能改配置或点托盘 |
-| **自适应心跳阶梯** | `GetTimerInterval()`：毫秒 20 / 动画色 66 / 时钟带秒 250 / 计时 100 / 空闲 1000（`src/config/config_misc_display.c:76-84`），且 ≤33 ms 时改用 `timeSetEvent` + `timeBeginPeriod` | 三档常量：`DRAW_INTERVAL` 200 ms、`ANIM_INTERVAL` 50 ms、`CENTIS_INTERVAL` 20 ms（#15 带来的），由 `Widget::tick_interval()` 选（`widget.rs:201-213`） | 20 ms 那一档已经在了，缺的是**空闲降到 1 s** 与**时钟带秒的 250 ms** 这两档下探；`timeBeginPeriod` 的等价物我们不需要——实测 20 ms 档读数按百分之一秒正常翻动，std 的定时器精度够用。**成本 XS** |
+| **百分之一秒显示** | `TimeComponents.centiseconds`（`include/drawing/drawing_time_format.h:15-20`），`(ms%1000)/10`；`CLOCK_SHOW_MILLISECONDS`（`src/config/config_defaults.c:59`）+ 专用热键 | **已做（2026-09-24）**：亚秒余量进了状态（`Timer::cs`，`timer.rs:100`），`tick_at` 一次采样的差值同时喂给秒位与百分位（`timer.rs:316`），`display_centis`（`timer.rs:142`）→ `render::format_centis`（`render.rs:54`）出 `45.32s` / `m:ss.cc` / `h:mm:ss.cc`；心跳多了 20ms 一档（`CENTIS_INTERVAL`，`widget.rs:38`），开关是 `centiseconds` 配置项 + 托盘「外观 ▸ 百分之一秒」勾选框。**当时差的两点已于 2026-09-25 全部收掉**：① 时钟挂件也覆盖了（`clock::now_hms_cs` 从同一次 `duration_since` 里取亚秒，`format_clock_cs` 出 `HH:MM:SS.cc`；关显示秒时百分秒一并压掉，与 Catime `drawing_time_format.c:255-263` 同规则）；② CLI 开了 `--centis` / `--no-centis`（设定值、进配置、走套接字转发，快捷键能直接绑） |
+| **自适应心跳阶梯** | `GetTimerInterval()`：毫秒 20 / 动画色 66 / 时钟带秒 250 / 计时 100 / 空闲 1000（`src/config/config_misc_display.c:76-84`），且 ≤33 ms 时改用 `timeSetEvent` + `timeBeginPeriod` | **已做（2026-09-25）**：五档 20 / 50 / 200 / 250 / 1000 ms，由 `Widget::tick_interval()` 选（`widget.rs`）。下探的代价原本是"命令最多等一个心跳才结算"（`mpsc` 不占 fd，`poll` 等不到它），用 self-pipe 补掉了：`src/wake.rs` 的 `UnixStream::pair()`，托盘/套接字发完命令摸一下管道，两个后端的 `poll` 各多盯一个 fd——空闲档白睡不再是问题。**`timeBeginPeriod` 的等价物不需要**：实测 20 ms 档读数正常翻动，std 定时器精度够用。原估 **成本 XS**，实测 XS＋唤醒器（ XS 到 S 之间） |
 | **取整的非对称性** | 隐藏百分秒时倒计时用 **ceil**（`(remainingMs+999)/1000`），显示百分秒时用 floor（`drawing_time_format.c:100-105`）——为了不出现"开局先跳 1 秒" | **已对齐**（#15 顺带做的）：显示百分秒时读 `display_centis`（向下取整到百分位），隐藏时读 `display_secs`（还挂在 `secs` 那一格，等价于 ceil），两条路径分别是 `render.rs:54` 与 `render.rs:35`，由 `Widget::shows_centis()` 选 | 之所以自然成立：`secs` 本来就是"这一格还没走完"的向上那一格，而 `secs*100 - cs` 就是向下取整的剩余量。测试钉在 `timer.rs` 的 `countdown_centiseconds_descend_through_the_second_boundary` |
 | **暂停不计时** | 恢复时把暂停时长同时加到 `g_target_end_time` 和 `g_start_time`（`timer.c:247-266`） | 暂停即冻结 `secs`，等价 | **已对齐** |
 | **休眠/唤醒补时** | QPC 与 `GetTickCount64` 两条时间线比对，差 ≥200 ms 就平移截止时间（`timer.c:75-107`） | `tick_at` 按真实时长差一次算清整秒与百分位（`timer.rs:316`），余量存在 `cs` 里 | 做百分秒**不需要**把这套改成按毫秒：一次采样的差值同时喂两个粒度，本来就没有"秒与百分位不同源"的窗口。真正没解决的是 `Instant` 用的是 `CLOCK_MONOTONIC`（不含挂起时长），所以休眠期间倒计时等于跟着停住——与 Catime 平移截止时间的**结果**一致，只是我们没有它那句"检测到有休眠"的显式判定。**不改** |
@@ -94,7 +94,7 @@ Catime 的番茄钟是**任意 N 段序列**，我们是**固定经典配方**�
 
 没把经典配方也拆成 `Vec<Step>` 是**权衡不是疏忽**：`WORK n` / `BREAK n` / `LONG n` 三档标签与"哪一段算专注完成"的语义，是 `pomo_status()` 与 `take_finish_cmd()` 里六条测试钉住的，统一成一种表示要重写那六条断言才能保住同样的话——收益是少一条分支，代价是把已经跑对的东西重新过一遍。所以现在 `Pomo` 同时带"四个键"与"一串"，`Timer::tick()` 用 `pomo.is_seq()` 分流。**要合并的话，先给经典配方补一条"生成的段列表与 round 计数逐位一致"的测试**，那条测试就是合并的保险。
 
-托盘那半边没做：Catime 为每段单独做了重设时长的对话框（`window_commands_timer.c:283-297`），我们只能整串从配置文件改；「每段一项、当前段打勾」也还没挂——`build_nodes` 现在只收 `presets` 与 `gif_configured` 两个参数，要加得先把番茄节奏传进托盘线程（`tray::spawn` 那一条）。
+**托盘那半边已做（2026-09-25）**：配了 `pomo_seq` 时根菜单多一个「🍅 番茄分段」——每段一项（"第 n 段 · 25 分"），**当前段打勾**，点了跳去那段（`Timer::goto_step`：换读数不动运行态）。段号的真值从主循环经 `TrayMsg::SyncPomo` 回填（只在变化时推一次），不跟点击走——跳段之后当前段才跟着走，那才是勾该待的地方。仍然只能整串从配置文件改序列（改段数的菜单结构重建卡在重启那侧），这是与它对话框那条路的真实差距。
 
 ---
 
@@ -159,7 +159,7 @@ Catime 的番茄钟是**任意 N 段序列**，我们是**固定经典配方**�
 | 键盘移动 | 方向键挪窗，步长可配 `MOVE_STEP_SMALL`=10 / `_LARGE`=50（`config_defaults.c:46-47`） | ❌（R1） | **L**：要开 `keyboard-interactive` 并自解 keymap→keysym（正常要走 xkbcommon，与零依赖冲突）。**建议不做** |
 | 多显示器 | 按 `WINDOW_MONITOR_ID` + 显示器内偏移存，显示器不在时特殊处理（`window_core_placement.c:176`） | 全局逻辑坐标对（`window_x/y`），Wayland 侧 layer 的 configure 宽高被丢弃（`wl.rs:794`） | Wayland 下挂件无法指定 output（layer-shell 无此请求）。**平台边界，不做** |
 | 缩放范围 | `WINDOW_SCALE` **0.5-20.0**，另有独立的 `PLUGIN_SCALE`（`config_recovery_window.c:15-48`） | `zoom` 0.5-3.0（`config.rs:274-280`） | **XS**：放宽上限。但 3.0 时字形已经 24 px，再大是糊。建议 0.5-6.0 |
-| 字体大小 | `CLOCK_BASE_FONT_SIZE` **8-500**（`config_recovery.c:47-52`） | 数字行恒为 `8 × scale × 2` 的点阵格，状态行的 TTF 像素高是 `12 × cell`（`text.rs`），两者都不能单独调 | 数字行是刻意保留点阵的（见 §5.1）；要"状态行字号可调"只需把 `TTF_PX_PER_CELL` 提成一个配置项，**XS** |
+| 字体大小 | `CLOCK_BASE_FONT_SIZE` **8-500**（`config_recovery.c:47-52`） | **已做状态行那半边（2026-09-25）**：`status_font_px = 8-24`（默认 12，就是原来写死的 `TTF_PX_PER_CELL`），`text.rs` 里提成原子量，字形缓存的键本来就带像素高，热加载换档不会读到旧尺寸。数字行按设计保留点阵（§5.1），不给它单独调字号的入口 | 它那一档能到 500 是因为整个读数就是字体；我们的数字行大小走 `zoom`（滚轮/配置），两行各管各的开关 |
 | 滚轮调透明度 | Ctrl+滚轮改不透明度，普通滚轮改缩放，步长各两档可配（`OPACITY_STEP_NORMAL`=1 / `_FAST`=5，`SCALE_STEP_*`=10/15） | ❌ 拿不到修饰键（Wayland pointer 事件不带 modifier，overlay 挂件也没有键盘焦点）→ 一律走托盘：图标上滚动缩放、菜单里 5 档透明度 | **平台边界**，已在 README:212 说明。差距只剩"透明度 5 档 vs 连续"——把 `ALPHA_STEPS` 换成 0/16/32/…/255 的 16 档也就是改数组。**XS** |
 | 隐藏/显示 | `HOTKEY_TOGGLE_VISIBILITY` + 菜单项，`NO_DISPLAY` 启动模式（`startup_mode.c:31`） | **已做（2026-09-24）**：托盘根菜单「👻 隐藏挂件」（带勾选）+ `tinyticker --hide` / `--show` 经 #16 那条套接字下命令，所以 DE 快捷键直接绑得到。计时器照常跑，心跳回落到 200ms 档（实测隐藏时 10 秒 CPU 从 100ms 掉到 < 10ms） | **Wayland 这边不能用 `attach(NULL)` 卸载表面**：layer-shell 规定未锚定的表面尺寸为 0 就是协议错误，niri 会直接掐断客户端（实测报 `width 0 requested without setting left and right anchors`）。所以"隐藏"= 提交一帧**全透明**像素 + 一块**没加任何矩形的空 `wl_region`**（0×0 矩形也不行，`set_input_region` 会报 `invalid arguments`）。X11 侧则是正经的 `XUnmapWindow`。代价：Wayland 上表面仍然 mapped，会出现在合成器的窗口列表里，只是看不见、点不到 |
 | 开机自启 | 三态 `AUTO_START_PREFERENCE = DEFAULT/ENABLED/DISABLED`（`startup_policy.h:7-14`） | 靠我们发布的 `.desktop` 让 DE 打开启自启（README:55） | **XS**：写 `~/.config/autostart/`。已经给了手工命令，做成托盘开关即可 |
@@ -178,10 +178,10 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 | Caps Lock 指示灯 | 有一档内置图标 `__capslock__`，`A`/`a` 字形（`percent_caps.c`） | ❌ | X11 可读 LED 掩码，Wayland **无协议**（只有拿到焦点时的 modifier）。**平台分裂，不做** |
 | 网络速率 | 每网卡上/下行 B/s，排除 loopback，`GetIfTable2` 动态解析并回落旧 API，独立采样线程，单位按资源管理器口径缩放（`system_monitor_network_api.c:9-116`、`utils/network_rate.h`） | **已做（2026-09-24）**：`/proc/net/dev` 差分（排 loopback，其余网卡求和），速率按**真实间隔**折算而不是按节拍假定；托盘 `tray_icon = network` 一档水位表 | 差距只剩**读数的呈现**：我们把它压成一根对数水位（1 KB/s = 空盘，10 MB/s = 满盘，上下行取大），Catime 是文字数字。独立采样线程不需要——采样本来就挂在 1s 的图标派发节拍上。**数字读数也做了**（2026-09-25，#23：`tray_numbers` 把那两行速率直接画进图标），剩下的只是"上下行同时各一个数字"那种排布 |
 | 磁盘 / 温度 / 每核 | ❌ 全都没有（明确只实现了 aggregate CPU、RAM、battery、network） | ❌ | 两边都缺，不是差距。若要做，`/proc/diskstats` 同样 XS |
-| 菜单规模 | **两个菜单**：左键是计时控制（暂停/继续（未按运行置灰）、重新开始、隐藏/显示窗口 · 时间显示 ▸（当前时间✓ / 24 小时✓ / 显示秒✓）· 番茄钟 ▸（开始、**每一段各一项且当前段打勾**、`Loop Count: %d`、Combination）· 正计时✓ / 倒计时 · N 条快捷预设），右键是设置（编辑模式✓ · 超时动作 ▸ · 预设管理 ▸ · 热键设置 · 格式 ▸ · 字体 ▸ · 颜色 ▸（**自绘色板项**，`MFT_OWNERDRAW`，标签只有 `1..N`，`src/tray/tray_menu_format_color.c:95-144` + `window_message_menu_draw.c:27-50`）· 样式 ▸ · 插件 ▸ · 托盘图标 ▸ · 帮助 ▸ · 退出）。长的 id 区间按 **2/3 屏高自动分页成"更多 ▸"链**（`include/tray/tray_menu_pagination.h:16-55`）（`src/tray/tray_menu.c:63-285`、`tray_menu_pomodoro.c:148-200`） | 单菜单：开始/暂停/重置 · **隐藏挂件**（2026-09-24）· **编辑态**（2026-09-25）· 弹通知 · 开机自启 · 时长预设 ▸ · 模式 ▸ · 外观 ▸（透明度/配色/文字颜色/特效/图标内容/**时间格式** 六个子菜单，全带勾选） · 恢复默认设置 · 重置窗口位置 · 退出（`tray/menu.rs:199-326`）。**不分页**，所以预设上限 24（`config.rs:33-34` 的理由写在注释里） | 差距是"入口数"不是"能力"。**格式 ▸ 已经挂了**（补零三档 + 显示秒 + 百分秒，2026-09-24），`重置位置` / `恢复默认设置` / 编辑模式三项也都有了（2026-09-24、2026-09-25）。剩下可做的是**每段番茄钟单独一项**（等 #20）与"超时动作 ▸"那一档（我们用 `--and` 覆盖了，见 §一）。全部 **XS-S** |
+| 菜单规模 | **两个菜单**：左键是计时控制（暂停/继续（未按运行置灰）、重新开始、隐藏/显示窗口 · 时间显示 ▸（当前时间✓ / 24 小时✓ / 显示秒✓）· 番茄钟 ▸（开始、**每一段各一项且当前段打勾**、`Loop Count: %d`、Combination）· 正计时✓ / 倒计时 · N 条快捷预设），右键是设置（编辑模式✓ · 超时动作 ▸ · 预设管理 ▸ · 热键设置 · 格式 ▸ · 字体 ▸ · 颜色 ▸（**自绘色板项**，`MFT_OWNERDRAW`，标签只有 `1..N`，`src/tray/tray_menu_format_color.c:95-144` + `window_message_menu_draw.c:27-50`）· 样式 ▸ · 插件 ▸ · 托盘图标 ▸ · 帮助 ▸ · 退出）。长的 id 区间按 **2/3 屏高自动分页成"更多 ▸"链**（`include/tray/tray_menu_pagination.h:16-55`）（`src/tray/tray_menu.c:63-285`、`tray_menu_pomodoro.c:148-200`） | 单菜单：开始/暂停/重置 · **隐藏挂件**（2026-09-24）· **编辑态**（2026-09-25）· 弹通知 · 开机自启 · 时长预设 ▸ · **番茄分段 ▸（每段一项、当前段打勾，2026-09-25）** · 模式 ▸ · 外观 ▸（透明度/配色/文字颜色/特效/图标内容/**时间格式** 六个子菜单，全带勾选） · **语言 ▸（三档单选，2026-09-25）** · 恢复默认设置 · 重置窗口位置 · 退出（`tray/menu.rs`）。预设上限提到 **50 档**（对齐它的 `MAX_TIME_OPTIONS`），超 20 档折进「更多 ▸」子菜单——它按屏幕高度自动分页成链，我们拿不到菜单高度，按条数分一页 | 入口数的差距已基本抹平。剩的两条真实差距：分页只有一层（我们最多 50 项、一页子菜单装得下，不必成链），以及超时动作那一档我们用 `--and` 覆盖了（见 §一）。全部 **XS-S** |
 | 悬停提示 | tooltip 里带 **CPU / 内存 / 上下行 / 开机时长 / 当前动画速率档** 多行文本（`tray_tooltip.c:18-53,85-149`），近图标 200 ms、远离 1000 ms 降频轮询，图标矩形靠 `Shell_NotifyIconGetRect` 缓存（`tray_events.c:21-24,89-100`） | tooltip 固定 `"TinyTicker" / "极简悬浮计时器"`（`tray/sni.rs:176-201`） | SNI 侧我们能设 `ToolTip`，但**Wayland/X11 都拿不到光标是否在图标上**，所以只能随 `NewIcon` 一起定长更新，做不到"靠近才采样"。加两行指标 **XS** |
 | 拖放导入 | `CF_HDROP` 一种格式（`ole_drop_target.c:118,175`）：`.ttf/.otf/.ttc` → `resources/fonts`，`.gif/.webp/.ani/.png/...` → `resources/animations`，递归扫目录并限条目数与体积，**恰好拖一个就自动应用**（`window_drop_import.c:13-136`、`window_drop_target.c:80-103`） | ❌ | **L**：Wayland 要 `data-device` + `primary-selection` 全套，X11 要 XDND。它这个设计很讨喜，但我们没有可导入的资产类别（唯一能用的是 GIF 动图），**收益不明确** |
-| 悬停即预览 | 整套 `menu_preview` 子系统：靠 `WM_MENUSELECT` 驱动，鼠标**停在菜单项上就临时应用该值**——覆盖颜色、字体、3 档时补、百分秒、显示秒、24 小时制、全部特效、全部动画 id（`window_message_menu_preview.c:136-186`）；弹层/分隔线/置灰项直接拒绝（`:115-134`），30 ms 起效 / 50 ms 取消去抖，分组互相取消；离开菜单循环时安排还原，确定才提交。连**心跳频率都随预览变**（`menu_preview_state.c:33-49`，被 `drawing_time_format.c:228-233` 与 `config_misc_display.c:77-79` 消费） | ❌ 我们是**点一下立即生效并写回**（`widget.rs:221-330` 的 `SetAlpha`/`SetPalette`/`SetEffect`/`SetIcon`） | 这是两种哲学：它"试了再说、可反悔"，我们"所见即所得、无中间态"。要抄就得给每个可预览项做一份可撤销快照，**S**；在只有 8 种特效 / 30 套配色 / 5 档透明度的规模下，我们的方案不吃亏。**优先级低**，但顺带有个真问题：**托盘的勾选态是靠托盘线程自持的那份镜像算的**，手改配置文件之后勾会漂——#17 热加载已经落地（2026-09-24），挂件的显示内容跟着文件走了，勾却只跟着菜单点击走。**tray 方向的通道已补（2026-09-25）**：`TrayHandle.tx` 原本只送通知，现在送的是 `TrayMsg`（`Notify` / `SyncEdit` / `SyncHidden`），主循环在 `set_edit` / `set_hidden` 里回填，实测 `tinyticker --edit` 之后 `GetLayout` 里那一格从 `checked b false` 变成 `true`。**还剩的漂移**：配色/特效/透明度这些走配置文件的项（热加载改了 `Config` 但没往托盘回填），以及预设档位与图标内容档（菜单节点是启动时建的，改不了） |
+| 悬停即预览 | 整套 `menu_preview` 子系统：靠 `WM_MENUSELECT` 驱动，鼠标**停在菜单项上就临时应用该值**——覆盖颜色、字体、3 档时补、百分秒、显示秒、24 小时制、全部特效、全部动画 id（`window_message_menu_preview.c:136-186`）；弹层/分隔线/置灰项直接拒绝（`:115-134`），30 ms 起效 / 50 ms 取消去抖，分组互相取消；离开菜单循环时安排还原，确定才提交。连**心跳频率都随预览变**（`menu_preview_state.c:33-49`，被 `drawing_time_format.c:228-233` 与 `config_misc_display.c:77-79` 消费） | ❌ 我们是**点一下立即生效并写回**（`widget.rs:221-330` 的 `SetAlpha`/`SetPalette`/`SetEffect`/`SetIcon`） | 这是两种哲学：它"试了再说、可反悔"，我们"所见即所得、无中间态"。要抄就得给每个可预览项做一份可撤销快照，**S**；在只有 8 种特效 / 30 套配色 / 5 档透明度的规模下，我们的方案不吃亏。**优先级低**，但顺带有个真问题：**托盘的勾选态是靠托盘线程自持的那份镜像算的**，手改配置文件之后勾会漂——#17 热加载已经落地（2026-09-24），挂件的显示内容跟着文件走了，勾却只跟着菜单点击走。**tray 方向的通道已补（2026-09-25）**：`TrayHandle.tx` 原本只送通知，现在送的是 `TrayMsg`（`Notify` / `SyncEdit` / `SyncHidden`），主循环在 `set_edit` / `set_hidden` 里回填，实测 `tinyticker --edit` 之后 `GetLayout` 里那一格从 `checked b false` 变成 `true`。**剩下的两类漂移也已收口（2026-09-25 同日）**：`TrayMsg::SyncConfig` 把**所有配置派生的勾选格**一次性回填（配色/特效/透明度/百分秒/补零/显示秒/图标档/语言，快照里 `mode` 盖成计时器实时值），热加载与套接字那两条不经过菜单的路都走它——加一个配置项不会漏一条回填消息；菜单**结构**（预设档位、番茄段数）仍是启动时建的，那是另一回事，不是漂移。 |
 
 ---
 
@@ -206,7 +206,7 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 | 二次启动 = 下命令 | CLI 是一等入口：`s`显时间 `u`秒表 `p`番茄 `r`重启 `h`帮助 `e`编辑态 `v`显隐 `pr`暂停 `q1-q3`快捷预设 `p<N>`第 N 个预设，以及裸时间表达式（`cli.c:219-255`）；命令经 `WM_COPYDATA` **转发给已在跑的实例**而不是起第二个窗口（`window_message_commands.c:74-105`）；**非法输入不报错，直接启动默认计时器**——注释里写明"可预测的行为好过打断用户"（`cli.h:38-44`） | ✅ **已做**（2026-09-24，`src/ipc.rs`）：`$XDG_RUNTIME_DIR/tinyticker.sock`，不可用时退到 `/tmp/tinyticker-<uid>.sock`，0600；一次连接一行，参数用 U+001F 分隔（因为 `"1h 30m 10s"` 里有真空格），收端回一个 `K` 才让发端退出。命令走**既有的** `cmd_tx` 通道进主循环，**两个后端一行没改** | 已付：+12.5 KB。被 kill 留下的死套接字文件会先确认没人听再 unlink 接管 |
 | 自动更新 | 手写 JSON 取值器（无库），semver 含**预发布标签**比较（`1.3.0-alpha2`，`update_parser.c:44-180`），下载 URL 过白名单，后台线程可取消，**Release Notes 用 Markdown 渲染** | ❌ 靠包管理器 / 手动 Releases | Linux 侧正确答案是"交给发行版"。若要做，`spawn curl` 取 GitHub API 就够（不引 TLS）。**S，低优先** |
 | 崩溃与日志 | 分级 + 轮转（命名移位链）+ 节流 flush（≥ERROR 立即）+ `signal` 异常处理器 + 动态加载 `RtlGetVersion` 绕过 manifest 兼容谎报（`log_*.c`） | 无日志文件；X11 错误非致命化并记录（`x11.rs:39-51`）；`panic = "abort"` | **不做**。0.5 MB 的单一职责程序不需要日志轮转 |
-| 国际化 | 10 个 locale，编在同一个自定义 zlib 容器里（`embedded_assets.json:6-44`），首启用系统语言、切换走**托盘「帮助 → Language」子菜单的母语名**（`简体中文/繁體中文/English/Français/Deutsch/日本語/한국어/Português/Русский/Español`，`language_def.h:27-36`），**没有语言对话框**（`window_commands_language.c:16-28`）；还带**本地化时长串**（俄语 一/少/多 三条复数规则 + CJK 去空格）（`localized_duration.c:24-97`） | 托盘文案硬编码中文；挂件画不出非 ASCII | 托盘侧 i18n **S**（一张文案表 + 语言检测，形态和它一样：子菜单而非对话框）；挂件侧受 R2 限制。它的 `preset_label`（我们的 `config.rs:56-69`）已经在做同一件事，只是只有中文 |
+| 国际化 | 10 个 locale，编在同一个自定义 zlib 容器里（`embedded_assets.json:6-44`），首启用系统语言、切换走**托盘「帮助 → Language」子菜单的母语名**（`简体中文/繁體中文/English/Français/Deutsch/日本語/한국어/Português/Русский/Español`，`language_def.h:27-36`），**没有语言对话框**（`window_commands_language.c:16-28`）；还带**本地化时长串**（俄语 一/少/多 三条复数规则 + CJK 去空格）（`localized_duration.c:24-97`） | **已做 zh/en 两语版（2026-09-25）**：`src/lang.rs` 一张 `tr_in(语言, 中, 英)` 词条层 + `language = auto|zh|en` 配置（auto 按 `$LANGUAGE`/`$LC_ALL`/`$LC_MESSAGES`/`$LANG` 判 zh 前缀）+ 托盘「语言」三档单选，切换经 `SyncConfig` 重建菜单节点即时换标签；悬停提示与通知文案同层。本地化时长串做了英文紧凑单位（`90 → "1m 30s"`，`preset_label_in`）。其余八种语言没有语料可拄——Catime 那八份是人工翻译的，我们不自造机翻文案 | 挂件侧受 R2 限制不变：数字行恒 ASCII，状态行写什么由内容决定。**真实剩下的差距只有"语种数"**，机制（词条表 + 检测 + 子菜单切换）已与它同形；再加一种语言就是往 `tr_in` 多一个参数列 |
 | CI 冒烟模式 | `--ci-smoke --ci-config-dir=<path>` 可注入配置目录并限时自退（`config_path_sources.c:68-126`、`main_ci.c`） | ❌（配置路径不可覆盖） | **XS**：加 `--config-dir` / `TINYTICKER_CONFIG` 环境变量。**建议顺手做**，它是我们自己写集成测试的前置 |
 
 ---
@@ -291,17 +291,17 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 | 29 | Markdown 渲染 | XL | 依赖 26 + 27 |
 | 30 | 拖放导入 | L | Wayland `data-device` 全套，收益不明 |
 
-### 零散 XS（没编号的那些，读完码确认还开着）
+### 零散 XS（没编号的那些，2026-09-25 同日整批清完）
 
 | 项 | 档 | 落点与现状 |
 |---|---|---|
-| 心跳阶梯再下探两档 | XS | `tick_interval()` 只有 200 / 50 / 20 ms 三档（`widget.rs:201-213`），Catime 空闲走 1 s、时钟带秒走 250 ms。纯省电，读数不受影响 |
-| 具名渐变预设 | XS | Catime 的 `GRADIENT_CANDY/BREEZE/FROST/SUNSET/STREAMER` 能直接当颜色值写（`color/gradient.h:16-24`）；我们只有十六进制停靠点，`Gradient::parse` 前加一张名字表即可 |
-| 状态行字号可调 | XS | `TTF_PX_PER_CELL` 写死 12（`text.rs:28`），提成配置项就行。数字行按设计保留点阵，不动它 |
-| CLI 缺"无时长语义"的动作 | XS | `Intent` 只有 mode / duration / autostart / hidden / edit / and_then（`ipc.rs:52-67`），没有 `--pause` / `--toggle` / `--reset`，也没有百分秒的三态开关。套接字已经在，加几个 flag 就能把这些也绑进 DE 快捷键 |
-| 时钟挂件的百分秒 | S | §一 记为"#15 没收掉的"：那一行显示的是 `localtime` 换算的整秒，要百分秒得先换一条取时路径 |
-| 预设上限 24 → 50 | S | 上限的理由是"菜单再长就该分页了，而我们不分页"（`config.rs:33-34`）。要提必须先做托盘菜单分页（Catime 有 `tray_menu_pagination.c`） |
-| 托盘文案 i18n | S | §九 那行：一张文案表 + 语言检测，形态与 Catime 一样走子菜单而不是对话框。挂件侧受 R2 限制，数字行仍旧只能 ASCII |
+| ~~心跳阶梯再下探两档~~ **已做（2026-09-25）** | XS＋唤醒器 | `tick_interval()` 现在五档：20 / 50 / 200 / 250 / **1000ms**（`widget.rs`）。下探的前置是 `src/wake.rs` 的 self-pipe：`mpsc` 不占 fd，`poll` 等不到命令，空闲档会把"绑一条快捷键"的响应拖到 1s；托盘/套接字发完命令摸一下管道，两个后端的 `poll` 各多盯一个 fd。测试钉住五档选路与"暂停不再 200ms 白醒" |
+| ~~具名渐变预设~~ **已做（2026-09-25）** | XS | `Gradient::named` 收 Catime `GRADIENT_REGISTRY` 那五条（candy/breeze/frost/sunset/streamer，大小写与 `GRADIENT_` 前缀随意），查表排在 `_` 分隔解析之前；写回配置时展开成停靠点串。实测取值逐条照抄 `src/color/gradient.c:21-64` |
+| ~~状态行字号可调~~ **已做（2026-09-25）** | XS | `status_font_px`（8-24，默认 12），`text.rs` 的原子量；点阵那半边不动（§六那行已更新） |
+| ~~CLI 缺"无时长语义"的动作~~ **已做（2026-09-25）** | XS | `Intent` 多了 `--pause` / `--toggle` / `--reset` 与 `--centis` / `--no-centis`（设定值且进配置），排在时长之后、`--and` 之前。暂停/继续/重置这些现在也能绑进 DE 快捷键了 |
+| ~~时钟挂件的百分秒~~ **已做（2026-09-25）** | S | `clock::now_hms_cs` 从同一次 `duration_since` 里取亚秒（两个粒度同源），`format_clock_cs` 出 `HH:MM:SS.cc`；关显示秒时百分秒一并压掉；`centis_live` 让 20ms 档在时钟模式下不看 `running` 也提频。见 §一 |
+| ~~预设上限 24 → 50~~ **已做（2026-09-25）** | S | `MAX_PRESETS = 50`（对齐 `MAX_TIME_OPTIONS`），分页在 `tray/menu.rs`：超 `PRESET_PAGE`（20）项折进「更多 ▸」子菜单，一条测试钉住"不丢不重" |
+| ~~托盘文案 i18n~~ **已做 zh/en（2026-09-25）** | S | `src/lang.rs` + `language` 配置 + 托盘「语言」子菜单三档单选；菜单标签走显式传参的 `tr_in`（单测不碰全局），悬停提示与通知文案走 `tr()`。其余八语种没有语料，不自造机翻（见 §九）。实测本批合计 +14 KB |
 
 ### 明确不做（平台边界，不是偷懒）
 
@@ -325,6 +325,10 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 >
 > 2026-09-25：**#19 编辑态一档已做完**（`Widget::edit`，中键 / 托盘 / `--edit` 三个入口，见 §六），并顺带两件：① 补了 **tray 方向的回填通道**（`TrayMsg::SyncEdit` / `SyncHidden`，实测套接字驱动的切换会让菜单那一格跟着翻），§七 那条漂移只剩"配置项改色/特效"与"菜单结构"两类；② **修掉一个真 bug**：`wl_region.add` 是 1 号请求而我们按 0 号（`destroy`）发，于是 `click_through = true` 的挂件在 Wayland 上**一启动就被合成器掐掉**——这条一直坏着，因为默认值是关。#19 这一轮合计 **+2.1 KB**（624 096 → 626 272 字节，仅 Wayland 616 840）。同日再收 **#22（CSS 名 / `rgb()` / `#RGB`，+2.5 KB）**：那条原估写的"纯解析层，无体积压力"实测不成立，已在 §5.2 划掉。托盘 `tray.rs` 也在同一天拆成了 `tray/` 六个模块（纯搬运，体积 +80 B）；**#23（图标数字档，+2.4 KB）**、**#21（动图限速，+2.4 KB）**、**#20（`pomo_seq` 任意段序列，+2 KB）** 同批收下——第二梯队 #19-#23 到此清空。
 >
+> **同日（零散批）**：§十二 "零散 XS"那张表整批清完——心跳阶梯下探到 250/1000ms（`src/wake.rs` 的 self-pipe 让下探不拿响应换电）、具名渐变五条、`status_font_px`、CLI `--pause/--toggle/--reset/--centis`、时钟挂件百分秒、预设 50 档 + 「更多 ▸」分页、番茄分段托盘项（当前段打勾）、zh/en 双语层 + `language` 配置，以及 §七 那两类勾选态漂移的收口（`TrayMsg::SyncConfig`）。这一批合计 **+14 KB**（635 416 → 649 720，仅 Wayland 625 920 → 640 544），测试 194 → **212** 项。三条根因里 **R1（键盘）与 R3（进程外能力）未动**；悬停即预览照旧是"两种哲学"那条，没做。
+>
 > 第一梯队 + #15/#16/#17/#18 这一整轮（#15 + #2 + #4 + #7 + #14 + #18 + #17 + #3 + #5 + #6 + #8 + #1 + #9 + #10 + #11 + #12 + #13）合计 **+31 KB**：含 X11 的默认构建 592,816 → 624,096 字节，仅 Wayland 615,016 字节。另外顺手修了一个后端选择的老毛病：`WAYLAND_DISPLAY=`（空值，某些启动器会留）以前算"在 Wayland 上"，于是既不连 Wayland 也不退回 X11，直接报错退出——现在空值按"没有"处理（`main.rs:run_backend`）。
 
 第三梯队以后不建议为"对齐 Catime"而做，只为"我们自己想要"而做。
+
+> 零散 XS 批之后，§十二 只剩三种东西：第三梯队那七条贵的（先想清楚要不要）、"悬停即预览"那条哲学差，以及 R1/R3 两条根因。对齐性的便宜活到此没有剩项。

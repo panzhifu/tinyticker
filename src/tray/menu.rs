@@ -1,10 +1,17 @@
 //! 菜单：节点表 + 托盘自持的那份显示状态（`State`），以及 `com.canonical.dbusmenu` 的读写。
+//!
+//! 标签全部走 `lang::tr_in` 的**显式语言版**：`build_nodes` 收一个 `Language` 参数，
+//! 单测断言具体字面量时不碰进程级全局，并行测试也不会互相掰语言。切换语言由
+//! `TrayMsg::SyncConfig` 那条路重建节点（托盘线程重建，主循环只负责写回配置）。
 
-use crate::config::{ALPHA_STEPS, COLOR_OPTIONS, Config, PALETTES, color_label, preset_label};
+use super::*;
+use crate::config::{
+    ALPHA_STEPS, COLOR_OPTIONS, Config, PALETTES, PRESET_PAGE, color_label, preset_label_in,
+};
 use crate::effect::{EFFECTS, Effect, Gradient};
+use crate::lang::{Language, tr_in};
 use crate::render::{PADS, Pad};
 use crate::timer::Mode;
-use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -36,12 +43,15 @@ impl Command {
             Command::ToggleNumbers => Some(Check::Numbers),
             Command::SetThrottle(t) => Some(Check::Throttle(t)),
             Command::ToggleCentiseconds => Some(Check::Centiseconds),
+            Command::SetCentiseconds(v) => Some(Check::Centi(v)),
             Command::SetTimePad(p) => Some(Check::TimePad(p)),
             Command::ToggleClockSeconds => Some(Check::ClockSeconds),
             Command::ToggleHidden => Some(Check::Hidden),
             Command::ToggleEdit => Some(Check::Edit),
             Command::ToggleNotify => Some(Check::Notify),
             Command::ToggleAutostart => Some(Check::Autostart),
+            Command::SetLanguage(l) => Some(Check::Language(l)),
+            Command::SetPomoStep(i) => Some(Check::PomoStep(i)),
             Command::SetHidden(_) | Command::SetEdit(_) => None,
             _ => None,
         }
@@ -62,6 +72,8 @@ pub(super) enum Check {
     Numbers,
     /// 下面三个是勾选框（各自独立），上面五个是单选组。勾选框只有一项，不必带值。
     Centiseconds,
+    /// 设定值版的百分秒（套接字那条路），勾与勾选框共用同一格状态。
+    Centi(bool),
     TimePad(Pad),
     ClockSeconds,
     Hidden,
@@ -69,12 +81,17 @@ pub(super) enum Check {
     Edit,
     Notify,
     Autostart,
+    /// 语言单选三档（`language` 的**配置值**，不是 resolve 之后的——`auto` 是一档独立的选择）。
+    Language(Language),
+    /// `pomo_seq` 的每一段一项，当前段打勾。
+    PomoStep(usize),
 }
 
 /// 托盘自己维护的一份显示状态。
 ///
 /// 菜单要显示「当前选中的是哪一项」，而这几项只有托盘会改（初值来自配置），
-/// 所以在发出命令的同时就地镜像一份，省掉主窗口 → 托盘的反向通道。
+/// 所以在发出命令的同时就地镜像一份。热加载与套接字那两条不经过菜单的路，
+/// 由主循环经 `TrayMsg::SyncConfig` 回填（GAP §七 那条"勾选态漂移"）。
 pub(super) struct State {
     pub(super) mode: Mode,
     pub(super) alpha: u8,
@@ -88,7 +105,7 @@ pub(super) struct State {
     pub(super) centis: bool,
     /// 计时数字行的补零档位。
     pub(super) pad: Pad,
-    /// 时钟挂件显示到秒还是到分。
+    /// 时钟挂件显示到分还是到秒。
     pub(super) clock_seconds: bool,
     /// 挂件是否被藏着（只影响那一行的勾选）。
     pub(super) hidden: bool,
@@ -104,6 +121,10 @@ pub(super) struct State {
     pub(super) autostart: bool,
     /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
     pub(super) gif: bool,
+    /// 语言子菜单的勾选看**配置值**（auto/zh/en 三档单选）。
+    pub(super) language: Language,
+    /// `pomo_seq` 当前段号，由主循环回填；不在序列番茄钟上就是 `None`。
+    pub(super) pomo_step: Option<usize>,
 }
 
 impl State {
@@ -119,9 +140,9 @@ impl State {
             }),
             effect: cfg.text_effect,
             icon: cfg.tray_icon,
-            running_color: COLOR_OPTIONS.iter().position(|v| {
-                Gradient::parse(v).is_some_and(|g| g == cfg.color_running)
-            }),
+            running_color: COLOR_OPTIONS
+                .iter()
+                .position(|v| Gradient::parse(v).is_some_and(|g| g == cfg.color_running)),
             centis: cfg.centiseconds,
             pad: cfg.time_pad,
             clock_seconds: cfg.clock_seconds,
@@ -133,8 +154,27 @@ impl State {
             throttle: cfg.tray_throttle,
             notify: cfg.notify,
             autostart: crate::config::autostart_enabled(),
-            gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
+            gif: cfg
+                .tray_gif
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty()),
+            language: cfg.language,
+            pomo_step: None,
         }
+    }
+
+    /// 热加载/套接字回填：配置派生的格子全部对齐到新值，**运行态的三格保留**
+    /// （hidden / edit 不进配置，pomo_step 是计时器实时状态，都不是 Config 的投影）。
+    /// `mode` 特殊：配置里的 `mode` 是启动值，勾该跟着在跑的计时器走，
+    /// 由主循环把实时值盖进 `cfg.mode` 再传进来（见 `Widget::sync_tray`）。
+    pub(super) fn resync(&mut self, cfg: &Config) {
+        let hidden = std::mem::take(&mut self.hidden);
+        let edit = std::mem::take(&mut self.edit);
+        let step = self.pomo_step;
+        *self = Self::from_config(cfg);
+        self.hidden = hidden;
+        self.edit = edit;
+        self.pomo_step = step;
     }
 
     /// 这一项当前能不能点。
@@ -151,6 +191,7 @@ impl State {
             Check::Effect(e) => self.effect == e,
             Check::Icon(m) => self.icon == m,
             Check::Centiseconds => self.centis,
+            Check::Centi(want) => self.centis == want,
             Check::TimePad(p) => self.pad == p,
             Check::ClockSeconds => self.clock_seconds,
             Check::Hidden => self.hidden,
@@ -159,6 +200,8 @@ impl State {
             Check::Throttle(t) => self.throttle == t,
             Check::Notify => self.notify,
             Check::Autostart => self.autostart,
+            Check::Language(l) => self.language == l,
+            Check::PomoStep(i) => self.pomo_step == Some(i),
         }
     }
 
@@ -188,6 +231,7 @@ impl State {
             Command::ToggleNumbers => self.numbers = !self.numbers,
             Command::SetThrottle(t) => self.throttle = t,
             Command::ToggleCentiseconds => self.centis = !self.centis,
+            Command::SetCentiseconds(v) => self.centis = v,
             Command::SetTimePad(p) => self.pad = p,
             Command::ToggleClockSeconds => self.clock_seconds = !self.clock_seconds,
             Command::ToggleHidden => self.hidden = !self.hidden,
@@ -196,6 +240,9 @@ impl State {
             Command::SetEdit(v) => self.edit = v,
             Command::ToggleNotify => self.notify = !self.notify,
             Command::ToggleAutostart => self.autostart = !self.autostart,
+            Command::SetLanguage(l) => self.language = l,
+            // SetPomoStep 不改这里：段号由主循环按计时器的真值回填（SyncPomo），
+            // 点了哪一段不代表当前段——跳段之后当前段才跟着走，那才是勾该待的地方
             _ => {}
         }
     }
@@ -211,7 +258,12 @@ pub(super) fn push_top(n: &mut Vec<Node>, root: &mut Vec<i32>, node: Node) -> i3
     id
 }
 
-pub(super) fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
+pub(super) fn build_nodes(
+    presets: &[u32],
+    gif_configured: bool,
+    pomo_seq: &[u32],
+    lang: Language,
+) -> Vec<Node> {
     let button = |label: &str, command: Command| Node {
         kind: Kind::Button,
         label: label.into(),
@@ -238,68 +290,171 @@ pub(super) fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
         children: Vec::new(),
     }];
     let mut root = Vec::new();
-    push_top(&mut n, &mut root, button("▶ 开始", Command::Start));
-    push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
-    push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
-    push_top(&mut n, &mut root, button("👻 隐藏挂件", Command::ToggleHidden));
-    push_top(&mut n, &mut root, button("🛠 编辑态", Command::ToggleEdit));
-    push_top(&mut n, &mut root, button("🔔 弹通知", Command::ToggleNotify));
-    push_top(&mut n, &mut root, button("🚀 开机自启", Command::ToggleAutostart));
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "▶ 开始", "▶ Start"), Command::Start),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "⏸ 暂停", "⏸ Pause"), Command::Pause),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "⟳ 重置", "⟳ Reset"), Command::Reset),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            tr_in(lang, "👻 隐藏挂件", "👻 Hide widget"),
+            Command::ToggleHidden,
+        ),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "🛠 编辑态", "🛠 Edit mode"), Command::ToggleEdit),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "🔔 弹通知", "🔔 Notify"), Command::ToggleNotify),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            tr_in(lang, "🚀 开机自启", "🚀 Autostart"),
+            Command::ToggleAutostart,
+        ),
+    );
     push_top(&mut n, &mut root, separator());
-    let presets_menu = push_top(&mut n, &mut root, submenu("时长预设"));
-    let modes = push_top(&mut n, &mut root, submenu("模式"));
-    let look = push_top(&mut n, &mut root, submenu("外观"));
+    let presets_menu = push_top(
+        &mut n,
+        &mut root,
+        submenu(tr_in(lang, "时长预设", "Presets")),
+    );
+    // 番茄钟分段：只在配了 `pomo_seq` 时出现——经典配方没有"段"可列
+    let pomo_menu = (!pomo_seq.is_empty()).then(|| {
+        push_top(
+            &mut n,
+            &mut root,
+            submenu(tr_in(lang, "🍅 番茄分段", "🍅 Pomodoro steps")),
+        )
+    });
+    let modes = push_top(&mut n, &mut root, submenu(tr_in(lang, "模式", "Mode")));
+    let look = push_top(
+        &mut n,
+        &mut root,
+        submenu(tr_in(lang, "外观", "Appearance")),
+    );
     push_top(&mut n, &mut root, separator());
-    push_top(&mut n, &mut root, button("↺ 恢复默认设置", Command::ResetConfig));
-    push_top(&mut n, &mut root, button("⌂ 重置窗口位置", Command::ResetPosition));
-    push_top(&mut n, &mut root, button("✕ 退出", Command::Quit));
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            tr_in(lang, "↺ 恢复默认设置", "↺ Restore defaults"),
+            Command::ResetConfig,
+        ),
+    );
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            tr_in(lang, "⌂ 重置窗口位置", "⌂ Reset position"),
+            Command::ResetPosition,
+        ),
+    );
+    let language = push_top(&mut n, &mut root, submenu(tr_in(lang, "语言", "Language")));
+    push_top(
+        &mut n,
+        &mut root,
+        button(tr_in(lang, "✕ 退出", "✕ Quit"), Command::Quit),
+    );
 
-    for secs in presets {
+    // 预设超过一页时折进「更多 ▸」：Catime 按 2/3 屏高自动分页（`tray_menu_pagination.c`），
+    // 我们拿不到菜单高度，按条数分——前 `PRESET_PAGE` 项平铺，余下的进子菜单。
+    let mut preset_slot = presets_menu as usize;
+    let mut paginate = presets.len() > PRESET_PAGE;
+    for (k, secs) in presets.iter().enumerate() {
+        if paginate && k == PRESET_PAGE {
+            let more = n.len() as i32;
+            n.push(submenu(tr_in(lang, "更多 ▸", "More ▸")));
+            n[presets_menu as usize].children.push(more);
+            preset_slot = more as usize;
+            paginate = false; // 只分一页：50 档上限里 20 + 30 已经念得清
+        }
         let id = n.len() as i32;
-        n.push(button(&format!("⏱ {}", preset_label(*secs)), Command::Preset(*secs)));
-        n[presets_menu as usize].children.push(id);
+        let label = preset_label_in(*secs, lang);
+        n.push(button(&format!("⏱ {label}"), Command::Preset(*secs)));
+        n[preset_slot].children.push(id);
     }
-    for (label, mode) in [
-        ("倒计时", Mode::Countdown),
-        ("秒表", Mode::Stopwatch),
-        ("🍅 番茄钟", Mode::Pomodoro),
-        ("🕐 时钟", Mode::Clock),
+    if let Some(menu) = pomo_menu {
+        // 每段一项、当前段打勾（GAP §四："托盘那半边没做"的那半句）。点了跳去那段：
+        // 与时长预设同一个手感——立刻把读数换成本段时长，运行与否不变。
+        for (i, secs) in pomo_seq.iter().enumerate() {
+            let id = n.len() as i32;
+            let label = preset_label_in(*secs, lang);
+            let name = if lang.resolve() == Language::En {
+                format!("Step {} · {}", i + 1, label)
+            } else {
+                format!("第 {} 段 · {}", i + 1, label)
+            };
+            n.push(button(&name, Command::SetPomoStep(i)));
+            n[menu as usize].children.push(id);
+        }
+    }
+    for (label_zh, label_en, mode) in [
+        ("倒计时", "Countdown", Mode::Countdown),
+        ("秒表", "Stopwatch", Mode::Stopwatch),
+        ("🍅 番茄钟", "🍅 Pomodoro", Mode::Pomodoro),
+        ("🕐 时钟", "🕐 Clock", Mode::Clock),
     ] {
         let id = n.len() as i32;
-        n.push(button(label, Command::SetMode(mode)));
+        n.push(button(
+            tr_in(lang, label_zh, label_en),
+            Command::SetMode(mode),
+        ));
         n[modes as usize].children.push(id);
     }
     // 外观：透明度 / 配色 / 文字特效 / 图标内容，各一个二级子菜单
     let alpha = n.len() as i32;
-    n.push(submenu("背景透明度"));
+    n.push(submenu(tr_in(lang, "背景透明度", "Background opacity")));
     n[look as usize].children.push(alpha);
     let palette = n.len() as i32;
-    n.push(submenu("配色预设"));
+    n.push(submenu(tr_in(lang, "配色预设", "Palettes")));
     n[look as usize].children.push(palette);
     // 30 条取自 Catime 的数字色（含渐变）：只换运行色，不动背景与另两态
     let colors = n.len() as i32;
-    n.push(submenu("文字颜色"));
+    n.push(submenu(tr_in(lang, "文字颜色", "Text color")));
     n[look as usize].children.push(colors);
     let effects = n.len() as i32;
-    n.push(submenu("文字特效"));
+    n.push(submenu(tr_in(lang, "文字特效", "Text effects")));
     n[look as usize].children.push(effects);
     let icon = n.len() as i32;
-    n.push(submenu("图标内容"));
+    n.push(submenu(tr_in(lang, "图标内容", "Tray icon")));
     n[look as usize].children.push(icon);
     // 时间格式：补零三档是单选组，显示秒与百分秒各是一个勾选框
     let fmt = n.len() as i32;
-    n.push(submenu("时间格式"));
+    n.push(submenu(tr_in(lang, "时间格式", "Time format")));
     n[look as usize].children.push(fmt);
-    for (label, value) in ALPHA_STEPS {
+    for (zh, en, value) in ALPHA_STEPS {
         let id = n.len() as i32;
-        n.push(button(label, Command::SetAlpha(value)));
+        n.push(button(tr_in(lang, zh, en), Command::SetAlpha(value)));
         n[alpha as usize].children.push(id);
     }
     for (i, p) in PALETTES.iter().enumerate() {
         let id = n.len() as i32;
-        n.push(button(p.name, Command::SetPalette(i)));
+        n.push(button(
+            tr_in(lang, p.name, p.name_en),
+            Command::SetPalette(i),
+        ));
         n[palette as usize].children.push(id);
     }
+    // 颜色预设的标签就是值串本身（两种语言一样），具名五条额外带上名字
     for (i, v) in COLOR_OPTIONS.iter().enumerate() {
         let id = n.len() as i32;
         n.push(button(&color_label(v), Command::SetRunningColor(i)));
@@ -307,50 +462,77 @@ pub(super) fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     }
     for e in EFFECTS {
         let id = n.len() as i32;
-        n.push(button(e.label(), Command::SetEffect(e)));
+        n.push(button(e.label_in(lang), Command::SetEffect(e)));
         n[effects as usize].children.push(id);
     }
-    for (label, m) in [
-        ("🕐 时钟表盘", IconMode::Clock),
-        ("CPU 占用", IconMode::Cpu),
-        ("内存占用", IconMode::Memory),
-        ("电池电量", IconMode::Battery),
-        ("网络速率", IconMode::Network),
+    for (zh, en, m) in [
+        ("🕐 时钟表盘", "🕐 Clock dial", IconMode::Clock),
+        ("CPU 占用", "CPU usage", IconMode::Cpu),
+        ("内存占用", "Memory usage", IconMode::Memory),
+        ("电池电量", "Battery", IconMode::Battery),
+        ("网络速率", "Network rate", IconMode::Network),
         // 没配路径就直说，否则点了只会静默退回表盘
-        (if gif_configured { "GIF 动图" } else { "GIF 动图（未配置 tray_gif）" }, IconMode::Gif),
+        (
+            if gif_configured {
+                "GIF 动图"
+            } else {
+                "GIF 动图（未配置 tray_gif）"
+            },
+            if gif_configured {
+                "GIF animation"
+            } else {
+                "GIF animation (no tray_gif)"
+            },
+            IconMode::Gif,
+        ),
     ] {
         let id = n.len() as i32;
-        n.push(button(label, Command::SetIcon(m)));
+        n.push(button(tr_in(lang, zh, en), Command::SetIcon(m)));
         n[icon as usize].children.push(id);
     }
     // 数字还是水位：只对那四档指标有意义，所以挂在同一个子菜单末尾
     let nums = n.len() as i32;
-    n.push(button("用数字代替水位", Command::ToggleNumbers));
+    n.push(button(
+        tr_in(lang, "用数字代替水位", "Numbers instead of gauge"),
+        Command::ToggleNumbers,
+    ));
     n[icon as usize].children.push(nums);
     // 动图限速：单选三档，同样挂在图标内容下面（它只管 gif 那一档）
     let throttle = n.len() as i32;
-    n.push(submenu("动图限速"));
+    n.push(submenu(tr_in(lang, "动图限速", "Animation throttle")));
     n[icon as usize].children.push(throttle);
-    for (label, t) in [
-        ("不限速", Throttle::Off),
-        ("看 CPU", Throttle::Cpu),
-        ("看内存", Throttle::Memory),
+    for (zh, en, t) in [
+        ("不限速", "Off", Throttle::Off),
+        ("看 CPU", "By CPU", Throttle::Cpu),
+        ("看内存", "By memory", Throttle::Memory),
     ] {
         let id = n.len() as i32;
-        n.push(button(label, Command::SetThrottle(t)));
+        n.push(button(tr_in(lang, zh, en), Command::SetThrottle(t)));
         n[throttle as usize].children.push(id);
     }
     for p in PADS {
         let id = n.len() as i32;
-        n.push(button(p.label(), Command::SetTimePad(p)));
+        n.push(button(p.label_in(lang), Command::SetTimePad(p)));
         n[fmt as usize].children.push(id);
     }
-    for (label, cmd) in
-        [("时钟显示秒", Command::ToggleClockSeconds), ("百分之一秒", Command::ToggleCentiseconds)]
-    {
+    for (zh, en, cmd) in [
+        (
+            "时钟显示秒",
+            "Clock shows seconds",
+            Command::ToggleClockSeconds,
+        ),
+        ("百分之一秒", "Centiseconds", Command::ToggleCentiseconds),
+    ] {
         let id = n.len() as i32;
-        n.push(button(label, cmd));
+        n.push(button(tr_in(lang, zh, en), cmd));
         n[fmt as usize].children.push(id);
+    }
+    // 语言：三档单选，标签恒用母语名（"简体中文" 就该写成 "简体中文"，
+    // 这正是 Catime 每行用自己语言写的用意——选错了也认得回去的那一行）
+    for l in [Language::Auto, Language::Zh, Language::En] {
+        let id = n.len() as i32;
+        n.push(button(l.label(), Command::SetLanguage(l)));
+        n[language as usize].children.push(id);
     }
     // 根节点的子项顺序即菜单顺序
     n[0].children = root;
@@ -361,9 +543,14 @@ pub(super) fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
 mod tests {
     use super::*;
 
+    /// 默认按中文构建（与 `Config::default().language` 的 resolve 结果同侧）。
+    fn nodes(presets: &[u32], gif: bool) -> Vec<Node> {
+        build_nodes(presets, gif, &[], Language::Zh)
+    }
+
     #[test]
     fn menu_nodes_are_well_formed() {
-        let n = build_nodes(&Config::default().presets, true);
+        let n = nodes(&Config::default().presets, true);
         assert_eq!(n[0].kind, Kind::Root);
         for (id, node) in n.iter().enumerate().skip(1) {
             match node.kind {
@@ -396,15 +583,22 @@ mod tests {
 
     #[test]
     fn appearance_submenu_reaches_every_preset() {
-        let n = build_nodes(&Config::default().presets, true);
-        let look = n.iter().find(|x| x.label == "外观").expect("没有「外观」子菜单");
+        let n = nodes(&Config::default().presets, true);
+        let look = n
+            .iter()
+            .find(|x| x.label == "外观")
+            .expect("没有「外观」子菜单");
         assert_eq!(
             look.children.len(),
             6,
             "外观下应是 透明度 / 配色 / 文字颜色 / 文字特效 / 图标内容 / 时间格式 六个子菜单"
         );
         let acts = |parent: i32| -> Vec<Option<Command>> {
-            n[parent as usize].children.iter().map(|i| n[*i as usize].command.clone()).collect()
+            n[parent as usize]
+                .children
+                .iter()
+                .map(|i| n[*i as usize].command.clone())
+                .collect()
         };
         let (alpha_id, palette_id, colors_id, effect_id, icon_id, fmt_id) = (
             look.children[0],
@@ -426,7 +620,11 @@ mod tests {
         assert_eq!(colors.len(), COLOR_OPTIONS.len());
         for (k, id) in n[colors_id as usize].children.iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetRunningColor(k)));
-            assert_eq!(n[*id as usize].label, color_label(COLOR_OPTIONS[k]), "第 {k} 条标签不对");
+            assert_eq!(
+                n[*id as usize].label,
+                color_label(COLOR_OPTIONS[k]),
+                "第 {k} 条标签不对"
+            );
         }
         // 每条都得能被 Gradient 解析，否则点了就是静默无效
         for v in COLOR_OPTIONS {
@@ -438,7 +636,7 @@ mod tests {
         for (k, act) in alpha.iter().enumerate() {
             assert_eq!(
                 *act,
-                Some(Command::SetAlpha(ALPHA_STEPS[k].1)),
+                Some(Command::SetAlpha(ALPHA_STEPS[k].2)),
                 "第 {k} 档透明度接错"
             );
         }
@@ -446,14 +644,24 @@ mod tests {
         assert_eq!(palette.len(), PALETTES.len());
         for (k, id) in n[palette_id as usize].children.iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetPalette(k)));
-            assert_eq!(n[*id as usize].label, PALETTES[k].name, "菜单标签与预设对不上");
+            assert_eq!(
+                n[*id as usize].label, PALETTES[k].name,
+                "菜单标签与预设对不上"
+            );
         }
         let effects = acts(effect_id);
         // 特效加一档忘了登记就会漏在这里
         assert_eq!(effects.len(), EFFECTS.len());
         for (k, id) in n[effect_id as usize].children.iter().enumerate() {
-            assert_eq!(n[*id as usize].command, Some(Command::SetEffect(EFFECTS[k])));
-            assert_eq!(n[*id as usize].label, EFFECTS[k].label(), "菜单标签与特效对不上");
+            assert_eq!(
+                n[*id as usize].command,
+                Some(Command::SetEffect(EFFECTS[k]))
+            );
+            assert_eq!(
+                n[*id as usize].label,
+                EFFECTS[k].label_in(Language::Zh),
+                "菜单标签与特效对不上"
+            );
         }
         let icons = acts(icon_id);
         // 前六项与 IconMode 的全部取值一一对应：加一档忘了登记就漏在这里
@@ -465,8 +673,15 @@ mod tests {
             IconMode::Network,
             IconMode::Gif,
         ];
-        assert_eq!(icons.len(), expect.len() + 2, "末尾还有「用数字代替水位」与「动图限速」");
-        for (k, id) in n[icon_id as usize].children[..expect.len()].iter().enumerate() {
+        assert_eq!(
+            icons.len(),
+            expect.len() + 2,
+            "末尾还有「用数字代替水位」与「动图限速」"
+        );
+        for (k, id) in n[icon_id as usize].children[..expect.len()]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect[k])));
         }
         assert_eq!(
@@ -495,15 +710,22 @@ mod tests {
         ];
         assert_eq!(fmt_cmds, want, "时间格式子菜单与预期对不上");
         for (k, id) in n[fmt_id as usize].children[..PADS.len()].iter().enumerate() {
-            assert_eq!(n[*id as usize].label, PADS[k].label(), "补零档的标签对不上");
+            assert_eq!(
+                n[*id as usize].label,
+                PADS[k].label_in(Language::Zh),
+                "补零档的标签对不上"
+            );
         }
     }
 
     /// 预设菜单要照配置生成：条数、秒数、标签都得对上。
     #[test]
     fn preset_submenu_follows_the_config_list() {
-        let n = build_nodes(&[90, 1500, 5400], true);
-        let submenu = n.iter().find(|x| x.label == "时长预设").expect("没有「时长预设」子菜单");
+        let n = nodes(&[90, 1500, 5400], true);
+        let submenu = n
+            .iter()
+            .find(|x| x.label == "时长预设")
+            .expect("没有「时长预设」子菜单");
         let items: Vec<(String, Option<Command>)> = submenu
             .children
             .iter()
@@ -519,37 +741,194 @@ mod tests {
         );
     }
 
+    /// 超过一页的预设折进「更多 ▸」：平铺 20 项 + 一个子菜单装下余下的，
+    /// 一条不少、一条不多，且子菜单本身不再是按钮。
+    #[test]
+    fn long_preset_list_paginates() {
+        let many: Vec<u32> = (1..=30u32).map(|m| m * 60).collect();
+        let n = nodes(&many, true);
+        let submenu_idx = n
+            .iter()
+            .position(|x| x.label == "时长预设")
+            .expect("没有「时长预设」子菜单");
+        assert_eq!(
+            n[submenu_idx].children.len(),
+            PRESET_PAGE + 1,
+            "平铺 20 项 + 一个「更多 ▸」"
+        );
+        let more_idx = n[submenu_idx].children[PRESET_PAGE] as usize;
+        assert_eq!(n[more_idx].label, "更多 ▸");
+        assert_eq!(n[more_idx].kind, Kind::Submenu);
+        assert_eq!(n[more_idx].children.len(), many.len() - PRESET_PAGE);
+        // 每条预设都还在，且都绑着自己的秒数
+        let mut count = 0;
+        for node in &n {
+            for c in &node.children {
+                if matches!(n[*c as usize].command, Some(Command::Preset(_))) {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, many.len(), "分页把某条预设弄丢了");
+        // 没超限就一个子菜单都不该造出来
+        let few = nodes(&many[..PRESET_PAGE], true);
+        let sub = few.iter().find(|x| x.label == "时长预设").unwrap();
+        assert_eq!(sub.children.len(), PRESET_PAGE);
+        assert!(!few.iter().any(|x| x.label == "更多 ▸"));
+    }
+
+    /// 英文构建：标签换血，命令一个不换。
+    #[test]
+    fn english_labels_same_commands() {
+        let n = build_nodes(&Config::default().presets, true, &[], Language::En);
+        assert!(
+            n.iter()
+                .any(|x| x.command == Some(Command::Start) && x.label == "▶ Start")
+        );
+        assert!(n.iter().any(|x| x.label == "Appearance"));
+        assert!(
+            n.iter().any(|x| x.label == "⏱ 25m"),
+            "英文预设标签走紧凑单位"
+        );
+        // 中文档里找得到的命令，英文档里也必须找得到——词条只改皮不改骨
+        let zh = nodes(&Config::default().presets, true);
+        let cmds = |v: &Vec<Node>| {
+            let mut c: Vec<_> = v.iter().filter_map(|x| x.command.clone()).collect();
+            c.sort_by_key(|c| format!("{c:?}"));
+            c
+        };
+        assert_eq!(cmds(&n), cmds(&zh));
+    }
+
+    /// 番茄分段：配了 `pomo_seq` 才有子菜单，每段一项且按 `SetPomoStep` 绑段号；
+    /// 打勾跟着主循环回填的段号走，不跟点击走。
+    #[test]
+    fn pomodoro_steps_submenu_follows_the_sequence() {
+        let n = build_nodes(&[60], true, &[1500, 300, 900], Language::Zh);
+        let menu = n
+            .iter()
+            .find(|x| x.label == "🍅 番茄分段")
+            .expect("配了序列就该有子菜单");
+        assert_eq!(menu.children.len(), 3);
+        for (i, id) in menu.children.iter().enumerate() {
+            assert_eq!(n[*id as usize].command, Some(Command::SetPomoStep(i)));
+            assert!(n[*id as usize].label.contains(&format!("第 {} 段", i + 1)));
+        }
+        // 没配序列就整个子菜单不存在（空子菜单会被 well_formed 测试拒绝）
+        let none = nodes(&[60], true);
+        assert!(!none.iter().any(|x| x.label == "🍅 番茄分段"));
+
+        // 勾选态：只有回填过的那一段亮着
+        let cfg = Config::default();
+        let mut s = State::from_config(&cfg);
+        assert_eq!(s.pomo_step, None);
+        assert!(!s.checked(Check::PomoStep(0)));
+        s.pomo_step = Some(1);
+        assert!(s.checked(Check::PomoStep(1)) && !s.checked(Check::PomoStep(0)));
+        // 点另一项不翻勾——段号只认计时器的真值
+        s.note(&Command::SetPomoStep(2));
+        assert_eq!(s.pomo_step, Some(1));
+    }
+
+    /// 语言三档是单选组；回填配置不牵连运行态的三格。
+    #[test]
+    fn language_radio_and_resync_preserves_runtime_state() {
+        let n = nodes(&[60], true);
+        let menu = n
+            .iter()
+            .find(|x| x.label == "语言")
+            .expect("没有「语言」子菜单");
+        assert_eq!(menu.children.len(), 3);
+        assert_eq!(
+            n[menu.children[0] as usize].command,
+            Some(Command::SetLanguage(Language::Auto))
+        );
+
+        let cfg = Config {
+            language: Language::Zh,
+            ..Config::default()
+        };
+        let mut s = State::from_config(&cfg);
+        assert!(s.checked(Check::Language(Language::Zh)));
+        s.note(&Command::SetLanguage(Language::En));
+        assert!(
+            s.checked(Check::Language(Language::En)) && !s.checked(Check::Language(Language::Zh))
+        );
+
+        // resync：配置派生的格子跟文件走，hidden/edit/pomo_step 留在原地
+        s.note(&Command::SetAlpha(96));
+        s.hidden = true;
+        s.edit = true;
+        s.pomo_step = Some(2);
+        let mut next = cfg.clone();
+        next.bg_alpha = 0;
+        next.centiseconds = true;
+        s.resync(&next);
+        assert!(s.checked(Check::Alpha(0)), "透明度该跟回填走");
+        assert!(s.checked(Check::Centiseconds), "百分秒同理");
+        assert_eq!(
+            s.language,
+            Language::Zh,
+            "note 过的语言会被回填成配置值（它本就写回配置）"
+        );
+        assert!(s.hidden && s.edit, "运行态的格子不许被回填抹掉");
+        assert_eq!(s.pomo_step, Some(2));
+    }
+
     /// 只有单选组该带勾选；动作按钮（开始/暂停/退出/时长预设）不该画成圆点。
     /// 没配 `tray_gif` 时 GIF 那一档该置灰并在标签上说明原因，其余档不受影响。
     #[test]
     fn gif_item_is_disabled_without_a_path() {
         let cfg = Config::default();
         let s = State::from_config(&cfg);
-        assert!(!s.enabled(&Command::SetIcon(IconMode::Gif)), "没配路径该不可点");
+        assert!(
+            !s.enabled(&Command::SetIcon(IconMode::Gif)),
+            "没配路径该不可点"
+        );
         assert!(s.enabled(&Command::SetIcon(IconMode::Clock)));
         assert!(s.enabled(&Command::SetAlpha(96)), "非图标项不该被牵连");
 
-        let with = Config { tray_gif: Some("~/p/s.gif".into()), ..Config::default() };
+        let with = Config {
+            tray_gif: Some("~/p/s.gif".into()),
+            ..Config::default()
+        };
         assert!(State::from_config(&with).enabled(&Command::SetIcon(IconMode::Gif)));
         // 只有空白也算没配
-        let blank = Config { tray_gif: Some("   ".into()), ..Config::default() };
+        let blank = Config {
+            tray_gif: Some("   ".into()),
+            ..Config::default()
+        };
         assert!(!State::from_config(&blank).enabled(&Command::SetIcon(IconMode::Gif)));
 
-        let labelled = build_nodes(&cfg.presets, false);
-        let gif = labelled.iter().find(|x| x.label.starts_with("GIF 动图")).expect("菜单里该有 GIF 项");
-        assert!(gif.label.contains("tray_gif"), "标签该说明为什么不可用: {}", gif.label);
-        let ok = build_nodes(&cfg.presets, true);
-        assert_eq!(ok.iter().find(|x| x.label.starts_with("GIF")).unwrap().label, "GIF 动图");
+        let labelled = nodes(&cfg.presets, false);
+        let gif = labelled
+            .iter()
+            .find(|x| x.label.starts_with("GIF 动图"))
+            .expect("菜单里该有 GIF 项");
+        assert!(
+            gif.label.contains("tray_gif"),
+            "标签该说明为什么不可用: {}",
+            gif.label
+        );
+        let ok = nodes(&cfg.presets, true);
+        assert_eq!(
+            ok.iter()
+                .find(|x| x.label.starts_with("GIF"))
+                .unwrap()
+                .label,
+            "GIF 动图"
+        );
     }
 
     #[test]
     fn only_radio_items_are_checkable() {
-        let n = build_nodes(&Config::default().presets, true);
+        let n = build_nodes(&Config::default().presets, true, &[1500, 300], Language::Zh);
         for node in &n {
-            let Some(cmd) = node.command.as_ref() else { continue };
+            let Some(cmd) = node.command.as_ref() else {
+                continue;
+            };
             let checkable = cmd.check().is_some();
-            // 五个单选组，加上百分秒 / 显示秒 / 隐藏挂件 / 编辑态 / 弹通知 / 自启这几档勾选框
-            // （SetHidden 与 SetEdit 是命令行走的设定值，菜单上没有它们对应的那一项）
+            // 单选组加上各档勾选框（SetHidden / SetEdit / SetPomoStep 的语义见右列）
             let in_group = matches!(
                 cmd,
                 Command::SetMode(_)
@@ -560,6 +939,9 @@ mod tests {
                     | Command::SetIcon(_)
                     | Command::SetThrottle(_)
                     | Command::SetTimePad(_)
+                    | Command::SetLanguage(_)
+                    | Command::SetPomoStep(_)
+                    | Command::SetCentiseconds(_)
                     | Command::ToggleCentiseconds
                     | Command::ToggleClockSeconds
                     | Command::ToggleHidden
@@ -574,7 +956,11 @@ mod tests {
 
     #[test]
     fn checked_state_mirrors_menu_clicks() {
-        let cfg = Config { mode: Mode::Countdown, bg_alpha: 96, ..Config::default() };
+        let cfg = Config {
+            mode: Mode::Countdown,
+            bg_alpha: 96,
+            ..Config::default()
+        };
         let mut s = State::from_config(&cfg);
         assert!(s.checked(Check::Mode(Mode::Countdown)));
         assert!(!s.checked(Check::Mode(Mode::Pomodoro)));
@@ -583,7 +969,10 @@ mod tests {
 
         s.note(&Command::SetMode(Mode::Pomodoro));
         assert!(s.checked(Check::Mode(Mode::Pomodoro)));
-        assert!(!s.checked(Check::Mode(Mode::Countdown)), "旧的那项必须取消勾选");
+        assert!(
+            !s.checked(Check::Mode(Mode::Countdown)),
+            "旧的那项必须取消勾选"
+        );
 
         s.note(&Command::SetAlpha(0));
         assert!(s.checked(Check::Alpha(0)) && !s.checked(Check::Alpha(96)));
@@ -594,14 +983,30 @@ mod tests {
         assert!(s.checked(Check::Mode(Mode::Pomodoro)));
 
         // 百分秒是勾选框：点一下翻面，且不牵连任何单选组
-        assert!(!s.checked(Check::Centiseconds), "默认该关着，开着的代价是心跳");
+        assert!(
+            !s.checked(Check::Centiseconds),
+            "默认该关着，开着的代价是心跳"
+        );
         s.note(&Command::ToggleCentiseconds);
         assert!(s.checked(Check::Centiseconds));
-        assert!(s.checked(Check::Mode(Mode::Pomodoro)), "翻勾选框不该动了模式勾选");
+        assert!(
+            s.checked(Check::Mode(Mode::Pomodoro)),
+            "翻勾选框不该动了模式勾选"
+        );
         s.note(&Command::ToggleCentiseconds);
         assert!(!s.checked(Check::Centiseconds));
-        let on = Config { centiseconds: true, ..Config::default() };
+        // 设定值版与勾选框共用同一格状态：`--centis` 进来也能把勾摆正
+        s.note(&Command::SetCentiseconds(true));
+        assert!(s.checked(Check::Centiseconds) && s.checked(Check::Centi(true)));
+        assert!(!s.checked(Check::Centi(false)));
+        s.note(&Command::SetCentiseconds(true));
+        assert!(s.checked(Check::Centiseconds), "重复设定不该翻回去");
+        let on = Config {
+            centiseconds: true,
+            ..Config::default()
+        };
         assert!(State::from_config(&on).checked(Check::Centiseconds));
+        s.note(&Command::SetCentiseconds(false)); // 回到默认档再往下测
 
         // 补零是单选组：换档要把旧那档取消
         assert!(s.checked(Check::TimePad(Pad::None)));
@@ -618,14 +1023,23 @@ mod tests {
     /// 限速三档是单选组：换档要取消旧那档的勾。
     #[test]
     fn throttle_is_a_radio_group_starting_at_off() {
-        let on = Config { tray_throttle: Throttle::Cpu, ..Config::default() };
+        let on = Config {
+            tray_throttle: Throttle::Cpu,
+            ..Config::default()
+        };
         let mut s = State::from_config(&on);
         assert!(s.checked(Check::Throttle(Throttle::Cpu)));
         assert!(!s.checked(Check::Throttle(Throttle::Off)));
         s.note(&Command::SetThrottle(Throttle::Memory));
         assert!(s.checked(Check::Throttle(Throttle::Memory)));
-        assert!(!s.checked(Check::Throttle(Throttle::Cpu)), "旧档必须取消勾选");
-        assert!(s.checked(Check::Icon(IconMode::Clock)), "换限速不该动了图标档");
+        assert!(
+            !s.checked(Check::Throttle(Throttle::Cpu)),
+            "旧档必须取消勾选"
+        );
+        assert!(
+            s.checked(Check::Icon(IconMode::Clock)),
+            "换限速不该动了图标档"
+        );
     }
 
     /// 编辑态那一格：启动时恒关着（它不进配置），托盘点一下翻面，
@@ -658,11 +1072,17 @@ mod tests {
         };
         assert_eq!(State::from_config(&cfg).palette, Some(2));
 
-        let off = Config { color_done: Gradient::solid(0x123456), ..cfg };
+        let off = Config {
+            color_done: Gradient::solid(0x123456),
+            ..cfg
+        };
         assert_eq!(State::from_config(&off).palette, None);
         let st = State::from_config(&off);
         for i in 0..PALETTES.len() {
-            assert!(!st.checked(Check::Palette(i)), "自定义配色不该勾中第 {i} 套");
+            assert!(
+                !st.checked(Check::Palette(i)),
+                "自定义配色不该勾中第 {i} 套"
+            );
         }
         // 点一次预设就重新有得勾
         let mut st = st;

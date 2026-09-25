@@ -86,7 +86,14 @@ pub const MAX_POMO_STEPS: usize = 16;
 
 impl Default for Pomo {
     fn default() -> Self {
-        Self { work: 1500, short_break: 300, long_break: 900, rounds: 4, cycles: 0 , seq: Vec::new() }
+        Self {
+            work: 1500,
+            short_break: 300,
+            long_break: 900,
+            rounds: 4,
+            cycles: 0,
+            seq: Vec::new(),
+        }
     }
 }
 
@@ -271,6 +278,27 @@ impl Timer {
         }
     }
 
+    /// `pomo_seq` 那条路：当前段号（0 起）；不在序列番茄钟上就是 `None`。
+    /// 托盘菜单拿它给"当前段"打勾（GAP §四没收掉的托盘那半边）。
+    pub fn pomo_step(&self) -> Option<usize> {
+        (self.mode == Mode::Pomodoro && self.pomo.is_seq()).then_some(self.step)
+    }
+
+    /// 跳到序列里的第 `i` 段：读数换成本段的时长，运行与否原样保持。
+    /// 越界返回 `false` 且什么都不改。收工后跳回去等于再跑一遍当前这轮。
+    pub fn goto_step(&mut self, i: usize) -> bool {
+        if self.pomo_step().is_none() || i >= self.pomo.seq.len() {
+            return false;
+        }
+        self.step = i;
+        self.secs = self.pomo.step_secs(i);
+        self.cs = 0;
+        self.cycles_done = false;
+        self.finished = None;
+        self.last_tick.set(None);
+        true
+    }
+
     /// `pomo_seq` 那条路：一段跑完进下一段，跑完整个序列算一组。
     ///
     /// 中间段只发 [`Finished::PomodoroStep`]——它不算"计时结束"，所以既不触发
@@ -395,7 +423,8 @@ impl Timer {
         if centis == 0 {
             return;
         }
-        self.last_tick.set(Some(last + Duration::from_micros(centis * 10_000)));
+        self.last_tick
+            .set(Some(last + Duration::from_micros(centis * 10_000)));
         // 一次采样的差值同时喂给百分位与秒位：停顿（休眠恢复、高负载）期间走过的
         // 整秒也在这里一次补齐
         let total = self.cs as u64 + centis;
@@ -522,10 +551,18 @@ mod tests {
         assert_eq!(t.display_centis(), 130);
         t.pause();
         t.tick_at(t0 + Duration::from_secs(30));
-        assert_eq!((t.display_secs(), t.display_centis()), (1, 130), "暂停期间读数不动");
+        assert_eq!(
+            (t.display_secs(), t.display_centis()),
+            (1, 130),
+            "暂停期间读数不动"
+        );
         t.start();
         t.tick_at(t0 + Duration::from_secs(31));
-        assert_eq!(t.display_centis(), 230, "该从 1.30 接着走，而不是从 2.00 重来");
+        assert_eq!(
+            t.display_centis(),
+            230,
+            "该从 1.30 接着走，而不是从 2.00 重来"
+        );
     }
 
     /// 重置要连百分位一起清掉，否则重新开始会带着上一次的余量。
@@ -590,7 +627,14 @@ mod tests {
 
     /// 长休息关掉时，行为与只会短休息的旧版一致。
     fn no_long_break(work: u32, short: u32) -> Pomo {
-        Pomo { work, short_break: short, long_break: 0, rounds: 4, cycles: 0 , seq: Vec::new() }
+        Pomo {
+            work,
+            short_break: short,
+            long_break: 0,
+            rounds: 4,
+            cycles: 0,
+            seq: Vec::new(),
+        }
     }
 
     /// 跑满 rounds 轮专注插一次长休息，并在最后一组长休息后停住。
@@ -598,7 +642,14 @@ mod tests {
     fn pomodoro_inserts_long_break_and_stops_after_last_cycle() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
         // 2 轮一组、跑 1 组：W2 B1 W2 B1(长) → 停
-        t.set_pomo(&Pomo { work: 2, short_break: 1, long_break: 3, rounds: 2, cycles: 1 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 2,
+            short_break: 1,
+            long_break: 3,
+            rounds: 2,
+            cycles: 1,
+            seq: Vec::new(),
+        });
         t.start();
         let t0 = Instant::now();
         t.tick_at(t0);
@@ -623,7 +674,14 @@ mod tests {
     #[test]
     fn unlimited_pomodoro_keeps_looping_into_the_next_set() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 2, short_break: 1, long_break: 3, rounds: 2, cycles: 0 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 2,
+            short_break: 1,
+            long_break: 3,
+            rounds: 2,
+            cycles: 0,
+            seq: Vec::new(),
+        });
         t.start();
         let t0 = Instant::now();
         t.tick_at(t0);
@@ -641,7 +699,14 @@ mod tests {
     #[test]
     fn cycles_still_bite_with_long_break_disabled() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 2, cycles: 1 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 1,
+            short_break: 1,
+            long_break: 0,
+            rounds: 2,
+            cycles: 1,
+            seq: Vec::new(),
+        });
         t.start();
         let t0 = Instant::now();
         t.tick_at(t0);
@@ -657,8 +722,16 @@ mod tests {
     #[test]
     fn a_custom_sequence_runs_step_by_step_then_stops() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { seq: vec![3, 2, 1], cycles: 2, ..Pomo::default() });
-        assert_eq!((t.pomo_status(), t.display_secs()), (("POMO", 1), 3), "第 1 段");
+        t.set_pomo(&Pomo {
+            seq: vec![3, 2, 1],
+            cycles: 2,
+            ..Pomo::default()
+        });
+        assert_eq!(
+            (t.pomo_status(), t.display_secs()),
+            (("POMO", 1), 3),
+            "第 1 段"
+        );
         t.start();
         let run = |t: &mut Timer, secs: u32| {
             for _ in 0..secs {
@@ -670,13 +743,21 @@ mod tests {
         assert_eq!((t.pomo_status(), t.display_secs()), (("POMO", 2), 2));
         run(&mut t, 2);
         assert_eq!(t.take_finished(), Some(Finished::PomodoroStep));
-        assert_eq!((t.pomo_status(), t.display_secs()), (("POMO", 3), 1), "第 3 段");
+        assert_eq!(
+            (t.pomo_status(), t.display_secs()),
+            (("POMO", 3), 1),
+            "第 3 段"
+        );
         run(&mut t, 1);
         // 序列跑完一遍：第 2 遍从第 1 段重新开始，中间段仍算"这段结束"
         assert_eq!(t.take_finished(), Some(Finished::PomodoroStep));
         assert_eq!((t.pomo_status(), t.display_secs()), (("POMO", 1), 3));
         run(&mut t, 3 + 2 + 1);
-        assert_eq!(t.take_finished(), Some(Finished::PomodoroAllDone), "两遍跑完该收工");
+        assert_eq!(
+            t.take_finished(),
+            Some(Finished::PomodoroAllDone),
+            "两遍跑完该收工"
+        );
         assert!(t.is_done() && !t.running);
         assert_eq!(t.display_secs(), 0);
     }
@@ -685,11 +766,19 @@ mod tests {
     #[test]
     fn an_endless_sequence_keeps_wrapping() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { seq: vec![1, 1], cycles: 0, ..Pomo::default() });
+        t.set_pomo(&Pomo {
+            seq: vec![1, 1],
+            cycles: 0,
+            ..Pomo::default()
+        });
         t.start();
         for i in 0..6 {
             t.tick();
-            assert_eq!(t.take_finished(), Some(Finished::PomodoroStep), "第 {i} 次翻段");
+            assert_eq!(
+                t.take_finished(),
+                Some(Finished::PomodoroStep),
+                "第 {i} 次翻段"
+            );
             assert!(t.running && !t.is_done(), "不限遍数就不许自己停下");
         }
         assert!(t.pomo_status().1 <= 2, "段号不许跑出序列之外");
@@ -699,14 +788,71 @@ mod tests {
     #[test]
     fn zero_length_steps_are_clamped_up() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { seq: vec![0, 5], cycles: 1, ..Pomo::default() });
+        t.set_pomo(&Pomo {
+            seq: vec![0, 5],
+            cycles: 1,
+            ..Pomo::default()
+        });
         assert_eq!(t.display_secs(), 1, "0 秒段该被抬成 1 秒");
+    }
+
+    /// 托盘「番茄分段」那一串的底层：`pomo_step` 只在序列番茄钟上有值，
+    /// `goto_step` 换读数但不动运行态，越界与不在序列上都得拒。
+    #[test]
+    fn step_jump_follows_the_tray_item() {
+        let mut t = Timer::new(Mode::Pomodoro, 0);
+        assert_eq!(t.pomo_step(), None, "经典配方没有\"段\"可报");
+        assert!(!t.goto_step(0), "不在序列上就不许跳");
+        t.set_pomo(&Pomo {
+            seq: vec![30, 20, 10],
+            cycles: 0,
+            ..Pomo::default()
+        });
+        assert_eq!(t.pomo_step(), Some(0));
+        assert!(t.goto_step(2));
+        assert_eq!(
+            (t.pomo_step(), t.display_secs()),
+            (Some(2), 10),
+            "读数该换成第 3 段"
+        );
+        assert!(!t.running, "没在跑的时候跳段不该顺手把它跑起来");
+        t.start();
+        assert!(t.goto_step(1));
+        assert_eq!(
+            (t.pomo_step(), t.display_secs(), t.running),
+            (Some(1), 20, true),
+            "在跑的保持跑"
+        );
+        assert!(!t.goto_step(9), "越界拒绝且什么都不改");
+        assert_eq!((t.pomo_step(), t.display_secs()), (Some(1), 20));
+        // 收工后跳回去等于再跑这一遍
+        t.set_pomo(&Pomo {
+            seq: vec![1],
+            cycles: 1,
+            ..Pomo::default()
+        });
+        t.start();
+        t.tick();
+        assert_eq!(t.take_finished(), Some(Finished::PomodoroAllDone));
+        assert!(t.is_done() && !t.running);
+        assert!(t.goto_step(0));
+        assert_eq!(t.display_secs(), 1, "跳回去读数重新挂上本段时长");
+        // 段号也能回到模式切换之外：换了模式就不是序列番茄钟
+        t.set_mode(Mode::Countdown);
+        assert_eq!(t.pomo_step(), None);
     }
 
     #[test]
     fn pomo_status_numbers_follow_the_set() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 10, short_break: 10, long_break: 10, rounds: 2, cycles: 2 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 10,
+            short_break: 10,
+            long_break: 10,
+            rounds: 2,
+            cycles: 2,
+            seq: Vec::new(),
+        });
         assert_eq!(t.pomo_status(), ("WORK", 1));
         t.phase = Phase::Break;
         t.round = 1;
@@ -725,7 +871,14 @@ mod tests {
     #[test]
     fn pomodoro_is_not_done_until_cycles_run_out() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 2, cycles: 1 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 1,
+            short_break: 1,
+            long_break: 0,
+            rounds: 2,
+            cycles: 1,
+            seq: Vec::new(),
+        });
         assert!(!t.is_done());
         t.start();
         let t0 = Instant::now();
@@ -752,7 +905,14 @@ mod tests {
     #[test]
     fn finished_pomodoro_restarts_from_a_clean_set() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 1, short_break: 1, long_break: 0, rounds: 1, cycles: 1 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 1,
+            short_break: 1,
+            long_break: 0,
+            rounds: 1,
+            cycles: 1,
+            seq: Vec::new(),
+        });
         t.start();
         let t0 = Instant::now();
         t.tick_at(t0);
@@ -770,7 +930,14 @@ mod tests {
     #[test]
     fn pomo_zero_durations_are_clamped_to_one_second() {
         let mut t = Timer::new(Mode::Pomodoro, 0);
-        t.set_pomo(&Pomo { work: 0, short_break: 0, long_break: 0, rounds: 0, cycles: 0 , seq: Vec::new() });
+        t.set_pomo(&Pomo {
+            work: 0,
+            short_break: 0,
+            long_break: 0,
+            rounds: 0,
+            cycles: 0,
+            seq: Vec::new(),
+        });
         assert_eq!(t.secs, 1, "番茄钟总时长不该被置成 0");
         assert_eq!(t.pomo_status(), ("WORK", 1), "rounds=0 该被当作 1");
     }
@@ -813,7 +980,12 @@ mod tests {
 
     #[test]
     fn mode_names_roundtrip() {
-        for mode in [Mode::Countdown, Mode::Stopwatch, Mode::Pomodoro, Mode::Clock] {
+        for mode in [
+            Mode::Countdown,
+            Mode::Stopwatch,
+            Mode::Pomodoro,
+            Mode::Clock,
+        ] {
             assert_eq!(Mode::from_name(mode.name()), Some(mode));
         }
         assert_eq!(Mode::from_name("bogus"), None);

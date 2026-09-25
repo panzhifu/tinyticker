@@ -40,18 +40,20 @@ use wire::{
     variant_bool, variant_objpath, variant_str,
 };
 
-use std::ffi::{CStr, CString, c_int, c_void};
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread;
-use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::effect::Effect;
 use crate::gif;
+use crate::lang::Language;
 use crate::render::Pad;
 use crate::sys::dbus as d;
 use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObjectPathVTable};
 use crate::sysinfo;
 use crate::timer::Mode;
+use crate::wake::WakeSender;
+use std::ffi::{CStr, CString, c_int, c_void};
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// 托盘 → 主窗口的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +77,10 @@ pub enum Command {
     SetRunningColor(usize),
     /// 换文字特效（写回 `text_effect`，与透明度/配色同样要落盘）。
     SetEffect(Effect),
+    /// 换托盘文案语言（写回 `language`）。菜单标签在重建时跟着换。
+    SetLanguage(Language),
+    /// 跳到 `pomo_seq` 的第 i 段（托盘「番茄分段」那一项）。
+    SetPomoStep(usize),
     /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
     SetIcon(IconMode),
     /// 切换"图标里的占用指标用数字还是水位"（写回 `tray_numbers`）。
@@ -83,6 +89,8 @@ pub enum Command {
     SetThrottle(Throttle),
     /// 切换数字行的百分之一秒（写回 `centiseconds`）。
     ToggleCentiseconds,
+    /// 把百分之一秒设成给定值——`tinyticker --centis` / `--no-centis`，可重复执行。
+    SetCentiseconds(bool),
     /// 换计时数字行的补零档位（写回 `time_pad`）。
     SetTimePad(Pad),
     /// 切换时钟挂件的秒（写回 `clock_seconds`）。
@@ -212,6 +220,12 @@ enum TrayMsg {
     SyncEdit(bool),
     /// 「隐藏挂件」那一格同理：`tinyticker --hide` / `--show` 走的是套接字。
     SyncHidden(bool),
+    /// 用一份新配置回填所有配置派生的勾选格，并按新语言重建菜单节点。
+    /// 热加载与套接字那两条不经过菜单的路都靠它收口（取代逐项 `Sync*` 的趋势：
+    /// 加一个配置项不会漏一条回填消息）。
+    SyncConfig(Box<Config>),
+    /// `pomo_seq` 当前段号（计时器的真值，主循环变化时推一次）。
+    SyncPomo(Option<usize>),
 }
 
 /// 一条待发的通知。
@@ -224,7 +238,13 @@ struct Note {
 struct Server {
     dbus: &'static DBus,
     cmd_tx: Sender<Command>,
+    /// 向主循环发命令后捅一下唤醒管道（空闲档 1s 心跳下命令不能等一个心跳）。
+    wake: WakeSender,
     nodes: Vec<Node>,
+    /// 重建菜单要用的三份料（语言切换与配置回填时节点表整张重造）。
+    presets: Vec<u32>,
+    pomo_seq: Vec<u32>,
+    lang: Language,
     /// 32x32 图标的 ARGB32 网络字节序像素
     pixmap: Vec<u8>,
     /// 菜单 `checked` 与图标内容的依据。只在托盘线程上读写，`RefCell` 足够。
@@ -239,16 +259,35 @@ pub struct TrayHandle {
     tx: Sender<TrayMsg>,
 }
 
+/// 托盘线程的开机包：配置里取出来的那五样，打包一次好过十个位置参数。
+struct Boot {
+    state: State,
+    presets: Vec<u32>,
+    pomo_seq: Vec<u32>,
+    lang: Language,
+    gif_path: Option<String>,
+}
+
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
 ///
-/// 配置只用来给菜单的勾选态、图标内容和时长预设取初值，之后托盘自己镜像菜单点击的结果。
-pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Config) {
-    let state = State::from_config(cfg);
-    let presets = cfg.presets.clone();
-    let gif_path = cfg.tray_gif.clone();
+/// 配置只用来给菜单的勾选态、图标内容、时长预设与番茄分段取初值，之后托盘自己
+/// 镜像菜单点击的结果，并由 `SyncConfig` / `SyncPomo` 回填不经菜单的那两条路。
+pub fn spawn(
+    cmd_tx: Sender<Command>,
+    handle_tx: Sender<TrayHandle>,
+    cfg: &Config,
+    wake: WakeSender,
+) {
+    let boot = Boot {
+        state: State::from_config(cfg),
+        presets: cfg.presets.clone(),
+        pomo_seq: cfg.pomo.seq.clone(),
+        lang: cfg.language.resolve(),
+        gif_path: cfg.tray_gif.clone(),
+    };
     thread::spawn(move || {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel::<TrayMsg>();
-        match run(cmd_tx, msg_rx, handle_tx, msg_tx, state, presets, gif_path) {
+        match run(cmd_tx, msg_rx, handle_tx, msg_tx, wake, boot) {
             Ok(()) => {}
             Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
         }
@@ -257,7 +296,10 @@ pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Confi
 
 /// 发一条桌面通知；`action` 是按钮文案，点击后向主窗口发 [`Command::Start`]。
 pub fn notify(handle: &TrayHandle, body: &str, action: &str) {
-    let note = Note { body: body.to_string(), action: action.to_string() };
+    let note = Note {
+        body: body.to_string(),
+        action: action.to_string(),
+    };
     let _ = handle.tx.send(TrayMsg::Notify(note));
 }
 
@@ -271,20 +313,36 @@ pub fn sync_hidden(handle: &TrayHandle, hidden: bool) {
     let _ = handle.tx.send(TrayMsg::SyncHidden(hidden));
 }
 
+/// 用一份新配置回填托盘：勾选格全部对齐、菜单节点按新语言重建。
+/// 热加载与套接字那两条不经过菜单的路靠它收口。
+pub fn sync_config(handle: &TrayHandle, cfg: &Config) {
+    let _ = handle.tx.send(TrayMsg::SyncConfig(Box::new(cfg.clone())));
+}
+
+/// `pomo_seq` 当前段号变了就推一次（只在变化时，不必每秒）。
+pub fn sync_pomo(handle: &TrayHandle, step: Option<usize>) {
+    let _ = handle.tx.send(TrayMsg::SyncPomo(step));
+}
+
 // ---------------------------------------------------------------------------
 // 线程主体
 // ---------------------------------------------------------------------------
-
 
 fn run(
     cmd_tx: Sender<Command>,
     msg_rx: Receiver<TrayMsg>,
     handle_tx: Sender<TrayHandle>,
     msg_tx: Sender<TrayMsg>,
-    state: State,
-    presets: Vec<u32>,
-    gif_path: Option<String>,
+    wake: WakeSender,
+    boot: Boot,
 ) -> Result<(), String> {
+    let Boot {
+        state,
+        presets,
+        pomo_seq,
+        lang,
+        gif_path,
+    } = boot;
     let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
     let mut err = DBusError::zeroed();
     let conn = unsafe { (dbus.dbus_bus_get)(d::BUS_SESSION, &mut err) };
@@ -293,13 +351,22 @@ fn run(
     }
     let mut sampler = sysinfo::Sampler::new();
     let mut player = gif::Player::new(gif_path.as_deref());
-    let (_, _, pixmap) =
-        icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms(), &mut player,
-            state.numbers);
+    let (_, _, pixmap) = icon_pixmap(
+        state.icon,
+        &sampler.sample(),
+        crate::clock::now_hms(),
+        &mut player,
+        state.numbers,
+    );
+    let nodes = build_nodes(&presets, state.gif, &pomo_seq, lang);
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
-        nodes: build_nodes(&presets, state.gif),
+        wake,
+        nodes,
+        presets,
+        pomo_seq,
+        lang,
         pixmap,
         state: std::cell::RefCell::new(state),
         tooltip: std::cell::RefCell::new(String::new()),
@@ -347,6 +414,16 @@ fn run(
                 TrayMsg::Notify(note) => unsafe { send_notification(dbus, conn, &note) },
                 TrayMsg::SyncEdit(on) => unsafe { (*server).state.borrow_mut().edit = on },
                 TrayMsg::SyncHidden(v) => unsafe { (*server).state.borrow_mut().hidden = v },
+                TrayMsg::SyncPomo(step) => unsafe { (*server).state.borrow_mut().pomo_step = step },
+                TrayMsg::SyncConfig(cfg) => unsafe {
+                    let s = &mut *server;
+                    s.state.borrow_mut().resync(&cfg);
+                    // 序列变了要重造的子菜单不只是勾选：段数本身是菜单结构
+                    s.pomo_seq = cfg.pomo.seq.clone();
+                    s.lang = cfg.language.resolve();
+                    let gif = s.state.borrow().gif;
+                    s.nodes = build_nodes(&s.presets.clone(), gif, &s.pomo_seq.clone(), s.lang);
+                },
             }
         }
         // 采样按秒，图标按派发节拍（200ms）：动图帧间隔可以短到几十毫秒
@@ -377,7 +454,13 @@ fn run(
         // 倍率每轮都推进虚拟时钟（哪怕当前不是动图档）：只在切到动图时才推的话，
         // 从"不限速"切回来那一刻帧序会按累计的墙钟跳一大段
         player.advance(play_speed(throttle, &sources));
-        let (_, _, px) = icon_pixmap(mode, &sources, crate::clock::now_hms(), &mut player, numbers);
+        let (_, _, px) = icon_pixmap(
+            mode,
+            &sources,
+            crate::clock::now_hms(),
+            &mut player,
+            numbers,
+        );
         // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
         let changed = unsafe {
             let server = &mut *server;
@@ -447,20 +530,21 @@ unsafe extern "C" fn on_message(
         // 这三个方法在 ITEM_XML 里一直都有声明，此前一律只回成功。
         "Activate" if path == item_p && iface == item_i => {
             let _ = server.cmd_tx.send(Command::Toggle);
+            server.wake.wake();
             reply(dbus, conn, msg, |_, _| {})
         }
         "SecondaryActivate" if path == item_p && iface == item_i => {
             let _ = server.cmd_tx.send(Command::Reset);
+            server.wake.wake();
             reply(dbus, conn, msg, |_, _| {})
         }
-        "ContextMenu" if path == item_p && iface == item_i => {
-            reply(dbus, conn, msg, |_, _| {})
-        }
+        "ContextMenu" if path == item_p && iface == item_i => reply(dbus, conn, msg, |_, _| {}),
         // 滚轮缩放：ITEM_XML 里声明了 Scroll，就得真的接住，否则宿主收不到回复。
         // 悬浮窗太小、又常开着点击穿透，在托盘图标上滚反而是更顺手的一条路。
         "Scroll" if path == item_p && iface == item_i => {
             if let Some(delta) = read_scroll(dbus, args) {
                 let _ = server.cmd_tx.send(Command::ZoomBy(delta));
+                server.wake.wake();
             }
             reply(dbus, conn, msg, |_, _| {})
         }
@@ -473,11 +557,15 @@ unsafe extern "C" fn on_message(
         }
         "GetGroupProperties" if path == menu_p && iface == menu_i => {
             let ids = read_ids(dbus, args);
-            reply(dbus, conn, msg, |db, it| write_group_properties(db, it, server, &ids))
+            reply(dbus, conn, msg, |db, it| {
+                write_group_properties(db, it, server, &ids)
+            })
         }
         "GetProperty" if path == menu_p && iface == menu_i => {
             let (id, name) = read_property_request(dbus, args);
-            reply(dbus, conn, msg, |db, it| write_node_property(db, it, server, id, &name))
+            reply(dbus, conn, msg, |db, it| {
+                write_node_property(db, it, server, id, &name)
+            })
         }
         "AboutToShow" if path == menu_p && iface == menu_i => {
             reply(dbus, conn, msg, |db, it| put_bool(db, it, false))
@@ -491,6 +579,8 @@ unsafe extern "C" fn on_message(
                 // 先镜像再转发：菜单的 checked 读的是这一份，不能等主窗口回话
                 server.state.borrow_mut().note(cmd);
                 let _ = server.cmd_tx.send(cmd.clone());
+                // 空闲档心跳 1s：不唤醒的话，点了菜单要等到下一拍才结算
+                server.wake.wake();
             }
             reply(dbus, conn, msg, |_, _| {})
         }
@@ -503,7 +593,6 @@ unsafe extern "C" fn on_message(
 
 /// 图标刷新间隔：分针一秒走 6 度，1 秒足够；再快只是多读 /proc。
 const ICON_EVERY: Duration = Duration::from_secs(1);
-
 
 #[cfg(test)]
 mod tests {
@@ -524,5 +613,4 @@ mod tests {
         }
         assert_eq!(IconMode::from_name("disk"), None);
     }
-
 }

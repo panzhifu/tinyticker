@@ -1,8 +1,8 @@
 //! 32x32 托盘图标的像素绘制，以及悬停提示的文本。全部程序化生成，不引入图片资源。
 
+use super::*;
 use crate::gif;
 use crate::sysinfo;
-use super::*;
 
 /// 32x32 时钟图标（深色表盘 + 白色表圈和指针），输出 ARGB32 网络字节序。
 ///
@@ -11,7 +11,11 @@ pub(super) fn clock_pixmap(now: (u32, u32, u32)) -> (i32, i32, Vec<u8>) {
     let mut px = face();
     let (h, m, _) = now;
     // 表盘位置以「分钟格」为单位：时针含分钟分量，否则一小时里指针会跳一下
-    hand(&mut px, dial_dir((h % 12) as f32 * 5.0 + m as f32 / 12.0), 8.0);
+    hand(
+        &mut px,
+        dial_dir((h % 12) as f32 * 5.0 + m as f32 / 12.0),
+        8.0,
+    );
     hand(&mut px, dial_dir(m as f32), 12.0);
     (S as i32, S as i32, px)
 }
@@ -25,7 +29,11 @@ pub(super) fn face() -> Vec<u8> {
             if dist(dx, dy) > 15.0 {
                 continue;
             }
-            let (r, g, b) = if dist(dx, dy) > 12.5 { (255, 255, 255) } else { DARK };
+            let (r, g, b) = if dist(dx, dy) > 12.5 {
+                (255, 255, 255)
+            } else {
+                DARK
+            };
             put(&mut px, x, y, r, g, b);
         }
     }
@@ -67,8 +75,22 @@ pub(super) fn hand(px: &mut [u8], (sx, sy): (f32, f32), len: f32) {
     for step in 0..(len * 2.0) as usize {
         let t = step as f32 / 2.0;
         // 2px 粗：沿指针方向再错开半像素画一次
-        put(px, (CENTER + sx * t) as usize, (CENTER + sy * t) as usize, 255, 255, 255);
-        put(px, (CENTER + sx * (t + 0.5)) as usize, (CENTER + sy * (t + 0.5)) as usize, 255, 255, 255);
+        put(
+            px,
+            (CENTER + sx * t) as usize,
+            (CENTER + sy * t) as usize,
+            255,
+            255,
+            255,
+        );
+        put(
+            px,
+            (CENTER + sx * (t + 0.5)) as usize,
+            (CENTER + sy * (t + 0.5)) as usize,
+            255,
+            255,
+            255,
+        );
     }
 }
 
@@ -78,7 +100,11 @@ pub(super) fn gauge_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Ve
     let mut px = face();
     if let Some(p) = percent {
         // 充电中一律绿色：20% 的红色会让人以为快没电，而实际在涨
-        let (r, g, b) = if charging { (80, 220, 120) } else { level_color(p) };
+        let (r, g, b) = if charging {
+            (80, 220, 120)
+        } else {
+            level_color(p)
+        };
         // 水位线的 y 偏移：0% 在顶端（不填充），100% 在底端（填满内盘）
         let line = 12.5 - p as f32 * 0.25;
         for y in 0..S {
@@ -111,16 +137,24 @@ pub(super) fn fmt_rate(bps: u64) -> String {
 }
 
 /// 悬停提示的正文：把已经采到的指标拼成一行。没有电池就不写那一段。
+/// 文案走全局语言（托盘线程与主线程同进程，启动时已落定）。
 pub(super) fn tooltip_text(src: &sysinfo::Sources) -> String {
+    use crate::lang::tr;
     let mut s = format!(
-        "CPU {}% · 内存 {}% · ↓ {} ↑ {}",
+        "CPU {}% · {} {}% · ↓ {} ↑ {}",
         src.cpu,
+        tr("内存", "Mem"),
         src.mem,
         fmt_rate(src.net_down),
         fmt_rate(src.net_up)
     );
     if let Some(b) = src.battery {
-        s.push_str(&format!(" · 电池 {}%{}", b.percent, if b.charging { "⚡" } else { "" }));
+        s.push_str(&format!(
+            " · {} {}%{}",
+            tr("电池", "Batt"),
+            b.percent,
+            if b.charging { "⚡" } else { "" }
+        ));
     }
     s
 }
@@ -156,7 +190,10 @@ fn num_face() -> Vec<u8> {
     for y in 0..S {
         for x in 0..S {
             // 到最近那颗角圆心的距离：超过 r 就在被削掉的角上，留空
-            let d = dist(x as f32 - (x as f32).clamp(r, edge), y as f32 - (y as f32).clamp(r, edge));
+            let d = dist(
+                x as f32 - (x as f32).clamp(r, edge),
+                y as f32 - (y as f32).clamp(r, edge),
+            );
             if d > r {
                 continue;
             }
@@ -178,7 +215,11 @@ fn percent_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Vec<u8>) {
     let mut px = num_face();
     if let Some(p) = percent {
         // 充电中一律绿色，与水位档同一条规则
-        let c = if charging { (80, 220, 120) } else { level_color(p) };
+        let c = if charging {
+            (80, 220, 120)
+        } else {
+            level_color(p)
+        };
         // 一律不压扁：丢列会把 `M` `0` 这类字形啃坏，实测比顶边更难看
         draw_row(&mut px, &format!("{p}%"), (S - 8) / 2, c, 0);
     }
@@ -232,7 +273,10 @@ fn draw_row(px: &mut [u8], s: &str, y: usize, color: (u8, u8, u8), narrow: usize
         if !ch.is_ascii() {
             continue;
         }
-        for (row, bits) in crate::font8x8::FONT8X8_BASIC[usize::from(ch as u8)].iter().enumerate() {
+        for (row, bits) in crate::font8x8::FONT8X8_BASIC[usize::from(ch as u8)]
+            .iter()
+            .enumerate()
+        {
             let py = y + row;
             if py >= S {
                 continue;
@@ -285,15 +329,17 @@ pub(super) fn icon_pixmap(
         IconMode::Clock => clock_pixmap(now),
         IconMode::Cpu if numbers => percent_pixmap(Some(src.cpu), false),
         IconMode::Memory if numbers => percent_pixmap(Some(src.mem), false),
-        IconMode::Battery if numbers => {
-            percent_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
-        }
+        IconMode::Battery if numbers => percent_pixmap(
+            src.battery.map(|b| b.percent),
+            src.battery.is_some_and(|b| b.charging),
+        ),
         IconMode::Network if numbers => net_pixmap(src.net_down, src.net_up),
         IconMode::Cpu => gauge_pixmap(Some(src.cpu), false),
         IconMode::Memory => gauge_pixmap(Some(src.mem), false),
-        IconMode::Battery => {
-            gauge_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
-        }
+        IconMode::Battery => gauge_pixmap(
+            src.battery.map(|b| b.percent),
+            src.battery.is_some_and(|b| b.charging),
+        ),
         IconMode::Network => gauge_pixmap(Some(net_level(src.net_down, src.net_up)), false),
         // 动图解不出（没配 / 文件坏了）就退回真实时表盘，图标位不能空着
         IconMode::Gif => match player.current().map(|(f, w, h)| gif_pixmap(f, w, h)) {
@@ -352,11 +398,9 @@ pub(super) fn put(px: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
 // 对外接口
 // ---------------------------------------------------------------------------
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// 占用表里水位填充的像素数（排除白色圆环与深色底）。
     fn filled(px: &[u8]) -> usize {
@@ -369,7 +413,10 @@ mod tests {
     #[test]
     fn gauge_fills_monotonically() {
         let counts = [0u8, 25, 50, 75, 100].map(|p| filled(&gauge_pixmap(Some(p), false).2));
-        assert!(counts.windows(2).all(|w| w[0] < w[1]), "水位应随占用率单调上升: {counts:?}");
+        assert!(
+            counts.windows(2).all(|w| w[0] < w[1]),
+            "水位应随占用率单调上升: {counts:?}"
+        );
         // 100% 时整个内盘被填满（内盘半径 12.5）
         assert!(counts[4] > 450, "满盘像素过少: {}", counts[4]);
         // 0% 只剩水位线那一条缝
@@ -429,7 +476,10 @@ mod tests {
         assert_eq!(fmt_rate(51_200), "50.0 KB/s");
         assert_eq!(fmt_rate(2 * 1024 * 1024), "2.0 MB/s");
         assert_eq!(fmt_rate(40u64 * 1024 * 1024 * 1024), "40.0 GB/s");
-        assert!(fmt_rate(u64::MAX).ends_with("GB/s"), "封顶在 GB/s，不外推到 TB");
+        assert!(
+            fmt_rate(u64::MAX).ends_with("GB/s"),
+            "封顶在 GB/s，不外推到 TB"
+        );
     }
 
     /// 提示正文：没电池就不写那一段，有就把充电标记带上。
@@ -442,12 +492,21 @@ mod tests {
             net_down: 1024 * 1024,
             net_up: 2048,
         };
-        assert_eq!(tooltip_text(&src), "CPU 12% · 内存 44% · ↓ 1.0 MB/s ↑ 2048 B/s");
+        assert_eq!(
+            tooltip_text(&src),
+            "CPU 12% · 内存 44% · ↓ 1.0 MB/s ↑ 2048 B/s"
+        );
         let with_batt = sysinfo::Sources {
-            battery: Some(sysinfo::Battery { percent: 87, charging: true }),
+            battery: Some(sysinfo::Battery {
+                percent: 87,
+                charging: true,
+            }),
             ..src
         };
-        assert!(tooltip_text(&with_batt).ends_with("· 电池 87%⚡"), "充电标记该在末尾");
+        assert!(
+            tooltip_text(&with_batt).ends_with("· 电池 87%⚡"),
+            "充电标记该在末尾"
+        );
     }
 
     /// 网络水位是对数刻度：静默归零、区间内分得开、封顶不溢出。
@@ -457,7 +516,10 @@ mod tests {
         assert_eq!(net_level(900, 12), 0, "低于 1 KB/s 的零星心跳算静默");
         let small = net_level(64 * 1024, 0);
         let big = net_level(2 * 1024 * 1024, 0);
-        assert!(0 < small && small < big && big < 100, "刻度要分得开: {small} {big}");
+        assert!(
+            0 < small && small < big && big < 100,
+            "刻度要分得开: {small} {big}"
+        );
         assert_eq!(net_level(10 * 1024 * 1024, 0), 100);
         assert_eq!(net_level(u64::MAX, 0), 100, "超量要夹紧而不是回绕");
         // 上下行取大：只有上传在跑也该看得见
@@ -537,15 +599,19 @@ mod tests {
             (px[i + 1], px[i + 2], px[i + 3])
         };
         let band = |pred: fn((u8, u8, u8)) -> bool| {
-            let rows: Vec<usize> = (0..S)
-                .filter(|y| (0..S).any(|x| pred(at(x, *y))))
-                .collect();
+            let rows: Vec<usize> = (0..S).filter(|y| (0..S).any(|x| pred(at(x, *y)))).collect();
             (rows.first().copied(), rows.last().copied())
         };
         let down = band(|(r, g, _)| g > 150 && r < 150);
         let up = band(|(r, g, b)| r > 200 && g > 150 && b < 120);
-        assert!(down.0.is_some() && up.0.is_some(), "两行都该有字: {down:?} {up:?}");
+        assert!(
+            down.0.is_some() && up.0.is_some(),
+            "两行都该有字: {down:?} {up:?}"
+        );
         assert!(down.1 < up.0, "上下两行不许重叠: {down:?} {up:?}");
-        assert!(down.0.unwrap() >= 4 && up.1.unwrap() < S - 4, "不许贴着上下边");
+        assert!(
+            down.0.unwrap() >= 4 && up.1.unwrap() < S - 4,
+            "不许贴着上下边"
+        );
     }
 }

@@ -7,7 +7,7 @@
 //! 因此这里所有半径都以「位图像素格」为单位（即 `scale` 的倍数），
 //! 视觉上是同一族效果，不是逐像素复刻。
 
-use crate::render::{parse_color, premultiply, Canvas};
+use crate::render::{Canvas, parse_color, premultiply};
 use crate::text;
 
 /// 渐变流动一圈的毫秒数（Catime 的时钟路径同样是 2000ms）。
@@ -77,17 +77,18 @@ impl Effect {
         }
     }
 
-    /// 托盘菜单里的中文名。
-    pub fn label(self) -> &'static str {
+    /// 菜单标签。两种语言的取值都在词条里，不单独存中文名。
+    pub fn label_in(self, lang: crate::lang::Language) -> &'static str {
+        use crate::lang::tr_in;
         match self {
-            Effect::None => "无",
-            Effect::Glow => "辉光",
-            Effect::Glass => "玻璃",
-            Effect::Neon => "霓虹灯管",
-            Effect::Holographic => "全息",
-            Effect::Liquid => "液态流动",
-            Effect::Aqua => "水波",
-            Effect::Retro => "复古投影",
+            Effect::None => tr_in(lang, "无", "None"),
+            Effect::Glow => tr_in(lang, "辉光", "Glow"),
+            Effect::Glass => tr_in(lang, "玻璃", "Glass"),
+            Effect::Neon => tr_in(lang, "霓虹灯管", "Neon"),
+            Effect::Holographic => tr_in(lang, "全息", "Holographic"),
+            Effect::Liquid => tr_in(lang, "液态流动", "Liquid"),
+            Effect::Aqua => tr_in(lang, "水波", "Aqua"),
+            Effect::Retro => tr_in(lang, "复古投影", "Retro"),
         }
     }
 
@@ -111,8 +112,35 @@ impl Gradient {
         Self { stops: vec![color] }
     }
 
+    /// 具名渐变预设，**逐条取自 Catime** 的 `GRADIENT_REGISTRY`（`src/color/gradient.c:21-64`）：
+    /// 它的 `name` 字段写的就是这串停靠点，所以这里不是另编一套，是把同一张表
+    /// 用我们的语法重写。STREAMER 在它那边绘制时走镜像调色板（9 停靠点）防接缝，
+    /// 我们超过两个停靠点自动流动时用的是同一条三角波，不需要镜像。
+    /// 名表压成一条串，理由与 `render::NAMED` 相同：省掉每对胖指针的对齐死重。
+    const NAMED: &'static str = "candy=#FF5E96_#56C6FF breeze=#648CFF_#64DC78 frost=#FFFFFF_#00FFFF sunset=#FF9A56_#56CCBA streamer=#FFA745_#FE869F_#EF7AC8_#A083ED_#43AEFF";
+
+    /// 查具名渐变。大小写无关（前缀也是），`candy` / `CANDY` / `GRADIENT_CANDY` 都收。
+    pub fn named(s: &str) -> Option<Gradient> {
+        let s = s.trim();
+        let name = match s.get(..9) {
+            Some(p) if p.eq_ignore_ascii_case("gradient_") => &s[9..],
+            _ => s,
+        };
+        Self::NAMED.split(' ').find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| Self::parse(value))
+                .flatten()
+        })
+    }
+
     /// 解析渐变串；任一段不是颜色就整体返回 `None`，由调用方回落默认值。
+    /// 先查具名表（`candy` / `GRADIENT_STREAMER` …）——它必须排在 `_` 分隔解析
+    /// 之前，否则 `gradient_candy` 会被当成一串认不出的颜色丢掉。
     pub fn parse(s: &str) -> Option<Gradient> {
+        if let Some(g) = Self::named(s) {
+            return Some(g);
+        }
         let stops: Vec<u32> = s.split('_').map(parse_color).collect::<Option<Vec<_>>>()?;
         if stops.is_empty() || stops.len() > MAX_STOPS {
             return None;
@@ -139,7 +167,11 @@ impl Gradient {
         if self.stops.len() == 1 {
             return format!("{:06x}", self.stops[0] & 0xFFFFFF);
         }
-        self.stops.iter().map(|c| format!("#{c:06x}")).collect::<Vec<_>>().join("_")
+        self.stops
+            .iter()
+            .map(|c| format!("#{c:06x}"))
+            .collect::<Vec<_>>()
+            .join("_")
     }
 
     /// 取画布第 `x` 列的颜色。Catime 按整个窗口表面横向采样，这里保持一致。
@@ -187,7 +219,11 @@ struct Mask {
 
 impl Mask {
     fn new(w: u32, h: u32) -> Self {
-        Self { w, h, px: vec![0; (w * h) as usize] }
+        Self {
+            w,
+            h,
+            px: vec![0; (w * h) as usize],
+        }
     }
 
     fn get(&self, x: u32, y: u32) -> u8 {
@@ -394,7 +430,9 @@ fn build_mask(w: u32, h: u32, rows: &[Row], off: (i32, i32)) -> Mask {
                         }
                     }
                 }
-                text::GlyphBody::Gray { gray, w: gw, h: gh, .. } => {
+                text::GlyphBody::Gray {
+                    gray, w: gw, h: gh, ..
+                } => {
                     for y in 0..*gh {
                         for x in 0..*gw {
                             let v = gray[(y * gw + x) as usize];
@@ -425,7 +463,11 @@ fn composite(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_
             }
             let a = (a as u32 * gain as u32 / 255) as u8;
             let color = grad.at(x as i32 - pad as i32, w, phase_ms);
-            canvas.over(x as i32 - pad as i32, y as i32 - pad as i32, premultiply(color, a));
+            canvas.over(
+                x as i32 - pad as i32,
+                y as i32 - pad as i32,
+                premultiply(color, a),
+            );
         }
     }
 }
@@ -448,7 +490,11 @@ fn composite_add(
             }
             let a = (a as u32 * gain as u32 / 255) as u8;
             let color = grad.at(x as i32 - pad as i32, w, phase_ms);
-            canvas.add(x as i32 - pad as i32, y as i32 - pad as i32, premultiply(color, a));
+            canvas.add(
+                x as i32 - pad as i32,
+                y as i32 - pad as i32,
+                premultiply(color, a),
+            );
         }
     }
 }
@@ -506,7 +552,14 @@ fn neon(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms: u
             }
         }
     }
-    composite_add(canvas, &core, pad, &Gradient::solid(0xFFFFFF), phase_ms, 255);
+    composite_add(
+        canvas,
+        &core,
+        pad,
+        &Gradient::solid(0xFFFFFF),
+        phase_ms,
+        255,
+    );
     composite(canvas, &rim, pad, grad, phase_ms, 255);
 }
 
@@ -516,7 +569,14 @@ fn glass(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms: 
     let soft = mask.blurred(s);
     let off = s as i32;
     // 黑色偏移影子
-    composite(canvas, &soft.shifted(off, off), pad, &Gradient::solid(0x000000), phase_ms, 150);
+    composite(
+        canvas,
+        &soft.shifted(off, off),
+        pad,
+        &Gradient::solid(0x000000),
+        phase_ms,
+        150,
+    );
     // 斜面：左上受光、右下折射
     let up = mask.subtract(&mask.shifted(off, off));
     let down = mask.subtract(&mask.shifted(-off, -off));
@@ -531,7 +591,11 @@ fn glass(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms: 
             let sheen = 255u32.saturating_sub(y * 255 / mask.h.max(1)) >> 3;
             let a = ((src as u32 * 3) / 4 + sheen).min(255) as u8;
             let color = grad.at(x as i32 - pad as i32, canvas.size().0, phase_ms);
-            canvas.over(x as i32 - pad as i32, y as i32 - pad as i32, premultiply(color, a));
+            canvas.over(
+                x as i32 - pad as i32,
+                y as i32 - pad as i32,
+                premultiply(color, a),
+            );
         }
     }
     // 高光：斜面差值强的地方叠白。权重压得低，否则本体颜色会被洗成一片白
@@ -553,9 +617,30 @@ fn holographic(
     let s = scale.max(1);
     let soft = mask.blurred(s).blurred(s);
     let d = s as i32;
-    composite_add(canvas, &soft.shifted(d, 0), pad, &Gradient::solid(0xFF3030), phase_ms, 170);
-    composite_add(canvas, &soft, pad, &Gradient::solid(0x30FF60), phase_ms, 170);
-    composite_add(canvas, &soft.shifted(-d, 0), pad, &Gradient::solid(0x4060FF), phase_ms, 170);
+    composite_add(
+        canvas,
+        &soft.shifted(d, 0),
+        pad,
+        &Gradient::solid(0xFF3030),
+        phase_ms,
+        170,
+    );
+    composite_add(
+        canvas,
+        &soft,
+        pad,
+        &Gradient::solid(0x30FF60),
+        phase_ms,
+        170,
+    );
+    composite_add(
+        canvas,
+        &soft.shifted(-d, 0),
+        pad,
+        &Gradient::solid(0x4060FF),
+        phase_ms,
+        170,
+    );
     // 描边：梯度幅度 ×85/255 后再平方，只留最陡的那一条
     let mut rim = Mask::new(mask.w, mask.h);
     for y in 0..mask.h {
@@ -575,7 +660,9 @@ fn holographic(
 
 /// 正弦查表：256 项，值域 ±1024（定点），用的时候再按需缩放。
 fn sine_lut() -> Vec<i32> {
-    (0..256).map(|i| ((i as f32 * std::f32::consts::TAU / 256.0).sin() * 1024.0) as i32).collect()
+    (0..256)
+        .map(|i| ((i as f32 * std::f32::consts::TAU / 256.0).sin() * 1024.0) as i32)
+        .collect()
 }
 
 /// 液态流动一圈的毫秒数（Catime 用 2048 项 LUT × 0.815 步进得出 2513ms，这里同周期）。
@@ -610,12 +697,23 @@ fn liquid(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms:
             }
             let a = ((v as u32 - 24) << 3).min(255) as u8;
             let color = grad.at(x as i32 - pad as i32, canvas.size().0, phase_ms);
-            canvas.over(x as i32 - pad as i32, y as i32 - pad as i32, premultiply(color, a));
+            canvas.over(
+                x as i32 - pad as i32,
+                y as i32 - pad as i32,
+                premultiply(color, a),
+            );
         }
     }
     // 高光：取横向坡度大的地方叠白
     let slope = height.subtract(&height.shifted(1, 0));
-    composite_add(canvas, &slope.gain(90, 255), pad, &Gradient::solid(0xFFFFFF), phase_ms, 255);
+    composite_add(
+        canvas,
+        &slope.gain(90, 255),
+        pad,
+        &Gradient::solid(0xFFFFFF),
+        phase_ms,
+        255,
+    );
 }
 
 /// 水波：value noise 位移 + 模糊辉光偏移 + 本体。
@@ -642,7 +740,9 @@ fn aqua(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms: u
         let tx = ((fx - x0 as f32) * 255.0) as u32;
         let ty = ((fy - y0 as f32) * 255.0) as u32;
         let g = |dx: u32, dy: u32| {
-            *grid.get(((y0 + dy) * nw + (x0 + dx)) as usize).unwrap_or(&0) as u32
+            *grid
+                .get(((y0 + dy) * nw + (x0 + dx)) as usize)
+                .unwrap_or(&0) as u32
         };
         let a = g(0, 0) * (255 - tx) / 255 + g(1, 0) * tx / 255;
         let b = g(0, 1) * (255 - tx) / 255 + g(1, 1) * tx / 255;
@@ -664,7 +764,14 @@ fn aqua(canvas: &mut Canvas, mask: &Mask, pad: u32, grad: &Gradient, phase_ms: u
     let soft = warped.blurred(scale.max(1));
     let off = scale as i32;
     // 偏移辉光（Catime 读 j-shadowOffset，alpha = glow × 90/255）
-    composite_add(canvas, &soft.shifted(off, off).gain(90, 255), pad, grad, phase_ms, 255);
+    composite_add(
+        canvas,
+        &soft.shifted(off, off).gain(90, 255),
+        pad,
+        grad,
+        phase_ms,
+        255,
+    );
     composite(canvas, &warped, pad, grad, phase_ms, 255);
 }
 
@@ -693,6 +800,30 @@ mod tests {
             let animates = matches!(e, Effect::Liquid | Effect::Aqua);
             assert_eq!(e.animated(), animates, "{} 的动画属性不对", e.name());
         }
+        // 两种语言的标签都不许空，且不许多出一个漏网的档位
+        for e in EFFECTS {
+            for lang in [crate::lang::Language::Zh, crate::lang::Language::En] {
+                assert!(!e.label_in(lang).is_empty(), "{} 缺标签", e.name());
+            }
+        }
+    }
+
+    /// 具名渐变：五条都要认（大小写与前缀随意），取值必须逐条等于表里的停靠点串；
+    /// 认不出的名字不许悄悄解析成颜色，必须原样返回 `None` 让配置层回落。
+    #[test]
+    fn named_gradients_resolve_to_their_stop_strings() {
+        let candy = Gradient::parse("#FF5E96_#56C6FF").unwrap();
+        assert_eq!(Gradient::parse("candy"), Some(candy.clone()));
+        assert_eq!(Gradient::parse("CANDY"), Some(candy.clone()));
+        assert_eq!(Gradient::parse("GRADIENT_candy"), Some(candy));
+        for name in ["breeze", "frost", "sunset", "streamer"] {
+            let g = Gradient::parse(name).unwrap_or_else(|| panic!("{name} 没认出来"));
+            assert!(g.is_gradient(), "具名渐变不该解析成单色");
+            // streamer 超两个停靠点 → 自动流动；其余两段静止
+            assert_eq!(g.animated(), name == "streamer");
+        }
+        assert_eq!(Gradient::parse("gradient_nope"), None);
+        assert_eq!(Gradient::parse("nope"), None);
     }
 
     #[test]
@@ -718,9 +849,15 @@ mod tests {
         assert_eq!(g.at(0, 100, 0), 0x000000);
         // 采样按列中心，最后一列是 99/100 而不是 1，留一点量化余量
         let tail = g.at(99, 100, 0);
-        assert!(tail & 0xFF >= 0xFA && (tail >> 16) >= 0xFA, "末段该接近白: {tail:#08x}");
+        assert!(
+            tail & 0xFF >= 0xFA && (tail >> 16) >= 0xFA,
+            "末段该接近白: {tail:#08x}"
+        );
         let mid = g.at(50, 100, 0);
-        assert!((0x7A..=0x86).contains(&(mid & 0xFF)), "中点该接近灰: {mid:#08x}");
+        assert!(
+            (0x7A..=0x86).contains(&(mid & 0xFF)),
+            "中点该接近灰: {mid:#08x}"
+        );
         // 三停靠点：正中间那列该正好是中间那个颜色
         let g3 = Gradient::parse("#000000_#FF0000_#000000").unwrap();
         let c = g3.at(50, 100, 0);
@@ -791,11 +928,21 @@ mod tests {
                     let mut c = Canvas::new(&mut buf, 200, 60);
                     let num = text::shape("25:00", scale, 10);
                     let status = text::shape("WORK 1", scale, 40);
-                    let rows = [Row { run: &num, scale }, Row { run: &status, scale }];
+                    let rows = [
+                        Row { run: &num, scale },
+                        Row {
+                            run: &status,
+                            scale,
+                        },
+                    ];
                     draw(&mut c, &rows, &grad, e, 700);
                 }
                 let painted = buf.iter().filter(|p| **p != 0xFF000000).count();
-                assert!(painted > 20, "{} 在 {scale}× 下几乎没画东西（{painted} 像素）", e.name());
+                assert!(
+                    painted > 20,
+                    "{} 在 {scale}× 下几乎没画东西（{painted} 像素）",
+                    e.name()
+                );
             }
         }
     }
@@ -805,7 +952,10 @@ mod tests {
     fn degenerate_inputs_are_boring_not_fatal() {
         let grad = Gradient::solid(0xFFFFFF);
         let empty = text::shape("", 2, 0);
-        let rows = [Row { run: &empty, scale: 2 }];
+        let rows = [Row {
+            run: &empty,
+            scale: 2,
+        }];
         let mut buf: Vec<u32> = Vec::new();
         let mut c = Canvas::new(&mut buf, 0, 0);
         for e in EFFECTS {
@@ -828,9 +978,18 @@ mod tests {
         let mut masked = vec![0u32; 200 * 60];
         {
             let mut c = Canvas::new(&mut masked, 200, 60);
-            let rows = [Row { run: &run, scale: 2 }];
+            let rows = [Row {
+                run: &run,
+                scale: 2,
+            }];
             // 两个停靠点同色：`is_gradient()` 为真，强制走覆盖度图那条路
-            draw(&mut c, &rows, &Gradient::parse("FFCC50_FFCC50").unwrap(), Effect::None, 0);
+            draw(
+                &mut c,
+                &rows,
+                &Gradient::parse("FFCC50_FFCC50").unwrap(),
+                Effect::None,
+                0,
+            );
         }
         let lit = |buf: &[u32]| {
             buf.iter()

@@ -18,8 +18,8 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::render::Canvas;
 use crate::sys::x11 as x;
-use crate::sys::{POLL_IN, PollFd, poll};
 use crate::sys::x11::{Event, Rectangle, VisualInfo, X11, XExt};
+use crate::sys::{POLL_IN, PollFd, poll};
 use crate::tray::{Command, TrayHandle};
 use crate::widget::{LOGICAL_SIZE, Widget};
 
@@ -31,7 +31,6 @@ const BITMAP_PAD: c_int = 32;
 const ORDER_UNSORTED: c_int = 0;
 /// 窗口被拖出屏幕后仍留这么多像素可见，免得抓不回来。
 const SLACK: i32 = 24;
-
 
 /// Xlib 出错时的默认处理器会打印并 `exit()`：一个异步的 BadWindow 就能杀掉挂件，
 /// 太脆。换成只记录不换实现——注意 X 的错误是**异步**回报的，请求本身已经返回了，
@@ -98,7 +97,10 @@ impl Client {
         let size = physical_size(widget.zoom, sf);
         let logical = widget.config.window_pos.unwrap_or(DEFAULT_POS);
         let pos = clamp(
-            ((logical.0 as f32 * sf).round() as i32, (logical.1 as f32 * sf).round() as i32),
+            (
+                (logical.0 as f32 * sf).round() as i32,
+                (logical.1 as f32 * sf).round() as i32,
+            ),
             size,
             screen_size(x11, dpy, screen),
         );
@@ -260,7 +262,9 @@ impl Client {
         }
         unsafe { (self.x.XPutImage)(self.dpy, self.win, self.gc, self.image, 0, 0, 0, 0, w, h) };
         // 输入区域：默认整窗接收；开启点击穿透后收缩到文字包围盒
-        let rect = frame.input_rect(self.sf).unwrap_or((0, 0, w as i32, h as i32));
+        let rect = frame
+            .input_rect(self.sf)
+            .unwrap_or((0, 0, w as i32, h as i32));
         self.apply_input_rect(rect);
     }
 
@@ -403,12 +407,15 @@ impl Client {
     }
 
     /// 事件 + 心跳：每 `Widget::tick_interval` 推进一次，其余时间阻塞在 X 的连接 fd 上。
+    /// 唤醒管道与 X 的 fd 一起 `poll`：空闲档睡到 1s 也不怕命令等下一拍（`src/wake.rs`）。
     fn event_loop(
         &mut self,
         cmd_rx: &Receiver<Command>,
         handle_rx: &Receiver<TrayHandle>,
+        wake: &crate::wake::WakeReader,
     ) -> Result<(), Box<dyn std::error::Error>> {
         while !self.quit {
+            wake.drain();
             while let Ok(handle) = handle_rx.try_recv() {
                 self.widget.accept_tray_handle(handle);
             }
@@ -427,7 +434,10 @@ impl Client {
             if self.widget.take_reposition() {
                 let d = self.sf;
                 self.pos = clamp(
-                    ((DEFAULT_POS.0 as f32 * d).round() as i32, (DEFAULT_POS.1 as f32 * d).round() as i32),
+                    (
+                        (DEFAULT_POS.0 as f32 * d).round() as i32,
+                        (DEFAULT_POS.1 as f32 * d).round() as i32,
+                    ),
                     self.size,
                     self.screen(),
                 );
@@ -444,13 +454,26 @@ impl Client {
                     .saturating_duration_since(Instant::now())
                     .as_millis()
                     .min(c_int::MAX as u128) as c_int;
-                let mut pfd = [PollFd { fd, events: POLL_IN, revents: 0 }];
-                unsafe { poll(pfd.as_mut_ptr(), 1, ms) };
+                let mut pfd = [
+                    PollFd {
+                        fd,
+                        events: POLL_IN,
+                        revents: 0,
+                    },
+                    PollFd {
+                        fd: wake.fd(),
+                        events: POLL_IN,
+                        revents: 0,
+                    },
+                ];
+                unsafe { poll(pfd.as_mut_ptr(), pfd.len() as u64, ms) };
             }
         }
         // 配置里统一存逻辑像素，与 layer-shell 路径保持一致
-        let logical =
-            ((self.pos.0 as f32 / self.sf).round() as i32, (self.pos.1 as f32 / self.sf).round() as i32);
+        let logical = (
+            (self.pos.0 as f32 / self.sf).round() as i32,
+            (self.pos.1 as f32 / self.sf).round() as i32,
+        );
         self.widget.persist(Some(logical));
         unsafe { (self.x.XCloseDisplay)(self.dpy) };
         Ok(())
@@ -463,9 +486,10 @@ pub fn run(
     handle_rx: &Receiver<TrayHandle>,
     config: Config,
     autostart: bool,
+    wake_rx: &crate::wake::WakeReader,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::new(config, autostart)?;
-    client.event_loop(cmd_rx, handle_rx)
+    client.event_loop(cmd_rx, handle_rx, wake_rx)
 }
 
 /// 优先 32 位 TrueColor（alpha 通道给合成器），拿不到就退回默认 visual。
@@ -491,9 +515,15 @@ fn pick_shape(x11: &X11, dpy: *mut x::Display) -> Option<&'static XExt> {
     let ext: &'static XExt = Box::leak(Box::new(XExt::load()?));
     let name = CString::new("SHAPE").ok()?;
     let (mut major, mut first_ev, mut first_err) = (0, 0, 0);
-    let present =
-        unsafe { (x11.XQueryExtension)(dpy, name.as_ptr(), &mut major, &mut first_ev, &mut first_err) }
-            != 0;
+    let present = unsafe {
+        (x11.XQueryExtension)(
+            dpy,
+            name.as_ptr(),
+            &mut major,
+            &mut first_ev,
+            &mut first_err,
+        )
+    } != 0;
     present.then_some(ext)
 }
 
