@@ -119,8 +119,11 @@ pub(super) struct State {
     pub(super) notify: bool,
     /// 是否已登记开机自启。这一格不进 Config：磁盘上那个文件本身就是状态。
     pub(super) autostart: bool,
-    /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
+    /// 配了可用的 `tray_gif` 没有（动图档，GIF/PNG 都算）；没配的话那一档点了也只能
+    /// 退回表盘，索性置灰
     pub(super) gif: bool,
+    /// 配了 `alarm_sound` 没有；没配的话「试听音效」无从播起，同样置灰
+    pub(super) sound: bool,
     /// 语言子菜单的勾选看**配置值**（auto/zh/en 三档单选）。
     pub(super) language: Language,
     /// `pomo_seq` 当前段号，由主循环回填；不在序列番茄钟上就是 `None`。
@@ -158,6 +161,7 @@ impl State {
                 .tray_gif
                 .as_deref()
                 .is_some_and(|p| !p.trim().is_empty()),
+            sound: cfg.alarm_sound.is_some(),
             language: cfg.language,
             pomo_step: None,
         }
@@ -177,9 +181,14 @@ impl State {
         self.pomo_step = step;
     }
 
-    /// 这一项当前能不能点。
+    /// 这一项当前能不能点。置灰的两档都在标签里写了原因（点了没动作却不说明，
+    /// 比置灰更难查）。
     pub(super) fn enabled(&self, cmd: &Command) -> bool {
-        !matches!(cmd, Command::SetIcon(IconMode::Gif)) || self.gif
+        match cmd {
+            Command::SetIcon(IconMode::Gif) => self.gif,
+            Command::PreviewSound => self.sound,
+            _ => true,
+        }
     }
 
     pub(super) fn checked(&self, c: Check) -> bool {
@@ -261,6 +270,7 @@ pub(super) fn push_top(n: &mut Vec<Node>, root: &mut Vec<i32>, node: Node) -> i3
 pub(super) fn build_nodes(
     presets: &[u32],
     gif_configured: bool,
+    sound_configured: bool,
     pomo_seq: &[u32],
     lang: Language,
 ) -> Vec<Node> {
@@ -322,6 +332,23 @@ pub(super) fn build_nodes(
         &mut n,
         &mut root,
         button(tr_in(lang, "🔔 弹通知", "🔔 Notify"), Command::ToggleNotify),
+    );
+    // 试听：没配提示音就置灰并把原因写进标签（与 GIF 那一档同一规矩）
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            if sound_configured {
+                tr_in(lang, "🔊 试听音效", "🔊 Test sound")
+            } else {
+                tr_in(
+                    lang,
+                    "🔊 试听音效（未配 alarm_sound）",
+                    "🔊 Test sound (no alarm_sound)",
+                )
+            },
+            Command::PreviewSound,
+        ),
     );
     push_top(
         &mut n,
@@ -471,17 +498,18 @@ pub(super) fn build_nodes(
         ("内存占用", "Memory usage", IconMode::Memory),
         ("电池电量", "Battery", IconMode::Battery),
         ("网络速率", "Network rate", IconMode::Network),
-        // 没配路径就直说，否则点了只会静默退回表盘
+        // 没配路径就直说，否则点了只会静默退回表盘。容器写"动图"不写格式名：
+        // GIF 与 PNG/APNG 共用同一个 `tray_gif` 键，由文件头分发解码器（`anim::decode`）。
         (
             if gif_configured {
-                "GIF 动图"
+                "🌀 动图（GIF/PNG）"
             } else {
-                "GIF 动图（未配置 tray_gif）"
+                "🌀 动图（未配置 tray_gif）"
             },
             if gif_configured {
-                "GIF animation"
+                "🌀 Animation (GIF/PNG)"
             } else {
-                "GIF animation (no tray_gif)"
+                "🌀 Animation (no tray_gif)"
             },
             IconMode::Gif,
         ),
@@ -497,7 +525,7 @@ pub(super) fn build_nodes(
         Command::ToggleNumbers,
     ));
     n[icon as usize].children.push(nums);
-    // 动图限速：单选三档，同样挂在图标内容下面（它只管 gif 那一档）
+    // 动图限速：单选五档（对齐 Catime 的 ANIMATION_SPEED_METRIC），挂在图标内容下面
     let throttle = n.len() as i32;
     n.push(submenu(tr_in(lang, "动图限速", "Animation throttle")));
     n[icon as usize].children.push(throttle);
@@ -505,6 +533,8 @@ pub(super) fn build_nodes(
         ("不限速", "Off", Throttle::Off),
         ("看 CPU", "By CPU", Throttle::Cpu),
         ("看内存", "By memory", Throttle::Memory),
+        ("看倒计时进度", "By countdown", Throttle::Timer),
+        ("固定倍率", "Fixed rate", Throttle::Fixed),
     ] {
         let id = n.len() as i32;
         n.push(button(tr_in(lang, zh, en), Command::SetThrottle(t)));
@@ -545,7 +575,7 @@ mod tests {
 
     /// 默认按中文构建（与 `Config::default().language` 的 resolve 结果同侧）。
     fn nodes(presets: &[u32], gif: bool) -> Vec<Node> {
-        build_nodes(presets, gif, &[], Language::Zh)
+        build_nodes(presets, gif, false, &[], Language::Zh)
     }
 
     #[test]
@@ -688,7 +718,7 @@ mod tests {
             n[n[icon_id as usize].children[expect.len()] as usize].command,
             Some(Command::ToggleNumbers)
         );
-        // 限速那一档是挂在图标内容下面的单选三档
+        // 限速那一档是挂在图标内容下面的单选五档
         let throttle_id = n[icon_id as usize].children[expect.len() + 1];
         assert_eq!(n[throttle_id as usize].label, "动图限速");
         assert_eq!(
@@ -697,6 +727,8 @@ mod tests {
                 Some(Command::SetThrottle(Throttle::Off)),
                 Some(Command::SetThrottle(Throttle::Cpu)),
                 Some(Command::SetThrottle(Throttle::Memory)),
+                Some(Command::SetThrottle(Throttle::Timer)),
+                Some(Command::SetThrottle(Throttle::Fixed)),
             ]
         );
         // 时间格式：三档补零按 PADS 顺序，后面跟两个勾选框
@@ -780,7 +812,7 @@ mod tests {
     /// 英文构建：标签换血，命令一个不换。
     #[test]
     fn english_labels_same_commands() {
-        let n = build_nodes(&Config::default().presets, true, &[], Language::En);
+        let n = build_nodes(&Config::default().presets, true, false, &[], Language::En);
         assert!(
             n.iter()
                 .any(|x| x.command == Some(Command::Start) && x.label == "▶ Start")
@@ -804,7 +836,7 @@ mod tests {
     /// 打勾跟着主循环回填的段号走，不跟点击走。
     #[test]
     fn pomodoro_steps_submenu_follows_the_sequence() {
-        let n = build_nodes(&[60], true, &[1500, 300, 900], Language::Zh);
+        let n = build_nodes(&[60], true, false, &[1500, 300, 900], Language::Zh);
         let menu = n
             .iter()
             .find(|x| x.label == "🍅 番茄分段")
@@ -875,8 +907,9 @@ mod tests {
         assert_eq!(s.pomo_step, Some(2));
     }
 
-    /// 只有单选组该带勾选；动作按钮（开始/暂停/退出/时长预设）不该画成圆点。
-    /// 没配 `tray_gif` 时 GIF 那一档该置灰并在标签上说明原因，其余档不受影响。
+    /// 只有单选组该带勾选；动作按钮（开始/暂停/退出/时长预设/试听）不该画成圆点。
+    /// 没配 `tray_gif` 时 GIF 那一档该置灰并在标签上说明原因，其余档不受影响；
+    /// 没配 `alarm_sound` 时「试听音效」同此规矩。
     #[test]
     fn gif_item_is_disabled_without_a_path() {
         let cfg = Config::default();
@@ -887,6 +920,26 @@ mod tests {
         );
         assert!(s.enabled(&Command::SetIcon(IconMode::Clock)));
         assert!(s.enabled(&Command::SetAlpha(96)), "非图标项不该被牵连");
+        assert!(!s.enabled(&Command::PreviewSound), "没配提示音不该能试听");
+        assert!(
+            State::from_config(&Config {
+                alarm_sound: Some("beep".into()),
+                ..Config::default()
+            })
+            .enabled(&Command::PreviewSound),
+            "配了 beep 就该能试听"
+        );
+        // 置灰的试听项标签该把原因写出来
+        let labelled = nodes(&[60], false);
+        let preview = labelled
+            .iter()
+            .find(|x| x.command == Some(Command::PreviewSound))
+            .expect("菜单里该有试听项");
+        assert!(
+            preview.label.contains("alarm_sound"),
+            "标签该说明为什么不可用: {}",
+            preview.label
+        );
 
         let with = Config {
             tray_gif: Some("~/p/s.gif".into()),
@@ -903,8 +956,8 @@ mod tests {
         let labelled = nodes(&cfg.presets, false);
         let gif = labelled
             .iter()
-            .find(|x| x.label.starts_with("GIF 动图"))
-            .expect("菜单里该有 GIF 项");
+            .find(|x| x.label.starts_with("🌀 动图"))
+            .expect("菜单里该有动图项");
         assert!(
             gif.label.contains("tray_gif"),
             "标签该说明为什么不可用: {}",
@@ -912,17 +965,20 @@ mod tests {
         );
         let ok = nodes(&cfg.presets, true);
         assert_eq!(
-            ok.iter()
-                .find(|x| x.label.starts_with("GIF"))
-                .unwrap()
-                .label,
-            "GIF 动图"
+            ok.iter().find(|x| x.label.starts_with("🌀")).unwrap().label,
+            "🌀 动图（GIF/PNG）"
         );
     }
 
     #[test]
     fn only_radio_items_are_checkable() {
-        let n = build_nodes(&Config::default().presets, true, &[1500, 300], Language::Zh);
+        let n = build_nodes(
+            &Config::default().presets,
+            true,
+            false,
+            &[1500, 300],
+            Language::Zh,
+        );
         for node in &n {
             let Some(cmd) = node.command.as_ref() else {
                 continue;

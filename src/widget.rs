@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::tray::TrayHandle;
 
+use crate::audio;
 use crate::clock;
 use crate::config::{
     COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path, toggle_autostart,
@@ -163,6 +164,8 @@ pub struct Widget {
     last_frame: Option<(String, String, u32, u32, u32, u32)>,
     /// 上一次回填给托盘的番茄段号（变化检测的基准，与 `hidden` 同步回填同手法）。
     last_pomo: Option<usize>,
+    /// 上一次回填给托盘的倒计时进度（`tray_throttle = timer` 的驱动量；只在变化时推）。
+    last_progress: u8,
 }
 
 impl Widget {
@@ -189,6 +192,7 @@ impl Widget {
             reposition: false,
             last_frame: None,
             last_pomo: None,
+            last_progress: 0,
         }
     }
 
@@ -385,6 +389,12 @@ impl Widget {
                 self.config.notify = !self.config.notify;
                 self.persist_appearance();
             }
+            Command::PreviewSound => {
+                // 试听也走真实链路：同一份音量、同一个后台线程，响不响一听就知道
+                if let Some(spec) = &self.config.alarm_sound {
+                    audio::play(spec, self.config.alarm_volume);
+                }
+            }
             Command::ArmFinish(cmd) => self.armed = Some(cmd),
             Command::ToggleAutostart => match toggle_autostart() {
                 Ok(on) => eprintln!(
@@ -519,6 +529,31 @@ impl Widget {
                 tray::sync_pomo(handle, step);
             }
         }
+        // `tray_throttle = timer`：倒计时进度 1% 一格推给托盘（不跑就归 0）。
+        // 托盘侧只存最新值，多实例消息不排队——这是给动画看的新鲜数，不是事件。
+        if self.config.tray_throttle == tray::Throttle::Timer {
+            let pct = match self.timer.mode {
+                Mode::Countdown
+                    if self.timer.running && self.timer.total > 0 && !self.timer.is_done() =>
+                {
+                    (100 - self.timer.display_secs() * 100 / self.timer.total).clamp(0, 100) as u8
+                }
+                Mode::Pomodoro
+                    if self.timer.running && self.timer.total > 0 && !self.timer.is_done() =>
+                {
+                    // 番茄钟的"当前段"进度：total 是阶段时长，语义与 Catime 的
+                    // TIMER 档一致（它按 CLOCK_TOTAL_TIME 算的也是"当前这段"）
+                    (100 - self.timer.display_secs() * 100 / self.timer.total).clamp(0, 100) as u8
+                }
+                _ => 0,
+            };
+            if pct != self.last_progress {
+                self.last_progress = pct;
+                if let Some(handle) = &self.tray {
+                    tray::sync_progress(handle, pct);
+                }
+            }
+        }
         let Some(ev) = self.timer.take_finished() else {
             return;
         };
@@ -573,6 +608,11 @@ impl Widget {
             if let Some(handle) = &self.tray {
                 tray::notify(handle, text, action);
             }
+        }
+        // 提示音与通知各走各的开关（Catime 同构：文件/音量独立于 Toast）。
+        // 内部是后台线程，这里不等它；音量 0 / 未配都不出声。
+        if let Some(spec) = &self.config.alarm_sound {
+            audio::play(spec, self.config.alarm_volume);
         }
         // 锁屏 / 关机 / 打开文件等场景都由用户命令覆盖
         let had_armed = self.armed.is_some();

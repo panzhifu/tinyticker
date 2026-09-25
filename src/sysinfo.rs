@@ -9,6 +9,7 @@ const STAT: &str = "/proc/stat";
 const MEMINFO: &str = "/proc/meminfo";
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
 const NET_DEV: &str = "/proc/net/dev";
+const UPTIME: &str = "/proc/uptime";
 
 /// 一次采样的结果，百分比都是 0-100。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub struct Sources {
     /// 下行 / 上行字节每秒，所有非 loopback 网卡之和。
     pub net_down: u64,
     pub net_up: u64,
+    /// 开机至今的秒数；读不到（奇异的容器）给 0，悬停提示据它省略那行。
+    pub uptime_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,10 +89,14 @@ impl Sampler {
         }
         Sources {
             cpu: self.cpu,
-            mem: read_to_string(MEMINFO).as_deref().and_then(parse_meminfo).unwrap_or(0),
+            mem: read_to_string(MEMINFO)
+                .as_deref()
+                .and_then(parse_meminfo)
+                .unwrap_or(0),
             battery: self.battery,
             net_down: self.net_down,
             net_up: self.net_up,
+            uptime_secs: read_uptime().unwrap_or(0),
         }
     }
 }
@@ -101,6 +108,20 @@ fn read_to_string(path: &str) -> Option<String> {
 fn read_cpu_times() -> Option<(u64, u64)> {
     let text = read_to_string(STAT)?;
     parse_cpu_line(&text)
+}
+
+/// `/proc/uptime` 首 token：`123.45` 这种浮点秒，只取整数部分。
+fn parse_uptime(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .next()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn read_uptime() -> Option<u64> {
+    parse_uptime(&read_to_string(UPTIME)?)
 }
 
 /// `/proc/stat` 首行的 cpu 聚合字段 → `(busy, total)`。
@@ -154,7 +175,9 @@ fn parse_netdev(text: &str) -> Option<(u64, u64)> {
     let mut tx = 0u64;
     let mut seen = false;
     for line in text.lines() {
-        let Some((name, cols)) = line.split_once(':') else { continue };
+        let Some((name, cols)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim();
         if name.is_empty() || name == "lo" {
             continue;
@@ -235,7 +258,8 @@ mod tests {
     fn cpu_line_sums_only_the_first_eight_fields() {
         // total = 1000+0+200+7000+300+50+50+0 = 8600（末尾两个 guest 不计，已含在 user/nice 里）
         // busy  = total - idle - iowait = 8600 - 7000 - 300 = 1300
-        let (busy, total) = parse_cpu_line("cpu  1000 0 200 7000 300 50 50 0 9 9\ncpu0 1 2 3\n").unwrap();
+        let (busy, total) =
+            parse_cpu_line("cpu  1000 0 200 7000 300 50 50 0 9 9\ncpu0 1 2 3\n").unwrap();
         assert_eq!(total, 8600);
         assert_eq!(busy, 1300);
     }
@@ -274,7 +298,10 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
   veth1:  250000    100    0    0    0     0          0         0    10000    100    0    0    0     0       0          0\n";
         assert_eq!(parse_netdev(text), Some((1_250_000, 60_000)));
         // 只有 loopback / 空文件 / 列数不足 / 数字栏是 junk：都没有可信读数
-        assert_eq!(parse_netdev("    lo: 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\n"), None);
+        assert_eq!(
+            parse_netdev("    lo: 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\n"),
+            None
+        );
         assert_eq!(parse_netdev(""), None);
         assert_eq!(parse_netdev("  eth0: 1 2 3\n"), None);
         assert_eq!(
@@ -287,14 +314,23 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
     #[test]
     fn net_rate_uses_the_real_interval() {
         assert_eq!(bytes_per_sec(1000, 0, 1000), 1000);
-        assert_eq!(bytes_per_sec(500, 0, 500), 1000, "半秒读到 500B 该报 1000B/s");
+        assert_eq!(
+            bytes_per_sec(500, 0, 500),
+            1000,
+            "半秒读到 500B 该报 1000B/s"
+        );
         assert_eq!(bytes_per_sec(0, 5000, 1000), 0);
-        assert_eq!(bytes_per_sec(100, 0, 0), 100_000, "间隔下限取 1ms，不许除零");
+        assert_eq!(
+            bytes_per_sec(100, 0, 0),
+            100_000,
+            "间隔下限取 1ms，不许除零"
+        );
     }
 
     #[test]
     fn meminfo_uses_mem_available() {
-        let text = "MemTotal:       16384000 kB\nMemFree:   1024000 kB\nMemAvailable:   4096000 kB\n";
+        let text =
+            "MemTotal:       16384000 kB\nMemFree:   1024000 kB\nMemAvailable:   4096000 kB\n";
         // (16384000 - 4096000) / 16384000 = 75%
         assert_eq!(parse_meminfo(text), Some(75));
     }

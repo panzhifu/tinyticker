@@ -40,6 +40,10 @@ const MAX_PRESETS: usize = 50;
 /// 常用档位要直接看得见，不必多点一层。
 pub const PRESET_PAGE: usize = 20;
 
+/// Fixed 限速档的默认倍率百分数，照 Catime 的 `ANIMATION_FIXED_SPEED_PERCENT` 默认值。
+pub const DEFAULT_GIF_SPEED: u8 = 200;
+const GIF_SPEED_RANGE: (u8, u8) = (10, 200);
+
 /// 番茄钟轮数与组数的上限，免得一个手滑配出几千轮。
 const MAX_ROUNDS: u32 = 100;
 
@@ -324,6 +328,9 @@ pub struct Config {
     pub tray_numbers: bool,
     /// 动图按哪个指标限速（只有 `tray_icon = gif` 时有意义）。
     pub tray_throttle: Throttle,
+    /// `tray_throttle = fixed` 那一档的倍率百分数（对齐 Catime 的
+    /// `ANIMATION_FIXED_SPEED_PERCENT`，默认 200 = 双倍速；10-200 有效）。
+    pub tray_gif_speed: u8,
     /// 番茄钟节奏（专注 / 短休 / 长休 / 每几轮一长休 / 跑几组）。
     pub pomo: Pomo,
     /// 托盘「时长预设」子菜单的档位（秒，按配置顺序），点击即重置并开始。
@@ -340,6 +347,13 @@ pub struct Config {
     pub notify: bool,
     /// 通知正文的自定义写法。空 = 按事件用默认文案（专注完成 / 休息结束 …各说各的）。
     pub notify_text: Option<String>,
+    /// 到点提示音（对齐 Catime 的 `NOTIFICATION_SOUND_FILE`）：`beep` / `SYSTEM_BEEP`
+    /// = 合成两声短音，其它 = WAV 路径（支持 `~/`）；`None`（默认）不出声。
+    /// 只解 WAV——MP3 需要整个解码器，与体积卖点冲突（GAP §八）。
+    pub alarm_sound: Option<String>,
+    /// 提示音音量 0-100（对齐 Catime 的 `NOTIFICATION_SOUND_VOLUME`，默认 100）。
+    /// 0 与"没配"同义：不发播放线程。
+    pub alarm_volume: u8,
     /// 外部文本源文件（可选）。非空时它的第一行会顶替状态行内容；
     /// 支持开头的 `~/`。文件缺失/为空/超限时状态行回到挂件自己的内容。
     pub text_source: Option<String>,
@@ -375,12 +389,15 @@ impl Default for Config {
             tray_gif: None,
             tray_numbers: false,
             tray_throttle: Throttle::default(),
+            tray_gif_speed: DEFAULT_GIF_SPEED,
             pomo: Pomo::default(),
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
             timeout_text: None,
             notify: true,
             notify_text: None,
+            alarm_sound: None,
+            alarm_volume: 100,
             text_source: None,
             text_font: TextFont::default(),
             status_font_px: DEFAULT_STATUS_FONT_PX,
@@ -618,6 +635,13 @@ impl Config {
                         cfg.tray_throttle = t;
                     }
                 }
+                "tray_gif_speed" => {
+                    if let Ok(v) = value.parse::<u8>()
+                        && (GIF_SPEED_RANGE.0..=GIF_SPEED_RANGE.1).contains(&v)
+                    {
+                        cfg.tray_gif_speed = v;
+                    }
+                }
                 "tray_gif" => {
                     if !value.is_empty() {
                         cfg.tray_gif = Some(value.to_string());
@@ -714,6 +738,18 @@ impl Config {
                         cfg.notify_text = Some(value.to_string());
                     }
                 }
+                "alarm_sound" => {
+                    if !value.is_empty() {
+                        cfg.alarm_sound = Some(value.to_string());
+                    }
+                }
+                "alarm_volume" => {
+                    if let Ok(v) = value.parse::<u8>()
+                        && v <= 100
+                    {
+                        cfg.alarm_volume = v;
+                    }
+                }
                 "text_source" => {
                     if !value.is_empty() {
                         cfg.text_source = Some(value.to_string());
@@ -785,6 +821,7 @@ impl Config {
         out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
         out.push_str(&format!("tray_numbers = {}\n", self.tray_numbers));
         out.push_str(&format!("tray_throttle = {}\n", self.tray_throttle.name()));
+        out.push_str(&format!("tray_gif_speed = {}\n", self.tray_gif_speed));
         if let Some(path) = &self.tray_gif {
             out.push_str(&format!("tray_gif = {path}\n"));
         }
@@ -813,6 +850,10 @@ impl Config {
         if let Some(text) = &self.notify_text {
             out.push_str(&format!("notify_text = {text}\n"));
         }
+        if let Some(spec) = &self.alarm_sound {
+            out.push_str(&format!("alarm_sound = {spec}\n"));
+        }
+        out.push_str(&format!("alarm_volume = {}\n", self.alarm_volume));
         if let Some(path) = &self.text_source {
             out.push_str(&format!("text_source = {path}\n"));
         }
@@ -911,6 +952,8 @@ mod tests {
             time_pad: Pad::Full,
             tray_icon: IconMode::Gif,
             tray_gif: Some("~/pics/spin.gif".into()),
+            tray_throttle: Throttle::Fixed,
+            tray_gif_speed: 150,
             pomo: Pomo {
                 work: 1800,
                 short_break: 600,
@@ -924,6 +967,8 @@ mod tests {
             timeout_text: Some("时间到".into()),
             notify: false,
             notify_text: Some("该起来了".into()),
+            alarm_sound: Some("beep".into()),
+            alarm_volume: 60,
             text_source: Some("~/tmp/tinyticker-out.txt".into()),
             window_pos: Some((-10, 200)),
             ..Config::default()

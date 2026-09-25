@@ -7,7 +7,10 @@
 //! - `sys`     系统 API 声明层（dlopen + FFI，无第三方 crate）
 //! - `clock`   本地时间读取（时钟挂件模式）
 //! - `sysinfo` 系统状态采样（CPU / 内存 / 电量，读 /proc 与 /sys）
-//! - `gif`     最小 GIF89a 解码器（托盘动图图标用）
+//! - `anim`    动图帧序列与播放器（GIF / PNG 两容器共用的形状）
+//! - `gif`     最小 GIF89a 解码器
+//! - `png`     最小 PNG/APNG 解码器（zlib inflate + 行滤波）
+//! - `audio`   提示音：WAV 解码 + 合成 beep，ALSA 后台播放（不挡主循环）
 //! - `textsrc` 外部文本源（别的进程写的文件，显示在状态行上）
 //! - `ipc`     命令行意图解析 + 单实例转发（Unix 套接字；二次启动 = 下命令）
 //! - `lang`    托盘文案的双语层（菜单/悬停提示/通知）
@@ -20,6 +23,8 @@
 //! - `wake`    self-pipe 唤醒器（空闲档 1s 心跳下命令也能即时结算）
 //! - `font8x8` 内置 8x8 位图字体
 
+mod anim;
+mod audio;
 mod clock;
 mod config;
 mod effect;
@@ -28,6 +33,7 @@ mod gif;
 mod ipc;
 mod lang;
 mod parse;
+mod png;
 mod render;
 mod sys;
 mod sysinfo;

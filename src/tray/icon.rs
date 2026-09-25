@@ -1,7 +1,7 @@
 //! 32x32 托盘图标的像素绘制，以及悬停提示的文本。全部程序化生成，不引入图片资源。
 
 use super::*;
-use crate::gif;
+use crate::anim;
 use crate::sysinfo;
 
 /// 32x32 时钟图标（深色表盘 + 白色表圈和指针），输出 ARGB32 网络字节序。
@@ -136,9 +136,11 @@ pub(super) fn fmt_rate(bps: u64) -> String {
     format!("{v:.1} {}", UNITS[u])
 }
 
-/// 悬停提示的正文：把已经采到的指标拼成一行。没有电池就不写那一段。
+/// 悬停提示的正文：把已经采到的指标拼成一行，下面接开机时长与（动图档限速生效时）
+/// 当前速率两行——补齐 Catime tooltip 的信息面（`tray_tooltip.c:18-53` 的多行结构）。
 /// 文案走全局语言（托盘线程与主线程同进程，启动时已落定）。
-pub(super) fn tooltip_text(src: &sysinfo::Sources) -> String {
+/// `anim_speed` = 当前生效的动图倍率；只在限速真压下来（<1）时才写那行。
+pub(super) fn tooltip_text(src: &sysinfo::Sources, anim_speed: Option<f64>) -> String {
     use crate::lang::tr;
     let mut s = format!(
         "CPU {}% · {} {}% · ↓ {} ↑ {}",
@@ -156,7 +158,33 @@ pub(super) fn tooltip_text(src: &sysinfo::Sources) -> String {
             if b.charging { "⚡" } else { "" }
         ));
     }
+    if src.uptime_secs > 0 {
+        s.push_str(&format!(
+            "\n{} {}",
+            tr("开机", "up"),
+            fmt_uptime(src.uptime_secs)
+        ));
+    }
+    if let Some(v) = anim_speed {
+        s.push_str(&format!("\n{} {:.2}x", tr("动图速率", "animation"), v));
+    }
     s
+}
+
+/// 开机秒数 → 时长串：天/时/分三档（Catime 的 `AppendUptimeLine` 同款分档，
+/// "3 天" 后面不再跟零头分钟，短串在 tooltip 里更好读）。
+fn fmt_uptime(secs: u64) -> String {
+    use crate::lang::tr_in;
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    // 两种语言各拼一次再选：`tr_in` 返借用，在 match 臂里现造临时串会当场悬掉
+    let (zh, en) = if d > 0 {
+        (format!("{d} 天 {h} 时"), format!("{d}d {h}h"))
+    } else if h > 0 {
+        (format!("{h} 时 {m} 分"), format!("{h}h {m}m"))
+    } else {
+        (format!("{m} 分"), format!("{m}m"))
+    };
+    tr_in(crate::lang::current(), &zh, &en).to_string()
 }
 
 /// 网络水位表的刻度：上下行取大的那个，按**对数**映到 0-100。
@@ -309,11 +337,22 @@ pub(super) fn throttle_speed(percent: u8) -> f64 {
 
 /// 这一拍动图该按几倍速走。抽成函数是为了能测——不然"看哪个指标"这条分支只能靠
 /// 把机器压到 50% 以上才验证得到。
-pub(super) fn play_speed(throttle: Throttle, src: &sysinfo::Sources) -> f64 {
+/// `progress` 是倒计时已完成的百分数（`Timer` 档的驱动量，非跑动时 0）；
+/// `fixed_pct` 是 `tray_gif_speed`（`Fixed` 档的倍率百分数，可 >100 = 双倍速）。
+pub(super) fn play_speed(
+    throttle: Throttle,
+    src: &sysinfo::Sources,
+    progress: u8,
+    fixed_pct: u8,
+) -> f64 {
     match throttle {
         Throttle::Off => 1.0,
         Throttle::Cpu => throttle_speed(src.cpu),
         Throttle::Memory => throttle_speed(src.mem),
+        // Catime 的 TIMER 档：进度当负载送进同一条曲线（0% 原速，100% 最慢）
+        Throttle::Timer => throttle_speed(progress.min(100)),
+        // FIXED 档：不跟指标，直接按配置倍率（config 侧已夹在 10-200，这里再挡一手）
+        Throttle::Fixed => f64::from(fixed_pct.min(250)) / 100.0,
     }
 }
 
@@ -322,7 +361,7 @@ pub(super) fn icon_pixmap(
     mode: IconMode,
     src: &sysinfo::Sources,
     now: (u32, u32, u32),
-    player: &mut gif::Player,
+    player: &mut anim::Player,
     numbers: bool,
 ) -> (i32, i32, Vec<u8>) {
     match mode {
@@ -351,7 +390,7 @@ pub(super) fn icon_pixmap(
 
 /// 把动图的一帧最近邻采样到 32x32 并转成 SNI 的 A,R,G,B 字节序。
 /// 尺寸固定成 32 是为了不动 `PIX_W`/`PIX_H`：宿主自己会再缩放，我们只保证一格一像素。
-pub(super) fn gif_pixmap(frame: &gif::Frame, width: u16, height: u16) -> Vec<u8> {
+pub(super) fn gif_pixmap(frame: &anim::Frame, width: u16, height: u16) -> Vec<u8> {
     let (fw, fh) = (usize::from(width), usize::from(height));
     let mut px = vec![0u8; S * S * 4];
     for y in 0..S {
@@ -482,7 +521,7 @@ mod tests {
         );
     }
 
-    /// 提示正文：没电池就不写那一段，有就把充电标记带上。
+    /// 提示正文：没电池就不写那一段，有就把充电标记带上；uptime 为 0 时不写开机行。
     #[test]
     fn tooltip_lists_what_was_sampled() {
         let src = sysinfo::Sources {
@@ -491,9 +530,10 @@ mod tests {
             battery: None,
             net_down: 1024 * 1024,
             net_up: 2048,
+            uptime_secs: 0,
         };
         assert_eq!(
-            tooltip_text(&src),
+            tooltip_text(&src, None),
             "CPU 12% · 内存 44% · ↓ 1.0 MB/s ↑ 2048 B/s"
         );
         let with_batt = sysinfo::Sources {
@@ -504,9 +544,24 @@ mod tests {
             ..src
         };
         assert!(
-            tooltip_text(&with_batt).ends_with("· 电池 87%⚡"),
+            tooltip_text(&with_batt, None).ends_with("· 电池 87%⚡"),
             "充电标记该在末尾"
         );
+        // 开机行：uptime>0 才出现，接在正文下一行；速率行只在给值时写
+        let up = sysinfo::Sources {
+            uptime_secs: 90_061,
+            ..src
+        };
+        let tip = tooltip_text(&up, Some(0.42));
+        assert!(tip.contains("\n开机 1 天 1 时"), "天数档该舍到小时: {tip}");
+        assert!(tip.contains("动图速率 0.42x"), "速率行没写: {tip}");
+        assert!(
+            !tooltip_text(&up, None).contains("速率"),
+            "没限速就不许多那行"
+        );
+        assert_eq!(fmt_uptime(59 * 60), "59 分", "小时以下只念分");
+        assert_eq!(fmt_uptime(3_700), "1 时 1 分");
+        assert_eq!(fmt_uptime(90_061), "1 天 1 时");
     }
 
     /// 网络水位是对数刻度：静默归零、区间内分得开、封顶不溢出。
@@ -573,10 +628,31 @@ mod tests {
             net_down: 0,
             net_up: 0,
             battery: None,
+            uptime_secs: 0,
         };
-        assert_eq!(play_speed(Throttle::Off, &src), 1.0, "关掉限速就该原速");
-        assert!(play_speed(Throttle::Cpu, &src) < 0.5, "CPU 90% 该慢下来");
-        assert_eq!(play_speed(Throttle::Memory, &src), 1.0, "内存 10% 不该动");
+        assert_eq!(
+            play_speed(Throttle::Off, &src, 0, 200),
+            1.0,
+            "关掉限速就该原速"
+        );
+        assert!(
+            play_speed(Throttle::Cpu, &src, 0, 200) < 0.5,
+            "CPU 90% 该慢下来"
+        );
+        assert_eq!(
+            play_speed(Throttle::Memory, &src, 0, 200),
+            1.0,
+            "内存 10% 不该动"
+        );
+        // Timer 档：进度 90% 走曲线的重负载端，0 进度原速
+        assert!(
+            play_speed(Throttle::Timer, &src, 90, 200) < 0.5,
+            "进度 90% 该慢下来"
+        );
+        assert_eq!(play_speed(Throttle::Timer, &src, 0, 200), 1.0);
+        // Fixed 档：默认 200% = 双倍速（与 Catime 的 ANIMATION_FIXED_SPEED 默认一致）
+        assert!((play_speed(Throttle::Fixed, &src, 0, 200) - 2.0).abs() < 1e-9);
+        assert!((play_speed(Throttle::Fixed, &src, 0, 25) - 0.25).abs() < 1e-9);
     }
 
     /// 限速曲线：半载以下完全不干预，之后线性掉到 1/4 速，且不许掉成负数。

@@ -10,10 +10,11 @@
 //! 再顺序合成为整幅画面。合成交给调用方的帧已经是完整 RGBA，调用方不需要懂
 //! 子矩形与回滚。
 
-use crate::config;
-use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use crate::anim::{Animation, Frame};
+use std::time::Duration;
+
+// 帧序列类型、播放器与大小上限都住在 [`crate::anim`]：GIF 与 PNG 两种容器共用
+// 同一个形状，托盘那侧不需要知道手里的是哪一种。
 
 /// 画布像素上限。托盘图标只有 32x32，更大的图拒收。
 const MAX_PIXELS: u32 = 128 * 128;
@@ -22,42 +23,6 @@ const MAX_FRAMES: usize = 64;
 /// LZW 码最长 12 位，字典因此封顶。
 const MAX_CODE: usize = 4096;
 const NO_PREFIX: u16 = u16::MAX;
-
-pub struct Frame {
-    /// 整幅画布的 RGBA，长度 = 画布宽 × 高 × 4（尺寸在 [`Animation`] 上）
-    pub rgba: Vec<u8>,
-    pub delay: Duration,
-}
-
-pub struct Animation {
-    pub width: u16,
-    pub height: u16,
-    pub frames: Vec<Frame>,
-}
-
-impl Animation {
-    /// 播放到 `elapsed` 时刻该显示第几帧（循环播放）。
-    pub fn frame_at(&self, elapsed: Duration) -> usize {
-        if self.frames.len() <= 1 {
-            return 0;
-        }
-        // Duration 不支持取余，一律换成毫秒整数
-        let ms = |d: Duration| d.as_millis() as u64;
-        let total: u64 = self.frames.iter().map(|f| ms(f.delay)).sum();
-        if total == 0 {
-            return 0;
-        }
-        let mut t = ms(elapsed) % total;
-        for (i, f) in self.frames.iter().enumerate() {
-            let d = ms(f.delay);
-            if t < d {
-                return i;
-            }
-            t -= d;
-        }
-        self.frames.len() - 1
-    }
-}
 
 /// 一个图像块的原样内容（尚未合成）。
 struct Raw {
@@ -73,64 +38,6 @@ struct Raw {
     delay: Duration,
     /// 0/1 原地留着，2 退回背景，3 退回画之前
     disposal: u8,
-}
-
-/// 单个 GIF 的文件大小上限。动图比文本大得多，但仍要挡住随手指向一个巨型文件。
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-
-/// 一个动图文件 + 播放进度。文件换了就重新解码。
-pub struct Player {
-    path: Option<PathBuf>,
-    stamp: Option<(u64, SystemTime)>,
-    anim: Option<Animation>,
-    /// 动画自己的虚拟时钟。限速时它走得比墙钟慢，于是画面是"变慢"而不是"跳帧"。
-    vclock: Duration,
-    last: Instant,
-}
-
-impl Player {
-    pub fn new(raw: Option<&str>) -> Self {
-        Self {
-            path: raw.map(config::expand_tilde).filter(|p| !p.as_os_str().is_empty()),
-            stamp: None,
-            anim: None,
-            vclock: Duration::ZERO,
-            last: Instant::now(),
-        }
-    }
-
-    /// 按 `speed`（0-1 的倍率）推进虚拟时钟。每次取帧之前调用一次。
-    pub fn advance(&mut self, speed: f64) {
-        let now = Instant::now();
-        let dt = now.saturating_duration_since(self.last);
-        self.last = now;
-        self.vclock += dt.mul_f64(speed.clamp(0.0, 1.0));
-    }
-
-    /// 当前该显示的一帧及其画布尺寸；文件不可用或解不出时 `None`（调用方该退回静态图标）。
-    pub fn current(&mut self) -> Option<(&Frame, u16, u16)> {
-        let path = self.path.as_ref()?;
-        if let Ok(meta) = fs::metadata(path) {
-            let stamp = (meta.len(), meta.modified().ok()?);
-            if Some(stamp) != self.stamp {
-                self.stamp = Some(stamp);
-                self.anim = None;
-                // 换文件等于换一段动画，时钟要从零走
-                self.vclock = Duration::ZERO;
-                if meta.len() > MAX_FILE_BYTES {
-                    eprintln!("⚠️ tray_gif 超过 {MAX_FILE_BYTES} 字节，忽略：{}", path.display());
-                } else if let Some(a) = fs::read(path).ok().as_deref().and_then(decode) {
-                    self.anim = Some(a);
-                }
-            }
-        } else {
-            self.stamp = None;
-            self.anim = None;
-        }
-        let anim = self.anim.as_ref()?;
-        let frame = anim.frames.get(anim.frame_at(self.vclock)).or(anim.frames.first())?;
-        Some((frame, anim.width, anim.height))
-    }
 }
 
 pub fn decode(bytes: &[u8]) -> Option<Animation> {
@@ -188,9 +95,16 @@ fn composite(width: u16, height: u16, raws: Vec<Raw>) -> Animation {
     let mut frames = Vec::with_capacity(raws.len());
     for raw in raws {
         // 处置方式作用于「本帧显示之后」，而快照此刻已经取好，所以立刻执行等价
-        let saved = if raw.disposal == 3 { Some(region(&canvas, &raw, width)) } else { None };
+        let saved = if raw.disposal == 3 {
+            Some(region(&canvas, &raw, width))
+        } else {
+            None
+        };
         draw(&mut canvas, &raw, width, height);
-        frames.push(Frame { rgba: canvas.clone(), delay: raw.delay });
+        frames.push(Frame {
+            rgba: canvas.clone(),
+            delay: raw.delay,
+        });
         match raw.disposal {
             2 => erase(&mut canvas, &raw, width),
             3 => {
@@ -201,7 +115,11 @@ fn composite(width: u16, height: u16, raws: Vec<Raw>) -> Animation {
             _ => {}
         }
     }
-    Animation { width, height, frames }
+    Animation {
+        width,
+        height,
+        frames,
+    }
 }
 
 fn draw(canvas: &mut [u8], raw: &Raw, canvas_w: u16, canvas_h: u16) {
@@ -211,7 +129,9 @@ fn draw(canvas: &mut [u8], raw: &Raw, canvas_w: u16, canvas_h: u16) {
             continue;
         }
         let entry = usize::from(index) * 3;
-        let Some(rgb) = raw.palette.get(entry..entry + 3) else { continue };
+        let Some(rgb) = raw.palette.get(entry..entry + 3) else {
+            continue;
+        };
         let (sx, sy) = map_pixel(i, w, usize::from(raw.height), raw.interlaced);
         let dx = usize::from(raw.left) + sx;
         let dy = usize::from(raw.top) + sy;
@@ -258,7 +178,9 @@ fn region(canvas: &[u8], raw: &Raw, canvas_w: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(usize::from(raw.width) * usize::from(raw.height) * 4);
     for y in 0..usize::from(raw.height) {
         for x in 0..usize::from(raw.width) {
-            let s = ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x) * 4;
+            let s =
+                ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x)
+                    * 4;
             out.extend_from_slice(canvas.get(s..s + 4).unwrap_or(&[0; 4]));
         }
     }
@@ -269,8 +191,12 @@ fn restore(canvas: &mut [u8], buf: &[u8], raw: &Raw, canvas_w: u16) {
     for y in 0..usize::from(raw.height) {
         for x in 0..usize::from(raw.width) {
             let s = (y * usize::from(raw.width) + x) * 4;
-            let d = ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x) * 4;
-            let Some(px) = buf.get(s..s + 4) else { continue };
+            let d =
+                ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x)
+                    * 4;
+            let Some(px) = buf.get(s..s + 4) else {
+                continue;
+            };
             if let Some(slot) = canvas.get_mut(d..d + 4) {
                 slot.copy_from_slice(px);
             }
@@ -282,7 +208,9 @@ fn restore(canvas: &mut [u8], buf: &[u8], raw: &Raw, canvas_w: u16) {
 fn erase(canvas: &mut [u8], raw: &Raw, canvas_w: u16) {
     for y in 0..usize::from(raw.height) {
         for x in 0..usize::from(raw.width) {
-            let d = ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x) * 4;
+            let d =
+                ((usize::from(raw.top) + y) * usize::from(canvas_w) + usize::from(raw.left) + x)
+                    * 4;
             if let Some(slot) = canvas.get_mut(d..d + 4) {
                 slot.copy_from_slice(&[0; 4]);
             }
@@ -314,8 +242,16 @@ fn parse_gce(bytes: &[u8], pos: usize) -> Option<(Duration, u8, Option<u8>)> {
     }
     let cs = u32::from(b[2]) | (u32::from(b[3]) << 8);
     // delay=0 的 GIF 满屏都是，按老规矩当 100ms
-    let delay = if cs == 0 { Duration::from_millis(100) } else { Duration::from_millis(u64::from(cs) * 10) };
-    Some((delay, b[1] & 7, if b[1] & 0x10 != 0 { Some(b[4]) } else { None }))
+    let delay = if cs == 0 {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_millis(u64::from(cs) * 10)
+    };
+    Some((
+        delay,
+        b[1] & 7,
+        if b[1] & 0x10 != 0 { Some(b[4]) } else { None },
+    ))
 }
 
 fn parse_image(
@@ -449,11 +385,25 @@ fn lzw_decode(data: &[u8], min_code_size: u8, expect: usize) -> Option<Vec<u8>> 
             return None;
         };
         if !defined {
-            add_entry(&mut prefix, &mut suffix, &mut dict_size, &mut code_size, prev?, first)?;
+            add_entry(
+                &mut prefix,
+                &mut suffix,
+                &mut dict_size,
+                &mut code_size,
+                prev?,
+                first,
+            )?;
         }
         emit(&mut out, &prefix, &suffix, code)?;
         if defined && let Some(p) = prev {
-            add_entry(&mut prefix, &mut suffix, &mut dict_size, &mut code_size, p, first)?;
+            add_entry(
+                &mut prefix,
+                &mut suffix,
+                &mut dict_size,
+                &mut code_size,
+                p,
+                first,
+            )?;
         }
         prev = Some(code);
     }
@@ -526,35 +476,52 @@ fn chain_first(prefix: &[u16], suffix: &[u8], code: u16) -> Option<u8> {
 mod tests {
     use super::*;
 
-    /// 限速靠虚拟时钟实现：倍率 0 时它一步都不许走，越界的倍率要夹住。
-    #[test]
-    fn player_clock_advances_by_the_speed_only() {
-        let mut p = Player::new(None);
-        for _ in 0..4 {
-            p.advance(0.0);
-        }
-        assert_eq!(p.vclock, Duration::ZERO, "0 速时虚拟时钟不许前进");
-        p.advance(-1.0);
-        assert_eq!(p.vclock, Duration::ZERO, "负倍率该被夹到 0");
-        // 1 倍速就是墙钟，四则之内不许跑出几十毫秒
-        p.advance(9.0);
-        assert!(p.vclock < Duration::from_millis(200), "超 1 的倍率该被夹到 1: {:?}", p.vclock);
-    }
-
     // 素材由 ImageMagick 生成，期望值取自 magick 自己的解码结果（它是已知正确的解码器）
     const M2: &[u8] = include_bytes!("../tests/fixtures/m2.gif");
     const INTER: &[u8] = include_bytes!("../tests/fixtures/inter.gif");
     const TRANS: &[u8] = include_bytes!("../tests/fixtures/trans.gif");
     const BIG: &[u8] = include_bytes!("../tests/fixtures/big.gif");
     /// 单帧 4x2，索引 5 带透明标志位。magick 不肯写这个位，透明只能自己造字节测。
-    const TINY: &[u8] = &[0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b, 0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36, 0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1, 0x1b, 0x21, 0xf9, 0x04, 0x11, 0x08, 0x00, 0x05, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x10, 0x14, 0x10, 0x04, 0x28, 0x23, 0x02, 0x00, 0x3b];
+    const TINY: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b,
+        0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36,
+        0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1,
+        0x1b, 0x21, 0xf9, 0x04, 0x11, 0x08, 0x00, 0x05, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x10, 0x14, 0x10, 0x04, 0x28, 0x23, 0x02, 0x00, 0x3b,
+    ];
     /// 两帧，第二帧是 2x2 子矩形 + disposal=1：右半必须留着第一帧的颜色。
-    const TINY_LEAVE: &[u8] = &[0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b, 0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36, 0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1, 0x1b, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x30, 0x84, 0x10, 0x42, 0x08, 0x21, 0x02, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x04, 0x04, 0xf0, 0x9c, 0x73, 0x22, 0x00, 0x3b];
+    const TINY_LEAVE: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b,
+        0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36,
+        0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1,
+        0x1b, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x30, 0x84, 0x10, 0x42, 0x08, 0x21, 0x02, 0x00, 0x21,
+        0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02,
+        0x00, 0x00, 0x04, 0x04, 0xf0, 0x9c, 0x73, 0x22, 0x00, 0x3b,
+    ];
     /// 三帧，第二帧 disposal=2：它画过的左半该被擦回透明，第三帧时左半空、右半是索引 3。
-    const TINY_ERASE: &[u8] = &[0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b, 0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36, 0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1, 0x1b, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x30, 0x84, 0x10, 0x42, 0x08, 0x21, 0x02, 0x00, 0x21, 0xf9, 0x04, 0x02, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x04, 0x04, 0xf0, 0x9c, 0x73, 0x22, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x04, 0x04, 0x70, 0x8c, 0x31, 0x22, 0x00, 0x3b];
+    const TINY_ERASE: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0x83, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x11, 0x1f, 0x35, 0x22, 0x3e, 0x6a, 0x33, 0x5d, 0x9f, 0x44, 0x7c, 0xd4, 0x55, 0x9b,
+        0x09, 0x66, 0xba, 0x3e, 0x77, 0xd9, 0x73, 0x88, 0xf8, 0xa8, 0x99, 0x17, 0xdd, 0xaa, 0x36,
+        0x12, 0xbb, 0x55, 0x47, 0xcc, 0x74, 0x7c, 0xdd, 0x93, 0xb1, 0xee, 0xb2, 0xe6, 0xff, 0xd1,
+        0x1b, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x02, 0x00, 0x00, 0x04, 0x07, 0x30, 0x84, 0x10, 0x42, 0x08, 0x21, 0x02, 0x00, 0x21,
+        0xf9, 0x04, 0x02, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02,
+        0x00, 0x00, 0x04, 0x04, 0xf0, 0x9c, 0x73, 0x22, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x05, 0x00,
+        0x00, 0x00, 0x2c, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x04, 0x04, 0x70,
+        0x8c, 0x31, 0x22, 0x00, 0x3b,
+    ];
     fn px(a: &Animation, i: usize, x: u16, y: u16) -> [u8; 4] {
         let o = (usize::from(y) * usize::from(a.width) + usize::from(x)) * 4;
-        [a.frames[i].rgba[o], a.frames[i].rgba[o + 1], a.frames[i].rgba[o + 2], a.frames[i].rgba[o + 3]]
+        [
+            a.frames[i].rgba[o],
+            a.frames[i].rgba[o + 1],
+            a.frames[i].rgba[o + 2],
+            a.frames[i].rgba[o + 3],
+        ]
     }
 
     #[test]
@@ -576,7 +543,10 @@ mod tests {
         let inter = decode(INTER).expect("交错 GIF 该能解");
         assert_eq!(inter.frames.len(), 2);
         for i in 0..2 {
-            assert_eq!(inter.frames[i].rgba, plain.frames[i].rgba, "第 {i} 帧去交错结果不一致");
+            assert_eq!(
+                inter.frames[i].rgba, plain.frames[i].rgba,
+                "第 {i} 帧去交错结果不一致"
+            );
         }
     }
 
@@ -602,7 +572,11 @@ mod tests {
         let k = off.windows(2).position(|w| w == [0x21, 0xf9]).unwrap();
         off[k + 3] &= !0x10;
         let a = decode(&off).expect("清掉标志位也该能解");
-        assert_eq!(px(&a, 0, 1, 0), [85, 155, 9, 255], "标志位清了还跳过，就是把无关索引当透明用了");
+        assert_eq!(
+            px(&a, 0, 1, 0),
+            [85, 155, 9, 255],
+            "标志位清了还跳过，就是把无关索引当透明用了"
+        );
     }
 
     /// disposal=1（do not dispose）：上一帧留在底下。
@@ -651,7 +625,10 @@ mod tests {
             for n in 0..src.len() {
                 // 只要求不 panic、不返回越界的帧；能不能解出来不作保证
                 if let Some(a) = decode(&src[..n]) {
-                    assert_eq!(a.frames[0].rgba.len(), usize::from(a.width) * usize::from(a.height) * 4);
+                    assert_eq!(
+                        a.frames[0].rgba.len(),
+                        usize::from(a.width) * usize::from(a.height) * 4
+                    );
                 }
             }
         }

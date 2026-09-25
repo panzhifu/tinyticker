@@ -92,6 +92,17 @@ pub fn set(lang: Language) {
     LANG.store(code(lang.resolve()), Ordering::Relaxed);
 }
 
+/// 当前全局语言（已 `resolve`）。给 tooltip 时长串这类不便显式传参的拼串处用；
+/// 单测只读不写——谁在测试里翻 `set()` 就会把断言中文标签的并行测试变成随机爆。
+#[must_use]
+pub fn current() -> Language {
+    if LANG.load(Ordering::Relaxed) == 0 {
+        Language::Zh
+    } else {
+        Language::En
+    }
+}
+
 /// 显式语言版词条。**菜单节点的标签全走这一条**：`build_nodes` 收一个 `Language`
 /// 参数，于是单测断言具体字面量时不必碰进程级全局，并行测试也不会互相掰语言。
 #[must_use]

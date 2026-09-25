@@ -40,9 +40,9 @@ use wire::{
     variant_bool, variant_objpath, variant_str,
 };
 
+use crate::anim;
 use crate::config::Config;
 use crate::effect::Effect;
-use crate::gif;
 use crate::lang::Language;
 use crate::render::Pad;
 use crate::sys::dbus as d;
@@ -50,6 +50,7 @@ use crate::sys::dbus::{DBus, DBusError, DBusMessage, DBusMessageIter, DBusObject
 use crate::sysinfo;
 use crate::timer::Mode;
 use crate::wake::WakeSender;
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -101,6 +102,9 @@ pub enum Command {
     SetHidden(bool),
     /// 切换编辑态（托盘那一项用；只存在于内存里，**不进配置**）。
     ToggleEdit,
+    /// 按当前配置播一次提示音（托盘「试听音效」）——用户刚改完 `alarm_sound`/音量，
+    /// 不用等计时结束就能确认它响不响。
+    PreviewSound,
     /// 把编辑态设成给定值——`tinyticker --edit` / `--no-edit`，可重复执行。
     SetEdit(bool),
     /// 切换计时结束时发不发桌面通知（写回 `notify`）。
@@ -158,7 +162,8 @@ impl IconMode {
     }
 }
 
-/// 托盘动图按哪个指标限速，对应配置项 `tray_throttle`。
+/// 托盘动图按哪个指标限速，对应配置项 `tray_throttle`。档名与取值对齐 Catime 的
+/// `ANIMATION_SPEED_METRIC`（`include/config/config_types.h:24-30`）。
 ///
 /// 只管 `tray_icon = gif` 那一档：静态图标没有"速率"可以慢下来。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,6 +175,12 @@ pub enum Throttle {
     Cpu,
     /// 看内存占用。
     Memory,
+    /// 看倒计时进度（Catime 的 `TIMER` 档）：elapsed/total 当负载百分数送进同一条
+    /// 曲线——计时越到后段动图越慢。非倒计时跑动时按 0 处理（原速）。
+    Timer,
+    /// 固定倍率（Catime 的 `FIXED` 档）：不跟任何指标，直接按 `tray_gif_speed` 走。
+    /// 这一档可以超过 1.0（双倍速），也是五档里唯一会变快的。
+    Fixed,
 }
 
 impl Throttle {
@@ -178,6 +189,8 @@ impl Throttle {
             "off" => Some(Throttle::Off),
             "cpu" => Some(Throttle::Cpu),
             "memory" => Some(Throttle::Memory),
+            "timer" => Some(Throttle::Timer),
+            "fixed" => Some(Throttle::Fixed),
             _ => None,
         }
     }
@@ -187,6 +200,8 @@ impl Throttle {
             Throttle::Off => "off",
             Throttle::Cpu => "cpu",
             Throttle::Memory => "memory",
+            Throttle::Timer => "timer",
+            Throttle::Fixed => "fixed",
         }
     }
 }
@@ -226,6 +241,8 @@ enum TrayMsg {
     SyncConfig(Box<Config>),
     /// `pomo_seq` 当前段号（计时器的真值，主循环变化时推一次）。
     SyncPomo(Option<usize>),
+    /// 倒计时进度（0-100），只在 `tray_throttle = timer` 时有意义；主循环按变化推。
+    SyncProgress(u8),
 }
 
 /// 一条待发的通知。
@@ -245,6 +262,10 @@ struct Server {
     presets: Vec<u32>,
     pomo_seq: Vec<u32>,
     lang: Language,
+    /// `tray_throttle = timer` 的驱动量：主循环按 1% 一格回填。
+    progress: Cell<u8>,
+    /// `tray_gif_speed`（Fixed 档倍率），随 SyncConfig 更新。
+    fixed_pct: std::cell::Cell<u8>,
     /// 32x32 图标的 ARGB32 网络字节序像素
     pixmap: Vec<u8>,
     /// 菜单 `checked` 与图标内容的依据。只在托盘线程上读写，`RefCell` 足够。
@@ -266,6 +287,8 @@ struct Boot {
     pomo_seq: Vec<u32>,
     lang: Language,
     gif_path: Option<String>,
+    /// `tray_gif_speed`：Fixed 限速档的倍率百分数，热加载可改。
+    fixed_pct: u8,
 }
 
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
@@ -284,6 +307,7 @@ pub fn spawn(
         pomo_seq: cfg.pomo.seq.clone(),
         lang: cfg.language.resolve(),
         gif_path: cfg.tray_gif.clone(),
+        fixed_pct: cfg.tray_gif_speed,
     };
     thread::spawn(move || {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel::<TrayMsg>();
@@ -311,6 +335,11 @@ pub fn sync_edit(handle: &TrayHandle, on: bool) {
 /// 同上，「隐藏挂件」那一格。
 pub fn sync_hidden(handle: &TrayHandle, hidden: bool) {
     let _ = handle.tx.send(TrayMsg::SyncHidden(hidden));
+}
+
+/// 倒计时进度变了推一次（`tray_throttle = timer` 的驱动源；1% 一格，不每秒刷屏）。
+pub fn sync_progress(handle: &TrayHandle, percent: u8) {
+    let _ = handle.tx.send(TrayMsg::SyncProgress(percent));
 }
 
 /// 用一份新配置回填托盘：勾选格全部对齐、菜单节点按新语言重建。
@@ -342,6 +371,7 @@ fn run(
         pomo_seq,
         lang,
         gif_path,
+        fixed_pct,
     } = boot;
     let dbus: &'static DBus = Box::leak(Box::new(DBus::load().ok_or("打不开 libdbus-1.so.3")?));
     let mut err = DBusError::zeroed();
@@ -350,7 +380,7 @@ fn run(
         return Err(format!("连不上会话总线: {}", err.describe()));
     }
     let mut sampler = sysinfo::Sampler::new();
-    let mut player = gif::Player::new(gif_path.as_deref());
+    let mut player = anim::Player::new(gif_path.as_deref());
     let (_, _, pixmap) = icon_pixmap(
         state.icon,
         &sampler.sample(),
@@ -358,7 +388,7 @@ fn run(
         &mut player,
         state.numbers,
     );
-    let nodes = build_nodes(&presets, state.gif, &pomo_seq, lang);
+    let nodes = build_nodes(&presets, state.gif, state.sound, &pomo_seq, lang);
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
@@ -367,6 +397,8 @@ fn run(
         presets,
         pomo_seq,
         lang,
+        progress: Cell::new(0),
+        fixed_pct: Cell::new(fixed_pct),
         pixmap,
         state: std::cell::RefCell::new(state),
         tooltip: std::cell::RefCell::new(String::new()),
@@ -415,14 +447,18 @@ fn run(
                 TrayMsg::SyncEdit(on) => unsafe { (*server).state.borrow_mut().edit = on },
                 TrayMsg::SyncHidden(v) => unsafe { (*server).state.borrow_mut().hidden = v },
                 TrayMsg::SyncPomo(step) => unsafe { (*server).state.borrow_mut().pomo_step = step },
+                TrayMsg::SyncProgress(p) => unsafe { (*server).progress.set(p) },
                 TrayMsg::SyncConfig(cfg) => unsafe {
                     let s = &mut *server;
                     s.state.borrow_mut().resync(&cfg);
                     // 序列变了要重造的子菜单不只是勾选：段数本身是菜单结构
                     s.pomo_seq = cfg.pomo.seq.clone();
                     s.lang = cfg.language.resolve();
+                    s.fixed_pct.set(cfg.tray_gif_speed);
                     let gif = s.state.borrow().gif;
-                    s.nodes = build_nodes(&s.presets.clone(), gif, &s.pomo_seq.clone(), s.lang);
+                    let sound = s.state.borrow().sound;
+                    s.nodes =
+                        build_nodes(&s.presets.clone(), gif, sound, &s.pomo_seq.clone(), s.lang);
                 },
             }
         }
@@ -430,8 +466,22 @@ fn run(
         if icon_at.elapsed() >= ICON_EVERY {
             icon_at = Instant::now();
             sources = sampler.sample();
-            // 悬停提示跟着采样走：宿主只在收到 NewToolTip 时才回读 ToolTip 属性
-            let tip = tooltip_text(&sources);
+            // 悬停提示跟着采样走：宿主只在收到 NewToolTip 时才回读 ToolTip 属性。
+            // 动图档且限速开着时多一行当前倍率（Catime 的 tooltip 有这一行）
+            let (tip_mode, tip_throttle) = {
+                let st = unsafe { (*server).state.borrow() };
+                (st.icon, st.throttle)
+            };
+            let anim_speed =
+                (tip_mode == IconMode::Gif && tip_throttle != Throttle::Off).then(|| {
+                    play_speed(
+                        tip_throttle,
+                        &sources,
+                        unsafe { (*server).progress.get() },
+                        unsafe { (*server).fixed_pct.get() },
+                    )
+                });
+            let tip = tooltip_text(&sources, anim_speed);
             let changed = unsafe {
                 let cell = &mut *server;
                 let mut slot = cell.tooltip.borrow_mut();
@@ -453,7 +503,13 @@ fn run(
         };
         // 倍率每轮都推进虚拟时钟（哪怕当前不是动图档）：只在切到动图时才推的话，
         // 从"不限速"切回来那一刻帧序会按累计的墙钟跳一大段
-        player.advance(play_speed(throttle, &sources));
+        let speed = play_speed(
+            throttle,
+            &sources,
+            unsafe { (*server).progress.get() },
+            unsafe { (*server).fixed_pct.get() },
+        );
+        player.advance(speed);
         let (_, _, px) = icon_pixmap(
             mode,
             &sources,

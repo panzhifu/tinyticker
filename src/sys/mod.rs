@@ -9,6 +9,7 @@
 // 这里是对 C 头的镜像：常量与符号按协议/头文件列全，用不到的也会被报死代码。
 #![allow(dead_code)]
 
+pub mod alsa;
 pub mod dbus;
 pub mod freetype;
 pub mod wayland;
@@ -89,4 +90,3 @@ impl Lib {
         (!p.is_null()).then_some(p)
     }
 }
-
