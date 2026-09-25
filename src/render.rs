@@ -17,18 +17,87 @@ pub const fn premultiply(color: u32, alpha: u8) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
 }
 
-/// 解析 `"#RRGGBB"` / `"0xRRGGBB"` / `"RRGGBB"` 颜色。
+/// CSS 颜色名。取值逐条照 Catime 的 `CSS_COLORS[]`（`src/color/color_parser.c:33-43`）
+/// 抄——那 30 条就是它全部的名表，所以它配置里的颜色串能直接搬过来。比对时忽略
+/// 大小写，所以 `Red` / `RED` / `red` 都收（它 `strcmp` 只认小写）。
+///
+/// 表压成一条 `"name=rrggbb …"` 而不是 30 个 `(&str, u32)`：后者每条要一对胖指针再
+/// 加对齐，实测光那 30 条数组就多占 1.1 KB。
+const NAMED: &str =
+    "white=ffffff black=000000 red=ff0000 lime=00ff00 blue=0000ff yellow=ffff00 cyan=00ffff magenta=ff00ff silver=c0c0c0 gray=808080 maroon=800000 olive=808000 green=008000 purple=800080 teal=008080 navy=000080 orange=ffa500 pink=ffc0cb brown=a52a2a violet=ee82ee indigo=4b0082 gold=ffd700 coral=ff7f50 salmon=fa8072 khaki=f0e68c plum=dda0dd azure=f0ffff ivory=fffff0 wheat=f5deb3 snow=fffafa";
+
+/// 解析颜色，四种写法都收：
+/// - `#RRGGBB` / `0xRRGGBB` / 裸 6 位十六进制
+/// - `#RGB` 三位的简写（每位翻倍展开，与 CSS 同规则）
+/// - CSS 颜色名（那 30 条，大小写无关）
+/// - `rgb(255, 94, 150)`，以及省掉前缀的裸三元组（分隔符见 [`parse_triplet`]）
+///
+/// 认不出来就返回 `None`，由配置层回落默认值。
 pub fn parse_color(s: &str) -> Option<u32> {
     let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(c) = named_color(s) {
+        return Some(c);
+    }
+    if let Some(triplet) = parse_triplet(s) {
+        return Some(triplet);
+    }
     let hex = s
         .strip_prefix('#')
         .or_else(|| s.strip_prefix("0x"))
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
+    // 三位简写：`#f57` 就是 `#ff5577`，每位乘 17 正好是把那个半字节复制一遍
+    if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let nib = |i: usize| u32::from_str_radix(&hex[i..i + 1], 16).ok().map(|v| v * 17);
+        return Some(rgb(nib(0)?, nib(1)?, nib(2)?));
+    }
     if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
+}
+
+/// 查 CSS 名表。大小写无关，靠比较时忽略而不是先转小写——转小写要为一次颜色解析
+/// 分配一块 `String`。
+fn named_color(s: &str) -> Option<u32> {
+    NAMED.split(' ').find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        if !name.eq_ignore_ascii_case(s) {
+            return None;
+        }
+        u32::from_str_radix(value, 16).ok()
+    })
+}
+
+/// `rgb(r,g,b)` / `r,g,b` / `r g b`：三个 0-255 的十进制数。
+///
+/// 分隔符连全角逗号与分号都收，这是照 Catime 的口径（`color_parser.c:146` 那张
+/// `separators[]` 表：`, ， ; ； 空格 |`）——同一句话在两边都能用才算对得上。
+/// 没有分隔符也不带 `rgb` 前缀的串一律不算三元组，否则裸 6 位十六进制会被抢走。
+fn parse_triplet(s: &str) -> Option<u32> {
+    let body = match s.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("rgb(") => s[4..].strip_suffix(')')?,
+        _ => s,
+    };
+    // 一个分隔符都没有就不算三元组——那串该走十六进制那条路，
+    // 否则裸 6 位（`102030`）会被当成"少写了分隔符的三元组"抢走
+    if !body.contains([' ', '\t', ',', ';', '|', '，', '；']) {
+        return None;
+    }
+    let mut parts = body
+        .split([' ', '\t', ',', ';', '|', '，', '；'])
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim().parse::<u32>().ok());
+    let r = parts.next()??;
+    let g = parts.next()??;
+    let b = parts.next()??;
+    if parts.next().is_some() || r > 255 || g > 255 || b > 255 {
+        return None;
+    }
+    Some(rgb(r, g, b))
 }
 
 /// 数字行的补零档位，对应配置项 `time_pad`（与 Catime 的三档 `TIME_FORMAT_*` 同形）。
@@ -306,7 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn color_parsing() {        assert_eq!(parse_color("0F0F14"), Some(0x0F0F14));
+    fn color_parsing() {
+        assert_eq!(parse_color("0F0F14"), Some(0x0F0F14));
         assert_eq!(parse_color("#FFFFFF"), Some(0xFFFFFF));
         assert_eq!(parse_color("0xffcc50"), Some(0xFFCC50));
         assert_eq!(parse_color(" 10aabb "), Some(0x10AABB));
@@ -314,6 +384,54 @@ mod tests {
         assert_eq!(parse_color("12345"), None);
         assert_eq!(parse_color("1234567"), None);
         assert_eq!(parse_color(""), None);
+    }
+
+    /// 三位简写按 CSS 的规则每位翻倍，而不是左移补零——`#f57` 是 `#ff5577`。
+    #[test]
+    fn short_hex_expands_by_doubling_each_nibble() {
+        assert_eq!(parse_color("#f57"), Some(0xFF5577));
+        assert_eq!(parse_color("#000"), Some(0x000000));
+        assert_eq!(parse_color("#fff"), Some(0xFFFFFF));
+        assert_eq!(parse_color("#12g"), None);
+    }
+
+    /// 名表那 30 条是照 Catime 抄的，所以两边写出来的字面量必须能互相认。
+    /// 我们比它宽一档：大小写无关（它 `strcmp` 只收小写）。
+    #[test]
+    fn css_names_are_case_insensitive() {
+        assert_eq!(parse_color("red"), Some(0xFF0000));
+        assert_eq!(parse_color("Red"), Some(0xFF0000));
+        assert_eq!(parse_color("  GOLD "), Some(0xFFD700));
+        assert_eq!(parse_color("tomato"), None, "名表只有那 30 条，不扩");
+        // 名表里每一条都得能被自己解析回来，且不含 alpha 位
+        for entry in NAMED.split(' ') {
+            let (name, hex) = entry.split_once('=').expect("名表条目该是 name=rrggbb");
+            let value = u32::from_str_radix(hex, 16).expect("值该是 6 位十六进制");
+            assert_eq!(parse_color(name), Some(value), "{name} 解析错了");
+            assert_eq!(value & 0xFF000000, 0, "{name} 不该带 alpha");
+        }
+    }
+
+    /// `rgb()` 与裸三元组：分隔符收 `, ; | 空格` 与两个全角字符（Catime 的口径），
+    /// 分量必须全在 0-255 且恰好三个。
+    #[test]
+    fn rgb_triplets_accept_the_same_separators_as_catime() {
+        assert_eq!(parse_color("rgb(255,94,150)"), Some(0xFF5E96));
+        assert_eq!(parse_color("rgb( 255 , 94 , 150 )"), Some(0xFF5E96));
+        assert_eq!(parse_color("255,94,150"), Some(0xFF5E96));
+        assert_eq!(parse_color("255 94 150"), Some(0xFF5E96));
+        assert_eq!(parse_color("255|94|150"), Some(0xFF5E96));
+        assert_eq!(parse_color("255；94；150"), Some(0xFF5E96), "全角分号");
+        assert_eq!(parse_color("1，2，3"), Some(0x010203), "全角逗号");
+        assert_eq!(parse_color("256,0,0"), None, "分量出界要拒，不能回绕");
+        assert_eq!(parse_color("1,2"), None);
+        assert_eq!(parse_color("1,2,3,4"), None);
+        assert_eq!(parse_color("rgb(1,2,x)"), None);
+        assert_eq!(parse_color("RGB(1,2,3)"), Some(0x010203), "前缀也大小写无关");
+        assert_eq!(parse_color("rgba(1,2,3,255)"), None, "alpha 没地方放，宁可不收");
+        // 关键取舍：不带分隔符也不带 `rgb` 前缀的串不许当三元组，
+        // 否则裸 6 位十六进制会被抢走
+        assert_eq!(parse_color("102030"), Some(0x102030));
     }
 
     /// 点阵字行走的是新管道的快路：一格点阵放大成 `cell × cell` 的实心块，

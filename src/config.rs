@@ -910,6 +910,24 @@ mod tests {
         assert_eq!(bad.text_effect, Effect::None);
     }
 
+    /// 颜色的四种写法要能穿过**配置文件**这条路（不只是 `parse_color` 单测）：
+    /// 配置文件里带空格与括号，而行解析先要按 `=` 拆键值。
+    #[test]
+    fn color_syntaxes_survive_the_line_parser() {
+        let cfg = Config::from_str(
+            "color_paused = #f57\ncolor_done = rgb(80, 220, 120)\ncolor_running = teal\n",
+        );
+        assert_eq!(cfg.color_paused, Gradient::solid(0xFF5577), "三位简写");
+        assert_eq!(cfg.color_done, Gradient::solid(0x50DC78), "rgb() 带空格");
+        assert_eq!(cfg.color_running, Gradient::solid(0x008080), "CSS 名");
+        // 名与三元组可以混在一条渐变里
+        let mixed = Config::from_str("color_running = gold_rgb(0, 128, 128)\n");
+        assert_eq!(mixed.color_running, Gradient::parse("#FFD700_#008080").unwrap());
+        // 认不出的写法整条作废，回落默认值而不是画半截颜色
+        let bad = Config::from_str("color_running = notacolor\n");
+        assert_eq!(bad.color_running, Config::default().color_running);
+    }
+
     /// 每个特效的值串都要能写回配置再读回来，否则用户改了配置就丢。
     #[test]
     fn every_effect_name_survives_the_config_roundtrip() {
