@@ -2,7 +2,7 @@
 
 极简悬浮计时器：倒计时 / 秒表 / 番茄钟 / 时钟挂件。Rust 编写，纯 CPU 软渲染，数字用内置 8x8 位图字体、状态行的中文由运行时 dlopen 的 libfreetype 补，单二进制 ~0.6 MB，零第三方 crate。
 
-![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.5.0-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
+![平台](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue) ![许可](https://img.shields.io/badge/license-MIT-green) ![版本](https://img.shields.io/badge/version-0.6.0-brightgreen) ![CI](https://github.com/panzhifu/tinyticker/actions/workflows/ci.yml/badge.svg)
 
 未压缩体积（工作区实测）：**Wayland 极小版 0.64 MB**、通用版（Wayland + X11）0.65 MB——X11 后端只多 9.3 KB。UPX 压缩后的发布产物体积待下次发版按 CI 实测更新（v0.4.1 为 0.38 / 0.50 MB）。
 
@@ -43,7 +43,7 @@
 URL 不可变，可直接校验：
 
 ```sh
-TAG=v0.5.0                                   # 换成 Releases 页面里的版本
+TAG=v0.6.0                                   # 换成 Releases 页面里的版本
 BASE=https://github.com/panzhifu/tinyticker/releases/download/$TAG
 curl -fLO "$BASE/tinyticker-${TAG#v}-x86_64-unknown-linux-gnu"
 curl -fLO "$BASE/SHA256SUMS.txt"

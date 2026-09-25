@@ -3,7 +3,7 @@
 > 生成日期：2026-09-24。配套阅读 [COMPARISON.md](COMPARISON.md)——那份是"谁有什么"的对比表，这份是"差在哪、为什么差、补要付多少"的差距分析。
 >
 > **取证基准**
-> - tinyticker：`main` 分支工作区（2026-09-25 三批已提交：第二梯队、零散 XS 整批、A 类声音/PNG 批），230 项内联测试全通过、`cargo clippy --all-targets -- -D warnings` 零告警；`cargo build --release` 实测 684 888 B（0.653 MiB），`--no-default-features` 675 600 B（0.644 MiB）——A 类那一批（声音 + PNG/APNG + 帧序列源 + 限速两档 + tooltip 补全）合计 **+35 KB**。本文档写完后又长了字形层、套接字与各批格式/图标/语言/分页项，见 §5.1、§九 与各表的"已做"标注。
+> - tinyticker：`main` 分支工作区（v0.6.0：第二梯队、零散 XS 整批、A 类声音/PNG 批三批已并入发布），230 项内联测试全通过、`cargo clippy --all-targets -- -D warnings` 零告警；`cargo build --release` 实测 684 888 B（0.653 MiB），`--no-default-features` 675 600 B（0.644 MiB）——A 类那一批（声音 + PNG/APNG + 帧序列源 + 限速两档 + tooltip 补全）合计 **+35 KB**。本文档写完后又长了字形层、套接字与各批格式/图标/语言/分页项，见 §5.1、§九 与各表的"已做"标注。
 > - Catime：本地克隆 `../Catime`，`resource/resource.h:9` 写的是 **1.6.2**（README 顶栏还停在 1.5.0），约 99 178 行 C，配置项 **92 个**（`src/config/config_defaults.c:18-129` 的 `CONFIG_METADATA[]`）。
 > - 下文 Catime 的每条断言都给了 `文件:行`；tinyticker 的每条都给本仓库的 `文件:行`。凡是只读到声明没读到实现的，标注"未证"。
 
