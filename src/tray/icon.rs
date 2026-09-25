@@ -249,6 +249,30 @@ fn draw_row(px: &mut [u8], s: &str, y: usize, color: (u8, u8, u8), narrow: usize
     }
 }
 
+/// 负载 → 动图播放倍率。
+///
+/// Catime 给的是一张用户可改的 0-100 % → 倍率曲线（`ANIMATION_SPEED_MAP_10..100`，
+/// 128 点容量，线性插值）。我们先用固定的两段直线：半载以下不干预，半载到满载之间
+/// 线性掉到 1/4 速。理由是本项目的配置面已经够大，而"曲线编辑器"需要键盘。
+pub(super) fn throttle_speed(percent: u8) -> f64 {
+    if percent <= 50 {
+        return 1.0;
+    }
+    // 50%→1.0，100%→0.25，中间线性；再往上夹住。下限是 1/4 速而不是 0——
+    // 满载也不该把动画冻住，那看起来像程序卡了
+    (1.0 - (percent as f64 - 50.0) * 0.015).clamp(0.25, 1.0)
+}
+
+/// 这一拍动图该按几倍速走。抽成函数是为了能测——不然"看哪个指标"这条分支只能靠
+/// 把机器压到 50% 以上才验证得到。
+pub(super) fn play_speed(throttle: Throttle, src: &sysinfo::Sources) -> f64 {
+    match throttle {
+        Throttle::Off => 1.0,
+        Throttle::Cpu => throttle_speed(src.cpu),
+        Throttle::Memory => throttle_speed(src.mem),
+    }
+}
+
 /// 按 `mode` 生成当前该显示的图标。
 pub(super) fn icon_pixmap(
     mode: IconMode,
@@ -476,6 +500,32 @@ mod tests {
             (0..S * S).any(|k| green(&charging, k * 4)),
             "充电时该出现绿色，而不是 9% 的红"
         );
+    }
+
+    /// 选哪个指标决定倍率：`Off` 恒 1.0，其余两档各看各的那一路。
+    #[test]
+    fn play_speed_follows_the_chosen_metric() {
+        let src = sysinfo::Sources {
+            cpu: 90,
+            mem: 10,
+            net_down: 0,
+            net_up: 0,
+            battery: None,
+        };
+        assert_eq!(play_speed(Throttle::Off, &src), 1.0, "关掉限速就该原速");
+        assert!(play_speed(Throttle::Cpu, &src) < 0.5, "CPU 90% 该慢下来");
+        assert_eq!(play_speed(Throttle::Memory, &src), 1.0, "内存 10% 不该动");
+    }
+
+    /// 限速曲线：半载以下完全不干预，之后线性掉到 1/4 速，且不许掉成负数。
+    #[test]
+    fn throttle_curve_is_flat_then_linear() {
+        assert_eq!(throttle_speed(0), 1.0);
+        assert_eq!(throttle_speed(50), 1.0, "半载以下不该动画面");
+        assert!(throttle_speed(75) < throttle_speed(60), "越忙越慢");
+        assert!((throttle_speed(100) - 0.25).abs() < 1e-9, "满载 1/4 速");
+        // 采样给的是 u8，理论到 100 封顶，但曲线本身也不许给出负倍率
+        assert!(throttle_speed(u8::MAX) > 0.0);
     }
 
     /// 网络的两行按颜色分开数：绿行与琥珀行不许重叠，也不许贴着上下边。

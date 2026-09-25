@@ -12,7 +12,7 @@ use crate::effect::{Effect, Gradient};
 use crate::parse::parse_duration;
 use crate::render::{Pad, parse_color, rgb};
 use crate::timer::{Mode, Pomo};
-use crate::tray::IconMode;
+use crate::tray::{IconMode, Throttle};
 
 const CONFIG_FILE: &str = "config.conf";
 
@@ -232,6 +232,8 @@ pub struct Config {
     /// 托盘图标里的占用指标用**数字**画，而不是水位。只影响那四档（CPU / 内存 /
     /// 电量 / 网络），表盘与动图不受它管。
     pub tray_numbers: bool,
+    /// 动图按哪个指标限速（只有 `tray_icon = gif` 时有意义）。
+    pub tray_throttle: Throttle,
     /// 番茄钟节奏（专注 / 短休 / 长休 / 每几轮一长休 / 跑几组）。
     pub pomo: Pomo,
     /// 托盘「时长预设」子菜单的档位（秒，按配置顺序），点击即重置并开始。
@@ -277,6 +279,7 @@ impl Default for Config {
             tray_icon: IconMode::Clock,
             tray_gif: None,
             tray_numbers: false,
+            tray_throttle: Throttle::default(),
             pomo: Pomo::default(),
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
@@ -499,6 +502,11 @@ impl Config {
                     }
                 }
                 "tray_numbers" => cfg.tray_numbers = value.parse().unwrap_or(false),
+                "tray_throttle" => {
+                    if let Some(t) = Throttle::from_name(value.trim()) {
+                        cfg.tray_throttle = t;
+                    }
+                }
                 "tray_gif" => {
                     if !value.is_empty() {
                         cfg.tray_gif = Some(value.to_string());
@@ -642,6 +650,7 @@ impl Config {
         out.push_str(&format!("centiseconds = {}\n", self.centiseconds));
         out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
         out.push_str(&format!("tray_numbers = {}\n", self.tray_numbers));
+        out.push_str(&format!("tray_throttle = {}\n", self.tray_throttle.name()));
         if let Some(path) = &self.tray_gif {
             out.push_str(&format!("tray_gif = {path}\n"));
         }
@@ -925,6 +934,21 @@ mod tests {
         assert!(on.serialize().contains("tray_numbers = true\n"));
         assert!(Config::from_str(&on.serialize()).tray_numbers, "写出去要读得回来");
         assert!(!Config::from_str("tray_numbers = maybe\n").tray_numbers, "认不出当关");
+    }
+
+    /// 限速那一档的键要认三种值，认不出来保持默认（不限速），且能往返。
+    #[test]
+    fn tray_throttle_parses_and_round_trips() {
+        assert_eq!(Config::default().tray_throttle, Throttle::Off, "默认不限速");
+        for (text, want) in
+            [("off", Throttle::Off), ("cpu", Throttle::Cpu), ("memory", Throttle::Memory)]
+        {
+            let cfg = Config::from_str(&format!("tray_throttle = {text}\n"));
+            assert_eq!(cfg.tray_throttle, want);
+            assert!(cfg.serialize().contains(&format!("tray_throttle = {text}\n")));
+        }
+        let junk = Config::from_str("tray_throttle = gpu\n");
+        assert_eq!(junk.tray_throttle, Throttle::Off, "认不出就保持默认，别静默改成别的档");
     }
 
     /// 颜色的四种写法要能穿过**配置文件**这条路（不只是 `parse_color` 单测）：

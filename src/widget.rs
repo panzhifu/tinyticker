@@ -250,6 +250,12 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::SetThrottle(t) => {
+                if self.config.tray_throttle != t {
+                    self.config.tray_throttle = t;
+                    self.persist_appearance();
+                }
+            }
             Command::ToggleNumbers => {
                 self.config.tray_numbers = !self.config.tray_numbers;
                 self.persist_appearance();

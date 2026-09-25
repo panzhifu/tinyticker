@@ -29,7 +29,7 @@ use dbusmenu::{
     MENU_XML, read_event, read_ids, read_layout_request, read_property_request, read_scroll,
     second_string, write_group_properties, write_layout, write_node_property,
 };
-use icon::{icon_pixmap, tooltip_text};
+use icon::{icon_pixmap, play_speed, tooltip_text};
 use menu::{Kind, Node, State, build_nodes};
 use sni::{
     ITEM_XML, emit_signal, on_filter, register_with_watcher, reply_props_get, send_notification,
@@ -79,6 +79,8 @@ pub enum Command {
     SetIcon(IconMode),
     /// 切换"图标里的占用指标用数字还是水位"（写回 `tray_numbers`）。
     ToggleNumbers,
+    /// 换动图限速看的指标（写回 `tray_throttle`）。
+    SetThrottle(Throttle),
     /// 切换数字行的百分之一秒（写回 `centiseconds`）。
     ToggleCentiseconds,
     /// 换计时数字行的补零档位（写回 `time_pad`）。
@@ -144,6 +146,39 @@ impl IconMode {
             IconMode::Battery => "battery",
             IconMode::Network => "network",
             IconMode::Gif => "gif",
+        }
+    }
+}
+
+/// 托盘动图按哪个指标限速，对应配置项 `tray_throttle`。
+///
+/// 只管 `tray_icon = gif` 那一档：静态图标没有"速率"可以慢下来。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Throttle {
+    /// 原速（Catime 的 `ORIGINAL` 档，也是我们的默认值）。
+    #[default]
+    Off,
+    /// 看 CPU 占用。
+    Cpu,
+    /// 看内存占用。
+    Memory,
+}
+
+impl Throttle {
+    pub fn from_name(name: &str) -> Option<Throttle> {
+        match name {
+            "off" => Some(Throttle::Off),
+            "cpu" => Some(Throttle::Cpu),
+            "memory" => Some(Throttle::Memory),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Throttle::Off => "off",
+            Throttle::Cpu => "cpu",
+            Throttle::Memory => "memory",
         }
     }
 }
@@ -335,10 +370,13 @@ fn run(
             }
         }
         // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
-        let (mode, numbers) = {
+        let (mode, numbers, throttle) = {
             let st = unsafe { (*server).state.borrow() };
-            (st.icon, st.numbers)
+            (st.icon, st.numbers, st.throttle)
         };
+        // 倍率每轮都推进虚拟时钟（哪怕当前不是动图档）：只在切到动图时才推的话，
+        // 从"不限速"切回来那一刻帧序会按累计的墙钟跳一大段
+        player.advance(play_speed(throttle, &sources));
         let (_, _, px) = icon_pixmap(mode, &sources, crate::clock::now_hms(), &mut player, numbers);
         // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
         let changed = unsafe {

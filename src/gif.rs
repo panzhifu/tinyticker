@@ -83,7 +83,9 @@ pub struct Player {
     path: Option<PathBuf>,
     stamp: Option<(u64, SystemTime)>,
     anim: Option<Animation>,
-    started: Instant,
+    /// 动画自己的虚拟时钟。限速时它走得比墙钟慢，于是画面是"变慢"而不是"跳帧"。
+    vclock: Duration,
+    last: Instant,
 }
 
 impl Player {
@@ -92,8 +94,17 @@ impl Player {
             path: raw.map(config::expand_tilde).filter(|p| !p.as_os_str().is_empty()),
             stamp: None,
             anim: None,
-            started: Instant::now(),
+            vclock: Duration::ZERO,
+            last: Instant::now(),
         }
+    }
+
+    /// 按 `speed`（0-1 的倍率）推进虚拟时钟。每次取帧之前调用一次。
+    pub fn advance(&mut self, speed: f64) {
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(self.last);
+        self.last = now;
+        self.vclock += dt.mul_f64(speed.clamp(0.0, 1.0));
     }
 
     /// 当前该显示的一帧及其画布尺寸；文件不可用或解不出时 `None`（调用方该退回静态图标）。
@@ -104,7 +115,8 @@ impl Player {
             if Some(stamp) != self.stamp {
                 self.stamp = Some(stamp);
                 self.anim = None;
-                self.started = Instant::now();
+                // 换文件等于换一段动画，时钟要从零走
+                self.vclock = Duration::ZERO;
                 if meta.len() > MAX_FILE_BYTES {
                     eprintln!("⚠️ tray_gif 超过 {MAX_FILE_BYTES} 字节，忽略：{}", path.display());
                 } else if let Some(a) = fs::read(path).ok().as_deref().and_then(decode) {
@@ -116,7 +128,7 @@ impl Player {
             self.anim = None;
         }
         let anim = self.anim.as_ref()?;
-        let frame = anim.frames.get(anim.frame_at(self.started.elapsed())).or(anim.frames.first())?;
+        let frame = anim.frames.get(anim.frame_at(self.vclock)).or(anim.frames.first())?;
         Some((frame, anim.width, anim.height))
     }
 }
@@ -513,6 +525,21 @@ fn chain_first(prefix: &[u16], suffix: &[u8], code: u16) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 限速靠虚拟时钟实现：倍率 0 时它一步都不许走，越界的倍率要夹住。
+    #[test]
+    fn player_clock_advances_by_the_speed_only() {
+        let mut p = Player::new(None);
+        for _ in 0..4 {
+            p.advance(0.0);
+        }
+        assert_eq!(p.vclock, Duration::ZERO, "0 速时虚拟时钟不许前进");
+        p.advance(-1.0);
+        assert_eq!(p.vclock, Duration::ZERO, "负倍率该被夹到 0");
+        // 1 倍速就是墙钟，四则之内不许跑出几十毫秒
+        p.advance(9.0);
+        assert!(p.vclock < Duration::from_millis(200), "超 1 的倍率该被夹到 1: {:?}", p.vclock);
+    }
 
     // 素材由 ImageMagick 生成，期望值取自 magick 自己的解码结果（它是已知正确的解码器）
     const M2: &[u8] = include_bytes!("../tests/fixtures/m2.gif");

@@ -34,6 +34,7 @@ impl Command {
             Command::SetEffect(e) => Some(Check::Effect(e)),
             Command::SetIcon(m) => Some(Check::Icon(m)),
             Command::ToggleNumbers => Some(Check::Numbers),
+            Command::SetThrottle(t) => Some(Check::Throttle(t)),
             Command::ToggleCentiseconds => Some(Check::Centiseconds),
             Command::SetTimePad(p) => Some(Check::TimePad(p)),
             Command::ToggleClockSeconds => Some(Check::ClockSeconds),
@@ -56,6 +57,7 @@ pub(super) enum Check {
     RunningColor(usize),
     Effect(Effect),
     Icon(IconMode),
+    Throttle(Throttle),
     /// 数字还是水位（`图标内容` 子菜单末尾那一项）。
     Numbers,
     /// 下面三个是勾选框（各自独立），上面五个是单选组。勾选框只有一项，不必带值。
@@ -94,6 +96,8 @@ pub(super) struct State {
     pub(super) edit: bool,
     /// 图标里的占用指标画数字还是水位。
     pub(super) numbers: bool,
+    /// 动图限速看哪个指标。
+    pub(super) throttle: Throttle,
     /// 到点发不发桌面通知。
     pub(super) notify: bool,
     /// 是否已登记开机自启。这一格不进 Config：磁盘上那个文件本身就是状态。
@@ -126,6 +130,7 @@ impl State {
             // 编辑态同理：启动时不在编辑态
             edit: false,
             numbers: cfg.tray_numbers,
+            throttle: cfg.tray_throttle,
             notify: cfg.notify,
             autostart: crate::config::autostart_enabled(),
             gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
@@ -151,6 +156,7 @@ impl State {
             Check::Hidden => self.hidden,
             Check::Edit => self.edit,
             Check::Numbers => self.numbers,
+            Check::Throttle(t) => self.throttle == t,
             Check::Notify => self.notify,
             Check::Autostart => self.autostart,
         }
@@ -180,6 +186,7 @@ impl State {
             Command::SetEffect(e) => self.effect = e,
             Command::SetIcon(m) => self.icon = m,
             Command::ToggleNumbers => self.numbers = !self.numbers,
+            Command::SetThrottle(t) => self.throttle = t,
             Command::ToggleCentiseconds => self.centis = !self.centis,
             Command::SetTimePad(p) => self.pad = p,
             Command::ToggleClockSeconds => self.clock_seconds = !self.clock_seconds,
@@ -320,6 +327,19 @@ pub(super) fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     let nums = n.len() as i32;
     n.push(button("用数字代替水位", Command::ToggleNumbers));
     n[icon as usize].children.push(nums);
+    // 动图限速：单选三档，同样挂在图标内容下面（它只管 gif 那一档）
+    let throttle = n.len() as i32;
+    n.push(submenu("动图限速"));
+    n[icon as usize].children.push(throttle);
+    for (label, t) in [
+        ("不限速", Throttle::Off),
+        ("看 CPU", Throttle::Cpu),
+        ("看内存", Throttle::Memory),
+    ] {
+        let id = n.len() as i32;
+        n.push(button(label, Command::SetThrottle(t)));
+        n[throttle as usize].children.push(id);
+    }
     for p in PADS {
         let id = n.len() as i32;
         n.push(button(p.label(), Command::SetTimePad(p)));
@@ -445,13 +465,24 @@ mod tests {
             IconMode::Network,
             IconMode::Gif,
         ];
-        assert_eq!(icons.len(), expect.len() + 1, "末尾还有一项「用数字代替水位」");
+        assert_eq!(icons.len(), expect.len() + 2, "末尾还有「用数字代替水位」与「动图限速」");
         for (k, id) in n[icon_id as usize].children[..expect.len()].iter().enumerate() {
             assert_eq!(n[*id as usize].command, Some(Command::SetIcon(expect[k])));
         }
         assert_eq!(
-            n[*n[icon_id as usize].children.last().unwrap() as usize].command,
+            n[n[icon_id as usize].children[expect.len()] as usize].command,
             Some(Command::ToggleNumbers)
+        );
+        // 限速那一档是挂在图标内容下面的单选三档
+        let throttle_id = n[icon_id as usize].children[expect.len() + 1];
+        assert_eq!(n[throttle_id as usize].label, "动图限速");
+        assert_eq!(
+            acts(throttle_id),
+            vec![
+                Some(Command::SetThrottle(Throttle::Off)),
+                Some(Command::SetThrottle(Throttle::Cpu)),
+                Some(Command::SetThrottle(Throttle::Memory)),
+            ]
         );
         // 时间格式：三档补零按 PADS 顺序，后面跟两个勾选框
         let fmt_cmds = acts(fmt_id);
@@ -527,6 +558,7 @@ mod tests {
                     | Command::SetRunningColor(_)
                     | Command::SetEffect(_)
                     | Command::SetIcon(_)
+                    | Command::SetThrottle(_)
                     | Command::SetTimePad(_)
                     | Command::ToggleCentiseconds
                     | Command::ToggleClockSeconds
@@ -581,6 +613,19 @@ mod tests {
         assert!(s.checked(Check::ClockSeconds));
         s.note(&Command::ToggleClockSeconds);
         assert!(!s.checked(Check::ClockSeconds));
+    }
+
+    /// 限速三档是单选组：换档要取消旧那档的勾。
+    #[test]
+    fn throttle_is_a_radio_group_starting_at_off() {
+        let on = Config { tray_throttle: Throttle::Cpu, ..Config::default() };
+        let mut s = State::from_config(&on);
+        assert!(s.checked(Check::Throttle(Throttle::Cpu)));
+        assert!(!s.checked(Check::Throttle(Throttle::Off)));
+        s.note(&Command::SetThrottle(Throttle::Memory));
+        assert!(s.checked(Check::Throttle(Throttle::Memory)));
+        assert!(!s.checked(Check::Throttle(Throttle::Cpu)), "旧档必须取消勾选");
+        assert!(s.checked(Check::Icon(IconMode::Clock)), "换限速不该动了图标档");
     }
 
     /// 编辑态那一格：启动时恒关着（它不进配置），托盘点一下翻面，
