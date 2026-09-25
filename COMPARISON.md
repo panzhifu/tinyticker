@@ -1,7 +1,7 @@
 # tinyticker vs Catime 功能对比
 
 > 更新日期：2026-09-24
-> tinyticker 版本：**0.5.0**（零第三方依赖重写：自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟）+ 工作区未提交改动（番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效、状态行中文、单实例参数转发、百分之一秒、补零三档与显示秒、网络速率图标、隐藏/显示挂件、配置原子写）
+> tinyticker 版本：**0.5.0**（零第三方依赖重写：自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟）+ 工作区未提交改动（番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效、状态行中文、单实例参数转发、百分之一秒、补零三档与显示秒、网络速率图标、隐藏/显示挂件、配置原子写、编辑态、CSS 颜色名与 `rgb()`、图标数字档、动图限速、`pomo_seq`）
 > Catime 版本：**v1.6.2**（本地参考克隆 `../Catime`，`resource/resource.h:9`；其 README 顶栏仍写 1.5.0）
 >
 > 本表回答"谁有什么"。**"差在哪、为什么差、补要付多少"看 [GAP.md](GAP.md)**——那份是逐文件读码后的代码级差距分析（含 Catime 92 个配置项与 30 条特效/颜色参数的取证，以及按补齐成本排的序）。本表若与 GAP.md 冲突，以 GAP.md 为准。
@@ -25,7 +25,7 @@
 | 正计时 / 秒表 | ✅（0.2.0，托盘或 `-s` 切换） | ✅ |
 | 时钟显示 | ✅（0.4.0 `-k` 时钟挂件；0.4.1 `clock_12h` 可选 12 小时制带 AM/PM；0.5.0 起本地时间走自研 TZif + POSIX 规则解析，不再调 C 库时区 API；工作区版本再加 `clock_seconds`——可以只到分） | ✅（12/24h，另有 `CLOCK_SHOW_SECONDS`） |
 | 计时数字补零 | ✅（工作区版本 `time_pad` = `none` / `zero` / `full` 三档，值串与它的 `TimeFormatType` 对齐；`zero`/`full` 同时去掉 `s` 后缀以固定宽度） | ✅（三档 `TimeFormatType`） |
-| 番茄钟 | ✅（0.4.0 专注/休息自动轮转 + 轮数显示；工作区版本补上**长休息与组数上限**：`pomo_work` / `pomo_break` / `pomo_long_break` / `pomo_rounds` / `pomo_cycles`。Catime 那边是「任意阶段序列 × 重复次数」，我们是固定经典配方——日常够用，但阶段序列不能自定义） | ✅（`POMODORO_TIME_OPTIONS` 序列 + `POMODORO_LOOP_COUNT`，默认 1 组） |
+| 番茄钟 | ✅（0.4.0 专注/休息自动轮转 + 轮数显示；工作区版本补上**长休息与组数上限**：`pomo_work` / `pomo_break` / `pomo_long_break` / `pomo_rounds` / `pomo_cycles`；2026-09-25 再补 **`pomo_seq`**——`25m,5m,15m` 这样自己排一串任意段（≤16 段），跑完整条算一遍、`pomo_cycles` 限定跑几遍，状态行换成 `POMO n`） | ✅（`POMODORO_TIME_OPTIONS` 序列 ≤10 段 + `POMODORO_LOOP_COUNT`，默认 1 组；每段还能在对话框里单独重设时长——我们有键盘通路缺失，只能整串从配置文件改） |
 | 百分之一秒显示 | ✅（工作区版本：`centiseconds` 或托盘「外观 ▸ 时间格式 ▸ 百分之一秒」，走 `45.32s` / `m:ss.cc` / `h:mm:ss.cc`；亚秒余量存在计时状态里，20 ms 心跳档只在跑动时开。倒计时显示百分秒时读向下取整、隐藏时读向上那一格，与它同规则。**不覆盖时钟挂件**，也没有专用热键——但 `tinyticker` 的套接字在，用户可以自己绑 DE 快捷键） | ✅（`CLOCK_SHOW_MILLISECONDS` + 专用热键，含时钟挂件） |
 | **窗口行为** | | |
 | 无边框悬浮窗 | ✅ | ✅ |

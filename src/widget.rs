@@ -416,6 +416,7 @@ impl Widget {
         let (body, action) = match ev {
             Finished::Countdown => ("⏰ 计时结束", "再来一次"),
             Finished::PomodoroWork => ("🍅 专注完成，休息一下", "好的"),
+            Finished::PomodoroStep => ("🔁 这一段结束，继续下一段", "继续"),
             Finished::PomodoroBreak => ("☕ 休息结束，继续专注", "开始"),
             Finished::PomodoroLongBreak => ("🌿 长休息结束，开始下一组", "开始"),
             Finished::PomodoroAllDone => ("🎉 番茄钟全部完成", "再来一组"),
@@ -665,7 +666,7 @@ mod tests {
         use crate::timer::Pomo;
         let cfg = Config {
             mode: Mode::Pomodoro,
-            pomo: Pomo { work: 1, short_break: 1, long_break: 1, rounds: 1, cycles: 1 },
+            pomo: Pomo { work: 1, short_break: 1, long_break: 1, rounds: 1, cycles: 1 , seq: Vec::new() },
             ..Config::default()
         };
         let mut w = Widget::new(cfg, true);
@@ -851,6 +852,8 @@ mod tests {
         assert_eq!(w.armed.as_deref(), Some("echo once"));
         // 休息结束不是"计时结束"：不该执行，也不该把待执行的那条吃掉
         assert_eq!(w.take_finish_cmd(Finished::PomodoroBreak), None);
+        // `pomo_seq` 的中间段同理：它不是"计时结束"
+        assert_eq!(w.take_finish_cmd(Finished::PomodoroStep), None);
         assert_eq!(w.armed.as_deref(), Some("echo once"), "不相关的事件不该消费武装");
         // 对上了就用一次性的，用完回到常驻配置
         assert_eq!(w.take_finish_cmd(Finished::Countdown).as_deref(), Some("echo once"));

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::effect::{Effect, Gradient};
 use crate::parse::parse_duration;
 use crate::render::{Pad, parse_color, rgb};
-use crate::timer::{Mode, Pomo};
+use crate::timer::{MAX_POMO_STEPS, Mode, Pomo};
 use crate::tray::{IconMode, Throttle};
 
 const CONFIG_FILE: &str = "config.conf";
@@ -41,7 +41,7 @@ const MAX_ROUNDS: u32 = 100;
 /// 逗号或空格分隔均可。任一段非法（解析不出、为 0、超过 24 小时）或总段数超限，
 /// 整条作废并回落到默认值——静默丢掉一项会让菜单悄悄少一格，更难查。
 /// 因为空格就是分隔符，带空格的写法（`"1h 30m"`）不能用作单段，写 `"1h30m"`。
-fn parse_preset_list(value: &str) -> Option<Vec<u32>> {
+fn parse_span_list(value: &str, max: usize) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for token in value.split([',', ' ', '\t']) {
         let token = token.trim();
@@ -51,7 +51,21 @@ fn parse_preset_list(value: &str) -> Option<Vec<u32>> {
         let secs = parse_duration(token).filter(|s| *s > 0 && *s <= MAX_SPAN)?;
         out.push(secs);
     }
-    (!out.is_empty() && out.len() <= MAX_PRESETS).then_some(out)
+    (!out.is_empty() && out.len() <= max).then_some(out)
+}
+
+/// 秒数 → 配置里写的那一个记号（`25m` / `1h` / `45s`）。
+///
+/// 取能整除的最大单位，所以写出去再读回来一定是同一个数——`pomo_seq` 要靠这一点
+/// 保证往返不漂移。
+fn span_token(secs: u32) -> String {
+    if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// 番茄钟的时长键：越界（含 0，`long_break` / `cycles` 除外）返回 `None` 让调用方回落。
@@ -544,8 +558,18 @@ impl Config {
                     }
                 }
                 "presets" => {
-                    if let Some(list) = parse_preset_list(value) {
+                    if let Some(list) = parse_span_list(value, MAX_PRESETS) {
                         cfg.presets = list;
+                    }
+                }
+                "pomo_seq" => {
+                    // 空值 = 关掉序列回到经典配方；非法则整条不采信（同 `presets` 的规矩）
+                    if value.trim().is_empty() {
+                        cfg.pomo.seq = Vec::new();
+                    } else if let Some(list) =
+                        parse_span_list(value, crate::timer::MAX_POMO_STEPS)
+                    {
+                        cfg.pomo.seq = list;
                     }
                 }
                 "pomo_work" => {
@@ -654,6 +678,10 @@ impl Config {
         if let Some(path) = &self.tray_gif {
             out.push_str(&format!("tray_gif = {path}\n"));
         }
+        if !self.pomo.seq.is_empty() {
+            let text = self.pomo.seq.iter().map(|s| span_token(*s)).collect::<Vec<_>>().join(",");
+            out.push_str(&format!("pomo_seq = {text}\n"));
+        }
         out.push_str(&format!("pomo_work = {}\n", self.pomo.work));
         out.push_str(&format!("pomo_break = {}\n", self.pomo.short_break));
         out.push_str(&format!("pomo_long_break = {}\n", self.pomo.long_break));
@@ -760,7 +788,7 @@ mod tests {
             time_pad: Pad::Full,
             tray_icon: IconMode::Gif,
             tray_gif: Some("~/pics/spin.gif".into()),
-            pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 },
+            pomo: Pomo { work: 1800, short_break: 600, long_break: 1200, rounds: 3, cycles: 2 , seq: Vec::new() },
             presets: vec![90, 600, 5400],
             on_finish: Some("loginctl lock-session".into()),
             timeout_text: Some("时间到".into()),
@@ -934,6 +962,30 @@ mod tests {
         assert!(on.serialize().contains("tray_numbers = true\n"));
         assert!(Config::from_str(&on.serialize()).tray_numbers, "写出去要读得回来");
         assert!(!Config::from_str("tray_numbers = maybe\n").tray_numbers, "认不出当关");
+    }
+
+    /// `pomo_seq`：逗号或空格都行，写出去要能读回同一串；空值回到经典配方；
+    /// 任一段非法或段数超限则整条不采信（与 `presets` 同一条规矩）。
+    #[test]
+    fn pomo_seq_parses_round_trips_and_rejects() {
+        let cfg = Config::from_str("pomo_seq = 25m,5m,15m\n");
+        assert_eq!(cfg.pomo.seq, vec![1500, 300, 900]);
+        let text = cfg.serialize();
+        assert!(text.contains("pomo_seq = 25m,5m,15m\n"), "往返写法变了: {text}");
+        assert_eq!(Config::from_str(&text).pomo.seq, cfg.pomo.seq);
+        // 空格分隔 + 不整除的秒数也要能原样回来
+        let odd = Config::from_str("pomo_seq = 90s 1h30m 7s\n");
+        assert_eq!(odd.pomo.seq, vec![90, 5400, 7]);
+        assert_eq!(Config::from_str(&odd.serialize()).pomo.seq, odd.pomo.seq);
+        // 空值 = 不用序列
+        assert!(Config::from_str("pomo_seq =\n").pomo.seq.is_empty());
+        // 一段非法整条作废，绝不静默丢掉一段
+        let bad = Config::from_str("pomo_seq = 25m banana\n");
+        assert!(bad.pomo.seq.is_empty(), "非法串该整条不采信");
+        let too_long = format!("pomo_seq = {}\n", vec!["1m"; MAX_POMO_STEPS + 1].join(","));
+        assert!(Config::from_str(&too_long).pomo.seq.is_empty(), "段数超限");
+        let ok = format!("pomo_seq = {}\n", vec!["1m"; MAX_POMO_STEPS].join(","));
+        assert_eq!(Config::from_str(&ok).pomo.seq.len(), MAX_POMO_STEPS);
     }
 
     /// 限速那一档的键要认三种值，认不出来保持默认（不限速），且能往返。
