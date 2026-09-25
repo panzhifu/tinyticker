@@ -64,6 +64,10 @@ pub enum Command {
     ToggleHidden,
     /// 把"是否隐藏"设成给定值——`tinyticker --hide` / `--show` 的语义，可重复执行。
     SetHidden(bool),
+    /// 切换编辑态（托盘那一项用；只存在于内存里，**不进配置**）。
+    ToggleEdit,
+    /// 把编辑态设成给定值——`tinyticker --edit` / `--no-edit`，可重复执行。
+    SetEdit(bool),
     /// 切换计时结束时发不发桌面通知（写回 `notify`）。
     ToggleNotify,
     /// 登记 / 取消开机自启（写删 `~/.config/autostart/` 里那份同名条目）。
@@ -167,9 +171,10 @@ impl Command {
             Command::SetTimePad(p) => Some(Check::TimePad(p)),
             Command::ToggleClockSeconds => Some(Check::ClockSeconds),
             Command::ToggleHidden => Some(Check::Hidden),
+            Command::ToggleEdit => Some(Check::Edit),
             Command::ToggleNotify => Some(Check::Notify),
             Command::ToggleAutostart => Some(Check::Autostart),
-            Command::SetHidden(_) => None,
+            Command::SetHidden(_) | Command::SetEdit(_) => None,
             _ => None,
         }
     }
@@ -189,6 +194,8 @@ enum Check {
     TimePad(Pad),
     ClockSeconds,
     Hidden,
+    /// 编辑态那一格（同样只影响一行勾选）。
+    Edit,
     Notify,
     Autostart,
 }
@@ -214,6 +221,8 @@ struct State {
     clock_seconds: bool,
     /// 挂件是否被藏着（只影响那一行的勾选）。
     hidden: bool,
+    /// 是否处于编辑态（同上，只影响那一行的勾选）。
+    edit: bool,
     /// 到点发不发桌面通知。
     notify: bool,
     /// 是否已登记开机自启。这一格不进 Config：磁盘上那个文件本身就是状态。
@@ -243,6 +252,8 @@ impl State {
             clock_seconds: cfg.clock_seconds,
             // 挂件总是以"看得见"启动（hidden 不进配置），所以这里恒 false
             hidden: false,
+            // 编辑态同理：启动时不在编辑态
+            edit: false,
             notify: cfg.notify,
             autostart: crate::config::autostart_enabled(),
             gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
@@ -266,6 +277,7 @@ impl State {
             Check::TimePad(p) => self.pad == p,
             Check::ClockSeconds => self.clock_seconds,
             Check::Hidden => self.hidden,
+            Check::Edit => self.edit,
             Check::Notify => self.notify,
             Check::Autostart => self.autostart,
         }
@@ -299,11 +311,27 @@ impl State {
             Command::ToggleClockSeconds => self.clock_seconds = !self.clock_seconds,
             Command::ToggleHidden => self.hidden = !self.hidden,
             Command::SetHidden(v) => self.hidden = v,
+            Command::ToggleEdit => self.edit = !self.edit,
+            Command::SetEdit(v) => self.edit = v,
             Command::ToggleNotify => self.notify = !self.notify,
             Command::ToggleAutostart => self.autostart = !self.autostart,
             _ => {}
         }
     }
+}
+
+/// 主循环 → 托盘线程的消息。
+enum TrayMsg {
+    /// 发一条桌面通知。
+    Notify(Note),
+    /// 把菜单里「编辑态」那一格设成给定值。
+    ///
+    /// 存在的理由是**不撒谎**：编辑态可以从挂件中键或套接字进来，那两条路都不经过
+    /// 菜单，托盘自持的那份镜像就不知道（GAP §七 的"勾选态漂移"）。宿主每次打开
+    /// 菜单都会重新拉 `GetLayout`，所以改内存即可，不必额外发信号催它。
+    SyncEdit(bool),
+    /// 「隐藏挂件」那一格同理：`tinyticker --hide` / `--show` 走的是套接字。
+    SyncHidden(bool),
 }
 
 /// 一条待发的通知。
@@ -367,6 +395,7 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
     push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
     push_top(&mut n, &mut root, button("👻 隐藏挂件", Command::ToggleHidden));
+    push_top(&mut n, &mut root, button("🛠 编辑态", Command::ToggleEdit));
     push_top(&mut n, &mut root, button("🔔 弹通知", Command::ToggleNotify));
     push_top(&mut n, &mut root, button("🚀 开机自启", Command::ToggleAutostart));
     push_top(&mut n, &mut root, separator());
@@ -678,7 +707,7 @@ fn put(px: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
 
 /// 主线程用来发通知的句柄（内部只是一条到托盘线程的通道）。
 pub struct TrayHandle {
-    tx: Sender<Note>,
+    tx: Sender<TrayMsg>,
 }
 
 /// 启动托盘线程；就绪后把 [`TrayHandle`] 发回主线程。
@@ -689,8 +718,8 @@ pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Confi
     let presets = cfg.presets.clone();
     let gif_path = cfg.tray_gif.clone();
     thread::spawn(move || {
-        let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
-        match run(cmd_tx, note_rx, handle_tx, note_tx, state, presets, gif_path) {
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<TrayMsg>();
+        match run(cmd_tx, msg_rx, handle_tx, msg_tx, state, presets, gif_path) {
             Ok(()) => {}
             Err(e) => eprintln!("⚠️ 托盘不可用: {e}"),
         }
@@ -699,7 +728,18 @@ pub fn spawn(cmd_tx: Sender<Command>, handle_tx: Sender<TrayHandle>, cfg: &Confi
 
 /// 发一条桌面通知；`action` 是按钮文案，点击后向主窗口发 [`Command::Start`]。
 pub fn notify(handle: &TrayHandle, body: &str, action: &str) {
-    let _ = handle.tx.send(Note { body: body.to_string(), action: action.to_string() });
+    let note = Note { body: body.to_string(), action: action.to_string() };
+    let _ = handle.tx.send(TrayMsg::Notify(note));
+}
+
+/// 把托盘菜单「编辑态」那一格对齐到挂件的真实状态（中键 / 套接字进来的那些）。
+pub fn sync_edit(handle: &TrayHandle, on: bool) {
+    let _ = handle.tx.send(TrayMsg::SyncEdit(on));
+}
+
+/// 同上，「隐藏挂件」那一格。
+pub fn sync_hidden(handle: &TrayHandle, hidden: bool) {
+    let _ = handle.tx.send(TrayMsg::SyncHidden(hidden));
 }
 
 // ---------------------------------------------------------------------------
@@ -709,9 +749,9 @@ pub fn notify(handle: &TrayHandle, body: &str, action: &str) {
 
 fn run(
     cmd_tx: Sender<Command>,
-    note_rx: Receiver<Note>,
+    msg_rx: Receiver<TrayMsg>,
     handle_tx: Sender<TrayHandle>,
-    note_tx: Sender<Note>,
+    msg_tx: Sender<TrayMsg>,
     state: State,
     presets: Vec<u32>,
     gif_path: Option<String>,
@@ -764,7 +804,7 @@ fn run(
     };
 
     // 主线程拿到句柄后就能发通知
-    if handle_tx.send(TrayHandle { tx: note_tx }).is_err() {
+    if handle_tx.send(TrayHandle { tx: msg_tx }).is_err() {
         return Ok(());
     }
 
@@ -772,8 +812,12 @@ fn run(
     let mut icon_at = Instant::now();
     let mut sources = sampler.sample();
     loop {
-        while let Ok(note) = note_rx.try_recv() {
-            unsafe { send_notification(dbus, conn, &note) };
+        while let Ok(msg) = msg_rx.try_recv() {
+            match msg {
+                TrayMsg::Notify(note) => unsafe { send_notification(dbus, conn, &note) },
+                TrayMsg::SyncEdit(on) => unsafe { (*server).state.borrow_mut().edit = on },
+                TrayMsg::SyncHidden(v) => unsafe { (*server).state.borrow_mut().hidden = v },
+            }
         }
         // 采样按秒，图标按派发节拍（200ms）：动图帧间隔可以短到几十毫秒
         if icon_at.elapsed() >= ICON_EVERY {
@@ -1820,8 +1864,8 @@ mod tests {
         for node in &n {
             let Some(cmd) = node.command.as_ref() else { continue };
             let checkable = cmd.check().is_some();
-            // 五个单选组，加上百分秒 / 显示秒 / 隐藏挂件三个勾选框
-            // （SetHidden 是命令行走的设定值，菜单上没有它对应的那一项）
+            // 五个单选组，加上百分秒 / 显示秒 / 隐藏挂件 / 编辑态 / 弹通知 / 自启这几档勾选框
+            // （SetHidden 与 SetEdit 是命令行走的设定值，菜单上没有它们对应的那一项）
             let in_group = matches!(
                 cmd,
                 Command::SetMode(_)
@@ -1834,6 +1878,7 @@ mod tests {
                     | Command::ToggleCentiseconds
                     | Command::ToggleClockSeconds
                     | Command::ToggleHidden
+                    | Command::ToggleEdit
                     | Command::ToggleNotify
                     | Command::ToggleAutostart
             );
@@ -1882,6 +1927,23 @@ mod tests {
         assert!(s.checked(Check::ClockSeconds));
         s.note(&Command::ToggleClockSeconds);
         assert!(!s.checked(Check::ClockSeconds));
+    }
+
+    /// 编辑态那一格：启动时恒关着（它不进配置），托盘点一下翻面，
+    /// 而套接字那条设定值命令可以重复发。
+    #[test]
+    fn edit_check_starts_off_and_mirrors_both_command_shapes() {
+        let mut s = State::from_config(&Config::default());
+        assert!(!s.checked(Check::Edit), "新实例总该从普通态开始");
+        s.note(&Command::ToggleEdit);
+        assert!(s.checked(Check::Edit));
+        s.note(&Command::SetEdit(true));
+        assert!(s.checked(Check::Edit), "重复设定不该翻回去");
+        s.note(&Command::SetEdit(false));
+        assert!(!s.checked(Check::Edit));
+        // 隐藏与编辑是两格，互不牵连
+        s.note(&Command::ToggleHidden);
+        assert!(s.checked(Check::Hidden) && !s.checked(Check::Edit));
     }
 
     /// 配色勾选只有在四色与某套预设完全一致时才算命中；用户手改过就一项都不勾。

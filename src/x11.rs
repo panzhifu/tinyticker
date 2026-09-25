@@ -310,7 +310,11 @@ impl Client {
                 let b = x::event::<x::ButtonEvent>(ev);
                 match b.button {
                     x::BTN_1 => self.begin_drag(b.x, b.y),
-                    x::BTN_3 => self.quit = true,
+                    // 中键是挂件上唯一空闲的按键：翻编辑态。按下不触发任何粘贴，
+                    // 因为这个窗口从来不是 PRIMARY selection 的目标
+                    x::BTN_2 => self.widget.toggle_edit(),
+                    // 编辑态下右键是"退出编辑态"，只有普通态才是关掉挂件
+                    x::BTN_3 => self.quit = self.widget.right_click(),
                     x::BTN_WHEEL_UP => self.zoom(1.0),
                     x::BTN_WHEEL_DOWN => self.zoom(-1.0),
                     _ => {}

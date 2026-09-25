@@ -15,17 +15,18 @@
   - **时钟挂件**：实时显示本地时间，`HH:MM:SS` 或 12 小时制 `hh:mm:ss AM`
 - **无边框透明悬浮窗**：逐像素预乘 ARGB，`bg_alpha` 从 0（全透明，只剩文字）到 255（不透明）自由调节
 - **浮在全屏窗口之上**：Wayland 上走 layer-shell 的 overlay 层，网页视频全屏时依然可见（协议限制下这是唯一办法）；X11 走 `_NET_WM_STATE_ABOVE`
-- **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–6.0，自动持久化）；**在托盘图标上滚动同样缩放**（SNI `Scroll`，挂件太小或开着点击穿透时更顺手）
+- **交互**：左键按住拖动、右键关闭、**滚轮缩放**（0.5–6.0，自动持久化）、**中键进编辑态**；**在托盘图标上滚动同样缩放**（SNI `Scroll`，挂件太小或开着点击穿透时更顺手）
 - **外观即时可调**：托盘「外观」子菜单——5 档背景透明度 + 6 套整体配色 + **30 条数字颜色**（逐条取自 Catime 的预设，含两段与五段渐变）+ 8 种文字特效 + 5 种图标内容 + 「时间格式」（补零三档 / 时钟显示秒 / 百分之一秒），点击立刻生效并写回配置，不必重启；菜单带勾选，看得出当前用的是哪一项
 - **文字特效与渐变**：`text_effect` 七种特效（辉光 / 玻璃 / 霓虹 / 全息 / 液态 / 水波 / 复古投影）全部在自研软渲染器里实现——文字先栅格化成单通道覆盖度图，在其上做可分离盒模糊、腐蚀求轮廓、梯度求边、正弦与 value-noise 位移，再按预乘 alpha 合成回画布；三色可写成 `_` 分隔的横向渐变，超过两个停靠点自动流动。不引入任何图像库，也不依赖 GPU
 - **状态行能写中文**：数字行保持内置 8x8 点阵按整数倍放大的像素风（所有特效的模糊半径与位移量都是照它标定的），而点阵覆盖不到的码位——中文、Latin-1、带圈数字这类符号——由运行时 `dlopen` 出来的 libfreetype 光栅宿主字体补齐，两种字形按同一条基线混排。字体自动发现（先试 Noto Sans CJK / Source Han / 文泉驿 / 霞鹜文楷 的常见路径，再按名字偏好扫 `$XDG_DATA_HOME/fonts` 等字体根），也可以用 `text_font` 指定文件；`text_font = off` 就退回"非 ASCII 一律留空位"。整行都是 ASCII 时 freetype 一次都不会被调用，画面与以前逐字节相同
 - **单实例，二次启动 = 下命令**：已经在跑的时候再敲 `tinyticker 25m` 不会多开一个窗口，而是把同样的参数交给那个实例（Unix 套接字，`$XDG_RUNTIME_DIR/tinyticker.sock`，权限 0600）。`--config-dir <目录>`（或 `TINYTICKER_CONFIG_DIR`）把配置与套接字一起搬进那个目录，于是**可以同时跑两套互不相干的挂件**。**全局快捷键因此不必我们自己实现**——Wayland 没有统一的快捷键协议，你在 KDE / GNOME / niri 的快捷键设置里绑一条 `tinyticker 25m` 就完了
 - **外部文本源**：`text_source` 指向一个由别的进程写的文件，它的第一行顶替状态行（编译进度、下载百分比之类）。靠 `(大小, mtime)` 判断要不要重读，超过 64 KB 直接不采信，文件缺失或清空就交还状态行。**只读不执行**——Catime 那套插件也要用户在托盘里逐个手动启动并显式信任，我们则连启动这一步都不做，生产者自己跑
 - **时长输入**：相对时长 `25m` / `1h30m` / `90` / `2d`，或**绝对时刻** `14:30`（已过则算明天）；也认 Catime 那套 `t` 后缀写法 `14 30t`
-- **托盘控制**：**左键开始/暂停、中键重置**，右键打开完整菜单——时长预设（档位由 `presets` 配置，出厂 1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）、四模式切换、外观、退出
+- **托盘控制**：**左键开始/暂停、中键重置**，右键打开完整菜单——时长预设（档位由 `presets` 配置，出厂 1 / 5 / 15 / 25 / 45 / 60 分钟，点击即开始）、四模式切换、外观、编辑态、退出。「隐藏挂件」与「编辑态」两格的勾会跟着套接字与挂件上的手势走（主循环往托盘线程回填，不只显示"上次点菜单的结果"）
 - **托盘悬停提示带实时指标**：正文是 `CPU 12% · 内存 44% · ↓ 1.0 MB/s ↑ 2048 B/s · 电池 87%⚡`，每秒随采样刷新、变了才发 `NewToolTip`（SNI 里宿主是拉取属性的，不催就等于永远显示启动时那份）
 - **托盘图标会走**：`tray_icon` 选真实时表盘（指针按本地时间摆）、CPU / 内存 / 电量 / **网络速率**的水位占用表，或**你自己的 GIF 动图**（`tray_gif`）。占用数据读 `/proc/stat`、`/proc/meminfo`、`/sys/class/power_supply`、`/proc/net/dev`（差分，排 loopback，其余网卡求和）；网络那一档是**对数水位**（1 KB/s 空盘、10 MB/s 满盘、上下行取大），线性刻度会让"挂着不动"和"满速下载"挤在同一格。图标按派发节拍重绘，像素变了才发 `NewIcon`
 - **挂件可以藏起来**：托盘「👻 隐藏挂件」勾一下，或 `tinyticker --hide`（配合单实例转发，这就是你的 DE 快捷键）。藏起来时计时**照常跑**、心跳回落到最慢那一档（实测 10 秒 CPU 从 100ms 掉到 < 10ms），再点一下就回来
+- **编辑态是一档临时状态**：挂件中键、托盘「🛠 编辑态」、或 `tinyticker --edit`（`--no-edit` 退回）都能进。进去之后三件事变了——**整窗接收输入**（点击穿透临时让路，于是拖和滚轮不必去瞄那两行字）、**到点静默**（只把读数换成 `DONE`，不发通知也不执行 `on_finish`，那条一次性的 `--and` 也不会被悄悄消费掉）、**右键改成退出编辑态**（否则想退出去结果把程序关了）。状态行这一档会写成 `EDIT` 提示你在哪儿。它**不进配置**：下次启动总该是普通态，一上手就"右键关不掉"是灾难。Catime 的编辑模式还要吃键盘与对话框，我们这一档只拿它"摆弄挂件"的那半边
 - **结束动作**：桌面通知（带「再来一次」按钮，可用 `notify = false` 整个关掉、`notify_text` 把正文写死成一句话）+ 可选 `on_finish` shell 命令（锁屏、关机、放音乐等）。**要"这次而已"就用 `--and <命令>`**：它只武装一次、跑完自动回落、永不落盘——常驻的 `on_finish` 误留一次就每次结束都触发，这条不会
 - **配置持久化**：时长、时长预设、模式、配色（含 30 条数字色）、透明度、缩放、番茄钟节奏、显示精度与格式、结束命令与通知、窗口位置，退出时自动写回；写入走"同目录临时文件 + `rename`"的**原子替换**，掉电最多退回上一版，不会留下半截配置
 - **开机自启**：托盘「🚀 开机自启」勾一下就在 `~/.config/autostart/` 写好那份与打包同名的 `.desktop`（`Exec` 用可执行文件的真实路径），再点一下删掉。判据就是那个文件在不在，所以在系统设置里关掉我们也能看见
@@ -120,7 +121,7 @@ tinyticker -k           # → 当前那个切到时钟模式
 `已把这条命令交给正在运行的实例 …（本进程不另开窗口）`，免得看不出窗口为什么没变多；
 想知道是谁在听，看 `/run/user/1000/tinyticker.sock` 与 `pgrep -x tinyticker` 即可。
 
-悬浮窗交互：左键按住拖动，右键关闭，滚轮缩放。
+悬浮窗交互：左键按住拖动，右键关闭，滚轮缩放，中键进编辑态（编辑态下右键只退出编辑态）。
 
 托盘交互：左键开始/暂停，中键重置，右键打开完整菜单，在图标上滚动即可缩放。为此 `ItemIsMenu`
 报的是 `false`——规范要求「只有菜单、没有自己的激活行为」的项才报 `true`，而宿主据此会把左键
@@ -234,7 +235,13 @@ src/
 ├── render.rs  # 像素画布、字形绘制（点阵整数放大 / 灰度覆盖度贴图）、时间格式化
 ├── config.rs  # 配置持久化（纯 std 文件 IO）
 ├── parse.rs   # 相对时长与绝对时刻解析
-├── tray.rs    # 自研托盘：StatusNotifierItem + dbusmenu 菜单 + 通知 + 每秒重绘的图标
+├── tray/      # 自研托盘（见下）
+│   ├── mod.rs      # 公共出口 + 托盘线程主体 + 总线消息路由
+│   ├── sni.rs      # StatusNotifierItem 属性、图标像素送出、注册、通知与 ActionInvoked
+│   ├── menu.rs     # 菜单节点表 + 托盘自持的那份勾选态
+│   ├── dbusmenu.rs # com.canonical.dbusmenu 的布局读写与点击/滚轮参数解析
+│   ├── icon.rs     # 32x32 图标的像素绘制 + 悬停提示文本
+│   └── wire.rs     # libdbus 迭代器的小工具（开闭容器、放变体、打包回复）
 └── font8x8.rs # 内置 ASCII 位图字体
 
 packaging/   # 随 release 发布的 freedesktop 资产
@@ -243,9 +250,9 @@ packaging/   # 随 release 发布的 freedesktop 资产
 └── io.github.panzhifu.tinyticker.metainfo.xml # AppStream 元数据
 ```
 
-技术栈：Wayland 侧不用任何 Rust GUI/协议库——`src/sys/wayland.rs` 声明 libwayland-client 的 C API 并在运行时 dlopen，扩展协议（layer-shell / viewporter / fractional-scale / relative-pointer / cursor-shape）的接口描述符按协议 XML 手写。托盘与通知同理：`src/sys/dbus.rs` 声明 libdbus-1 的 C API，`src/tray.rs` 自己实现 StatusNotifierItem + com.canonical.dbusmenu + 通知发送。字形也是同一手法：`src/sys/freetype.rs` 运行时 dlopen `libfreetype.so.6` 取六个函数，按 `offsetof` 探测出的偏移读槽位字段，取不到库或字体就退回内置点阵。因此 **Wayland 极小版零第三方 crate，`ldd` 只有 libc 与 libgcc_s**——构建不需要任何 `-dev` 包，freetype 与 fontconfig 一样都是发行版自带的运行时库。
+技术栈：Wayland 侧不用任何 Rust GUI/协议库——`src/sys/wayland.rs` 声明 libwayland-client 的 C API 并在运行时 dlopen，扩展协议（layer-shell / viewporter / fractional-scale / relative-pointer / cursor-shape）的接口描述符按协议 XML 手写。托盘与通知同理：`src/sys/dbus.rs` 声明 libdbus-1 的 C API，`src/tray/` 自己实现 StatusNotifierItem + com.canonical.dbusmenu + 通知发送。字形也是同一手法：`src/sys/freetype.rs` 运行时 dlopen `libfreetype.so.6` 取六个函数，按 `offsetof` 探测出的偏移读槽位字段，取不到库或字体就退回内置点阵。因此 **Wayland 极小版零第三方 crate，`ldd` 只有 libc、libm 与 libgcc_s**——构建不需要任何 `-dev` 包，freetype 与 fontconfig 一样都是发行版自带的运行时库。
 
-X11 侧同理：`src/sys/x11.rs` 逐字段照 `Xlib.h` 镜像 ABI，`src/x11.rs` 自己建 override-redirect 的 depth-32 ARGB 窗口、`XPutImage` 软渲染、`XShapeCombineRectangles` 做点击穿透，拖动靠 `XGrabPointer` + 根坐标。因此**两种构建都零第三方 crate**（`Cargo.lock` 里只有 tinyticker 自己），实测只硬链 `libc` 与 `libgcc_s`，X11 / Wayland / D-Bus / FreeType 全部运行时 dlopen。
+X11 侧同理：`src/sys/x11.rs` 逐字段照 `Xlib.h` 镜像 ABI，`src/x11.rs` 自己建 override-redirect 的 depth-32 ARGB 窗口、`XPutImage` 软渲染、`XShapeCombineRectangles` 做点击穿透，拖动靠 `XGrabPointer` + 根坐标。因此**两种构建都零第三方 crate**（`Cargo.lock` 里只有 tinyticker 自己），实测只硬链 `libc`、`libm` 与 `libgcc_s`，X11 / Wayland / D-Bus / FreeType 全部运行时 dlopen。
 
 ## 已知限制
 

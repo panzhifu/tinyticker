@@ -61,6 +61,9 @@ pub struct Intent {
     pub hidden: Option<bool>,
     /// `--and <命令>`：武装一条一次性结束命令。只走转发这条路，因此**永不落盘**。
     pub and_then: Option<String>,
+    /// `--edit` / `--no-edit`：把编辑态设成给定值。同样**只在内存里**，冷启动不生效
+    /// （见 `main.rs` 的提示）——留下一个"右键关不掉"的挂件是灾难。
+    pub edit: Option<bool>,
 }
 
 impl Intent {
@@ -78,6 +81,8 @@ impl Intent {
                 "-r" | "--running" => intent.autostart = true,
                 "--hide" => intent.hidden = Some(true),
                 "--show" => intent.hidden = Some(false),
+                "--edit" => intent.edit = Some(true),
+                "--no-edit" => intent.edit = Some(false),
                 // 带值参数：`--and 锁屏.cmd` / `--and=...` 两种写法
                 "--and" | "--then" => {
                     intent.and_then = Some(it.next().cloned().ok_or("--and 后面要跟一条命令")?);
@@ -120,6 +125,10 @@ impl Intent {
         // 可见性排在最前：`--hide` 之后不管换成什么模式，结果都是"藏着跑"
         if let Some(hidden) = self.hidden {
             out.push(Command::SetHidden(hidden));
+        }
+        // 编辑态紧随其后：它只决定输入区域和右键含义，不碰读数
+        if let Some(edit) = self.edit {
+            out.push(Command::SetEdit(edit));
         }
         if let Some(mode) = self.mode {
             out.push(Command::SetMode(mode));
@@ -377,6 +386,24 @@ mod tests {
             vec![Command::SetHidden(true), Command::Preset(1500)],
             "可见性该排在其它命令之前"
         );
+    }
+
+    /// `--edit` / `--no-edit`：与 `--hide` 同一条路，都是"给在跑的那个下命令"，
+    /// 且都是设定值而非翻转值——快捷键重复绑同一条命令也得到同样的结果。
+    #[test]
+    fn edit_flags_map_to_set_edit() {
+        assert_eq!(Intent::parse(&["--edit".into()]).unwrap().edit, Some(true));
+        assert_eq!(Intent::parse(&["--no-edit".into()]).unwrap().edit, Some(false));
+        assert_eq!(Intent::parse(&[]).unwrap().edit, None);
+        assert_eq!(Intent::parse(&["--edit".into()]).unwrap().commands(), vec![Command::SetEdit(true)]);
+        assert_eq!(
+            Intent::parse(&["--no-edit".into(), "25m".into()]).unwrap().commands(),
+            vec![Command::SetEdit(false), Command::Preset(1500)],
+        );
+        // 冷启动时它不进配置：`apply` 只碰 Config 上真有的那几个键
+        let mut cfg = Config::default();
+        Intent::parse(&["--edit".into()]).unwrap().apply(&mut cfg);
+        assert_eq!(cfg, Config::default(), "编辑态不该落到配置里");
     }
 
     #[test]

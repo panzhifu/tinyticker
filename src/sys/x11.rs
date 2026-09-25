@@ -285,6 +285,7 @@ pub const REPARENT_NOTIFY: c_int = 21;
 pub const CONFIGURE_NOTIFY: c_int = 22;
 // —— 按键编号（X 的滚轮就是按钮 4/5） ——
 pub const BTN_1: c_uint = 1;
+pub const BTN_2: c_uint = 2;
 pub const BTN_3: c_uint = 3;
 pub const BTN_WHEEL_UP: c_uint = 4;
 pub const BTN_WHEEL_DOWN: c_uint = 5;

@@ -116,6 +116,12 @@ pub struct Widget {
     ///
     /// 不进配置：退出时是隐藏状态，下次启动该是看得见的，否则用户只会以为程序没起来。
     hidden: bool,
+    /// 编辑态：一档"我正在摆弄这个挂件"的临时状态（`🛠 编辑态` / 挂件中键 / `--edit`）。
+    ///
+    /// 不进配置，理由与 [`Widget::hidden`] 同：下次启动该是普通状态。它换来三件事——
+    /// 整窗接收输入（点击穿透临时让路，于是拖/滚轮不必瞄准那两行字）、右键先考虑
+    /// 退出编辑态而不是关掉挂件、到点静默（不弹通知也不执行结束命令）。
+    edit: bool,
     /// 配置文件的变更探测：手改 `config.conf` 不用重启就生效（#17）。
     cfg_watch: Watch,
     /// **只存在于内存里**的一次性结束命令（`tinyticker 25m --and "..."`）。
@@ -147,6 +153,7 @@ impl Widget {
             text_src,
             started: Instant::now(),
             hidden: false,
+            edit: false,
             cfg_watch: Watch::new(config_path()),
             armed: None,
             reposition: false,
@@ -285,6 +292,8 @@ impl Widget {
             }
             Command::ToggleHidden => self.set_hidden(!self.hidden),
             Command::SetHidden(v) => self.set_hidden(v),
+            Command::ToggleEdit => self.set_edit(!self.edit),
+            Command::SetEdit(v) => self.set_edit(v),
             Command::ToggleNotify => {
                 self.config.notify = !self.config.notify;
                 self.persist_appearance();
@@ -387,6 +396,13 @@ impl Widget {
         let Some(ev) = self.timer.take_finished() else {
             return;
         };
+        // 编辑态期间到点只把读数换成 DONE：不弹通知、也不执行结束命令——"我在摆弄
+        // 这个挂件"不该被一次跑完的倒计时打断，更不该顺手把关机那条触发掉。
+        // 一次性武装（`armed`）因此也不被消费，退出编辑态后仍然算数。
+        if self.edit {
+            eprintln!("🛠 编辑态：本次结束事件只改了读数，未发通知、未执行结束命令");
+            return;
+        }
         let (body, action) = match ev {
             Finished::Countdown => ("⏰ 计时结束", "再来一次"),
             Finished::PomodoroWork => ("🍅 专注完成，休息一下", "好的"),
@@ -457,9 +473,15 @@ impl Widget {
         };
         // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态。
         // 截断按**实测像素宽**算，不是按字数——中文一格点阵宽写不下时也必须整字退让。
-        let status = match self.text_src.text() {
-            Some(external) => text::fit(external, scale, width),
-            None => status,
+        // 编辑态优先占住这一行：那是模式提示（"此刻按右键是退出编辑态"），
+        // 比外部文本的内容更要紧——用户得先看得见自己在哪一档。
+        let status = if self.edit {
+            "EDIT".to_string()
+        } else {
+            match self.text_src.text() {
+                Some(external) => text::fit(external, scale, width),
+                None => status,
+            }
         };
         let status_color = Gradient::solid(0xA0A0AA);
         // 数字行字号只依赖传进来的 scale，所以先算：到点顶替的自定义文本要按
@@ -513,7 +535,9 @@ impl Widget {
             bg,
             num_scale,
             status_scale: scale,
-            click_through: self.config.click_through,
+            // 编辑态临时压过点击穿透：正在摆弄挂件的时候整窗都该接得到手，
+            // 不该去瞄那两行字。退出编辑态自动还原，配置项一个字都不用改。
+            click_through: self.config.click_through && !self.edit,
         })
     }
 
@@ -532,6 +556,46 @@ impl Widget {
         // 重新显示时必须重画：脏检查只看内容指纹，而内容在隐藏期间可能压根没变过，
         // 不 invalidate 的话表面会一直停在"没有缓冲"的空白状态
         self.invalidate();
+        // `--hide` / `--show` 从套接字进来，不经过菜单：那一格的勾要自己跟上
+        if let Some(handle) = &self.tray {
+            tray::sync_hidden(handle, hidden);
+        }
+    }
+
+    /// 进 / 出编辑态。只改内存并标脏：输入区域与状态行都在帧里，不重画就等于没改。
+    fn set_edit(&mut self, on: bool) {
+        if self.edit == on {
+            return;
+        }
+        self.edit = on;
+        // 右键的含义跟着变了，得说清楚——否则用户按右键期待"退出编辑态"，
+        // 却把整个程序关掉
+        eprintln!(
+            "🛠 编辑态{}：{}",
+            if on { "开" } else { "关" },
+            if on { "整窗接收输入，到点静默；右键退出编辑态" } else { "输入区域与右键都回到普通态" }
+        );
+        self.invalidate();
+        // 菜单里那一格要跟着真值走：中键与套接字这两条路都不经过托盘，
+        // 不回填的话它显示的永远是"上次点菜单的结果"（GAP §七 那条漂移）
+        if let Some(handle) = &self.tray {
+            tray::sync_edit(handle, on);
+        }
+    }
+
+    /// 挂件中键：翻一档编辑态（后端的手势入口）。
+    pub fn toggle_edit(&mut self) {
+        self.set_edit(!self.edit);
+    }
+
+    /// 挂件上按右键：编辑态下先退出编辑态，否则按原来的语义退出程序。
+    /// 返回 `true` 表示后端应当收尾退出。
+    pub fn right_click(&mut self) -> bool {
+        if self.edit {
+            self.set_edit(false);
+            return false;
+        }
+        true
     }
 
     /// 退出前把当前模式、倒计时总时长、缩放和窗口位置写回配置。
@@ -655,6 +719,67 @@ mod tests {
         // 设定值命令是幂等的：重复执行不会再翻一次
         w.handle_cmd(Command::SetHidden(false));
         assert!(!w.hidden());
+    }
+
+    /// 编辑态把输入区域放开到整窗，状态行要说清楚自己在哪一档，右键先退回普通态。
+    ///
+    /// 输入矩形那两个具体数字来自 `click_through_rect_spans_both_rows`；这里只验
+    /// "编辑态要把它换成整窗"，退出后必须逐位还原回矩形。
+    #[test]
+    fn edit_mode_widens_input_and_takes_the_right_button_over() {
+        let cfg = Config { click_through: true, ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        let f = w.build_frame(200, 100, 2).expect("第一帧总要画");
+        assert_eq!(f.input_rect(1.0), Some((36, 22, 128, 56)), "普通态只接收那两行字");
+
+        w.toggle_edit();
+        let f = w.build_frame(200, 100, 2).expect("换档就该重画一帧");
+        assert_eq!(last_status(&w), "EDIT", "状态行要占住一格说明自己在编辑态");
+        assert_eq!(f.input_rect(1.0), None, "编辑态整窗可点");
+
+        // 编辑态的右键是"退出编辑态"，不是把挂件关掉
+        assert!(!w.right_click(), "编辑态下右键不该退出程序");
+        assert!(!w.edit);
+        let f = w.build_frame(200, 100, 2).expect("退回普通态也要重画");
+        assert_eq!(last_status(&w), "PAUSED", "退回普通态就该把状态行还给计时器");
+        assert_eq!(f.input_rect(1.0), Some((36, 22, 128, 56)));
+        assert!(w.right_click(), "普通态的右键仍然是关掉挂件");
+    }
+
+    /// 中键与托盘 / 套接字那条命令走的是同一份状态；设定值命令要幂等，
+    /// 因为 `tinyticker --edit` 可以被反复敲。
+    #[test]
+    fn edit_mode_shares_one_state_and_set_is_idempotent() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::SetEdit(true));
+        assert!(w.edit);
+        w.handle_cmd(Command::SetEdit(true));
+        assert!(w.edit, "重复设定不该把它翻回去");
+        w.handle_cmd(Command::SetEdit(false));
+        assert!(!w.edit);
+        w.handle_cmd(Command::ToggleEdit);
+        assert!(w.edit, "切换命令走的是同一格状态");
+        // 编辑态挂在 `Widget` 而不是 `Config` 上（同 `hidden`）：退出时不会留下
+        // 一个"右键关不掉"的挂件，这一点由类型本身保证
+    }
+
+    /// 编辑态期间到点只改读数：不发通知、不执行结束命令，而一次性武装**不被吃掉**
+    /// （否则用户调完外观回来，那次 `--and` 早就悄悄没了）。
+    #[test]
+    fn edit_mode_swallows_the_finish_event_without_consuming_the_arming() {
+        let cfg = Config { duration_secs: 1, on_finish: Some("echo persistent".into()), ..Config::default() };
+        let mut w = Widget::new(cfg, true);
+        w.handle_cmd(Command::ArmFinish("echo once".into()));
+        w.toggle_edit();
+        let t0 = Instant::now();
+        w.timer.tick_at(t0);
+        w.timer.tick_at(t0 + Duration::from_secs(2));
+        w.tick();
+        assert!(w.timer.is_done(), "读数照常被换成 DONE");
+        assert_eq!(w.armed.as_deref(), Some("echo once"), "到点静默不等于把武装消费掉");
+        // 退出编辑态后由下一次结束来兑现它（执行那半边由 `armed_finish_command_is_one_shot` 覆盖）
+        w.toggle_edit();
+        assert_eq!(w.take_finish_cmd(Finished::Countdown).as_deref(), Some("echo once"));
     }
 
     /// 热加载：空着的计时器跟着文件走，正在跑的不动；缩放与配色当场生效。

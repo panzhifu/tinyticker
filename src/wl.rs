@@ -29,6 +29,7 @@ use crate::widget::{LOGICAL_SIZE, Frame, Widget};
 /// Linux input-event 按键码，`wl_pointer.button` 原样透传。
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 /// 没有历史位置时的初始坐标（逻辑像素，距左上角）。
 const DEFAULT_POS: (i32, i32) = (80, 80);
 /// layer-shell：overlay 层、anchor top|left、键盘不交互。
@@ -45,6 +46,9 @@ const SURFACE_DAMAGE: u32 = 2;
 const SURFACE_SET_INPUT_REGION: u32 = 5;
 const SURFACE_COMMIT: u32 = 6;
 const SURFACE_DAMAGE_BUFFER: u32 = 9;
+/// wl_region 的请求号：0 是 `destroy`（无参数），`add` 是 **1**。
+/// 写成 0 会先把刚建的区域销毁掉，紧接着 `set_input_region` 就报 invalid arguments。
+const REGION_ADD: u32 = 1;
 const LAYER_SET_SIZE: u32 = 0;
 const LAYER_SET_ANCHOR: u32 = 1;
 const LAYER_SET_EXCLUSIVE_ZONE: u32 = 2;
@@ -93,6 +97,8 @@ struct Events {
     /// 左键"刚按下"的边沿标记：主循环据此把 drag_origin 对齐到当前 margin
     left_pressed: Cell<bool>,
     right_pressed: Cell<bool>,
+    /// 中键"刚按下"的边沿标记：挂件上唯一空闲的手势，用来翻编辑态
+    middle_pressed: Cell<bool>,
     rel_dx: Cell<f64>,
     rel_dy: Cell<f64>,
     axis: Cell<f64>,
@@ -543,8 +549,12 @@ client.commit();
         if e.frame.get() {
             self.flush_axis()?;
         }
+        if e.middle_pressed.replace(false) {
+            self.widget.toggle_edit();
+        }
         if e.right_pressed.replace(false) {
-            self.quit = true;
+            // 编辑态下右键是"退出编辑态"，只有普通态才是关掉挂件
+            self.quit = self.widget.right_click();
         }
         Ok(())
     }
@@ -703,7 +713,7 @@ client.commit();
             Input::None => Some(self.new_region()),
             Input::Rect((x, y, w, h)) => {
                 let region = self.new_region();
-                request(&self.wl, region, 0, &[int(x), int(y), int(w), int(h)]);
+                request(&self.wl, region, REGION_ADD, &[int(x), int(y), int(w), int(h)]);
                 Some(region)
             }
         };
@@ -939,6 +949,7 @@ unsafe extern "C" fn on_ptr_button(
             e.rel_dy.set(0.0);
         }
         (BTN_RIGHT, true) => e.right_pressed.set(true),
+        (BTN_MIDDLE, true) => e.middle_pressed.set(true),
         _ => {}
     }
 }
@@ -988,7 +999,9 @@ unsafe extern "C" fn on_relative_motion(
 
 #[cfg(test)]
 mod tests {
-    use super::fixed;
+    use super::{
+        REGION_ADD, SURFACE_ATTACH, SURFACE_COMMIT, SURFACE_SET_INPUT_REGION, fixed,
+    };
 
     /// `wl_fixed_t` 是 24.8，不是 16.16：线上 1 px 的位移就是 256。
     /// 这条钉住换算常数——写成 ÷65536 会让所有位移缩水 256 倍，
@@ -1019,5 +1032,21 @@ mod tests {
         assert_eq!(next, (602, 254));
         // 旧常数下这里只有 0.0156，连 round() 的 0.5 阈值都够不着
         assert!(fixed(256) >= 0.5, "1 px 鼠标位移必须够一轮取整");
+    }
+
+    /// 钉住几个请求号（照 `/usr/share/wayland/wayland.xml` 里各接口的请求顺序数）：
+    /// `wl_region` 的 0 号是 `destroy` 而不是 `add`。当年按 0 发"加矩形"带四个整数，
+    /// 后果是刚 `create_region` 出来的区域被销毁，紧跟的 `set_input_region` 引用到一个
+    /// 死对象——niri 当场报 `invalid arguments` 掐断客户端，于是
+    /// **`click_through = true` 的挂件一启动就没**（2026-09-25 实测才发现）。
+    #[test]
+    fn region_requests_keep_their_protocol_numbers() {
+        // wl_region: destroy=0, add=1, subtract=2
+        assert_eq!(REGION_ADD, 1);
+        // wl_surface: destroy=0, attach=1, damage=2, frame=3, opaque=4, input=5, commit=6
+        assert_eq!(SURFACE_ATTACH, 1);
+        assert_eq!(SURFACE_SET_INPUT_REGION, 5);
+        assert_eq!(SURFACE_COMMIT, 6, "commit 与 set_input_region 只差一位，别写串");
+        // wl_compositor: create_surface=0, create_region=1（`new_region` 用的就是 1）
     }
 }
