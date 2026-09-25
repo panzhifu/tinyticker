@@ -745,6 +745,11 @@ client.commit();
             }
             // 托盘命令也可能改 zoom（图标上的 Scroll），尺寸统一在这里结算
             self.sync_zoom()?;
+            // 「重置窗口位置」/「恢复默认设置」：挪回出厂位置，margin 也就是持久化的那份
+            if self.widget.take_reposition() {
+                self.set_margin(DEFAULT_POS);
+                self.commit();
+            }
             self.widget.tick();
             self.apply_events()?;
             self.render();

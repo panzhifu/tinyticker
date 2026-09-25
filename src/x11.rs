@@ -419,6 +419,16 @@ impl Client {
             self.widget.tick();
             self.pump_events();
             self.sync_size();
+            // 「重置窗口位置」/「恢复默认设置」：按启动时同一套换算挪回出厂位置
+            if self.widget.take_reposition() {
+                let d = self.sf;
+                self.pos = clamp(
+                    ((DEFAULT_POS.0 as f32 * d).round() as i32, (DEFAULT_POS.1 as f32 * d).round() as i32),
+                    self.size,
+                    self.screen(),
+                );
+                unsafe { (self.x.XMoveWindow)(self.dpy, self.win, self.pos.0, self.pos.1) };
+            }
             self.draw();
             unsafe { (self.x.XFlush)(self.dpy) };
 

@@ -241,6 +241,10 @@ pub struct Config {
     /// 空 = 保持现状（显示 `0s` / `0.00s`）；`"0"` = 整行留空；其它文本（可中文）
     /// 直接顶替数字。状态行仍会写 `DONE`，所以留空不会让人以为程序没了。
     pub timeout_text: Option<String>,
+    /// 计时结束要不要发桌面通知。false = 一声不响（`on_finish` 命令照旧执行）。
+    pub notify: bool,
+    /// 通知正文的自定义写法。空 = 按事件用默认文案（专注完成 / 休息结束 …各说各的）。
+    pub notify_text: Option<String>,
     /// 外部文本源文件（可选）。非空时它的第一行会顶替状态行内容；
     /// 支持开头的 `~/`。文件缺失/为空/超限时状态行回到挂件自己的内容。
     pub text_source: Option<String>,
@@ -273,6 +277,8 @@ impl Default for Config {
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
             timeout_text: None,
+            notify: true,
+            notify_text: None,
             text_source: None,
             text_font: TextFont::default(),
             window_pos: None,
@@ -300,16 +306,113 @@ fn absolute(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     (!value.is_empty() && path.is_absolute()).then_some(path)
 }
 
-fn env_dir(name: &str) -> Option<PathBuf> {
-    absolute(std::env::var_os(name))
+/// `--config-dir` 指定的目录。启动时设一次，之后配置路径与单实例套接字都从这里取。
+static CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// 记下 `--config-dir` 的值。只在启动时调用一次，重复调用以第一次为准（`OnceLock`）。
+pub fn set_config_dir(path: &str) {
+    let _ = CONFIG_DIR.set(PathBuf::from(path));
+}
+
+/// 配置目录是否被显式指定过（`--config-dir` 或环境变量）。
+///
+/// 套接字路径要问这个而不是问 [`config_dir`]：正常的 XDG 目录里放套接字是错的，
+/// 只有"用户明确要另一套独立实例"时套接字才该跟着搬进那个目录。
+pub fn config_dir_override() -> Option<PathBuf> {
+    CONFIG_DIR.get().cloned().or_else(|| {
+        std::env::var_os("TINYTICKER_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// 配置根目录（`$XDG_CONFIG_HOME`，缺省 `$HOME/.config`）的纯函数部分。
+///
+/// 值只有是非空**绝对路径**时才算数：相对路径会让配置跟着当前工作目录漂移。
+fn base_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    absolute(xdg.map(std::ffi::OsString::from))
+        .or_else(|| absolute(home.map(std::ffi::OsString::from)).map(|h| h.join(".config")))
+}
+
+/// 路径优先级的纯函数部分，单测直接喂三档值进来（进程级环境变量在并行测试里不可靠）。
+///
+/// `explicit` = `--config-dir` / `$TINYTICKER_CONFIG_DIR`；它给的是**相对路径**时按
+/// 当前工作目录解释——本进程不会 chdir，所以这是稳定的。
+fn resolve_config_dir(explicit: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = explicit.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    Some(base_dir(xdg, home)?.join(env!("CARGO_PKG_NAME")))
+}
+
+/// `$XDG_CONFIG_HOME` 或 `$HOME/.config`。自启条目与配置目录共用这一个根。
+pub fn config_base() -> Option<PathBuf> {
+    base_dir(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// 当前配置目录：`--config-dir` / `$TINYTICKER_CONFIG_DIR` > `$XDG_CONFIG_HOME/tinyticker`
+/// > `$HOME/.config/tinyticker`。三档都不合格时 `None`，此时不读写文件。
+pub fn config_dir() -> Option<PathBuf> {
+    let explicit = config_dir_override().map(|p| p.to_string_lossy().into_owned());
+    resolve_config_dir(
+        explicit.as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
 }
 
 /// 配置文件完整路径。XDG 优先，缺省 `$HOME/.config`；两个环境变量都不合格时返回
 /// `None`，此时 `load` / `save` 静默走默认值（不读写文件）。
 pub fn config_path() -> Option<PathBuf> {
-    let dir =
-        env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|home| home.join(".config")))?;
-    Some(dir.join(env!("CARGO_PKG_NAME")).join(CONFIG_FILE))
+    Some(config_dir()?.join(CONFIG_FILE))
+}
+
+/// 开机自启条目。文件名与打包的 desktop 文件**同名**——freedesktop 的自启机制就是
+/// 往 `~/.config/autostart/` 放一份同名副本，用户想关掉直接删这个文件即可。
+const AUTOSTART_FILE: &str = "io.github.panzhifu.tinyticker.desktop";
+
+/// 自启条目的路径（没有合格的配置根时 `None`）。
+fn autostart_path() -> Option<PathBuf> {
+    Some(config_base()?.join("autostart").join(AUTOSTART_FILE))
+}
+
+/// `.desktop` 的内容。`Exec` 用当前可执行文件的真实路径：开发构建下它会指向
+/// `target/release/tinyticker`，那是诚实的行为而不是 bug。
+fn autostart_entry(exec: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=TinyTicker\n\
+         Comment=极简悬浮计时器\n\
+         Exec={exec}\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+/// 当前是不是已经登记了开机自启（判据就是那个文件在不在）。
+pub fn autostart_enabled() -> bool {
+    autostart_path().is_some_and(|p| p.exists())
+}
+
+/// 翻面：没有就写一份，有就删掉。返回翻转后的状态。
+pub fn toggle_autostart() -> std::io::Result<bool> {
+    let Some(path) = autostart_path() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "环境里没有合格的 HOME / XDG_CONFIG_HOME",
+        ));
+    };
+    if path.exists() {
+        fs::remove_file(&path)?;
+        return Ok(false);
+    }
+    let exec = std::env::current_exe()?.to_string_lossy().into_owned();
+    write_atomic(&path, &autostart_entry(&exec))?;
+    Ok(true)
 }
 
 /// 原子写：先写同目录的临时文件、`sync_all` 落盘，再 `rename` 覆盖目标。
@@ -408,7 +511,7 @@ impl Config {
                         cfg.zoom = z;
                     }
                 }
-                "click_through" | "clock_12h" | "clock_seconds" | "centiseconds" => {
+                "click_through" | "clock_12h" | "clock_seconds" | "centiseconds" | "notify" => {
                     let on = matches!(
                         value.to_ascii_lowercase().as_str(),
                         "true" | "1" | "yes" | "on"
@@ -417,6 +520,7 @@ impl Config {
                         "click_through" => cfg.click_through = on,
                         "clock_12h" => cfg.clock_12h = on,
                         "clock_seconds" => cfg.clock_seconds = on,
+                        "notify" => cfg.notify = on,
                         _ => cfg.centiseconds = on,
                     }
                 }
@@ -469,6 +573,11 @@ impl Config {
                 "timeout_text" => {
                     if !value.is_empty() {
                         cfg.timeout_text = Some(value.to_string());
+                    }
+                }
+                "notify_text" => {
+                    if !value.is_empty() {
+                        cfg.notify_text = Some(value.to_string());
                     }
                 }
                 "text_source" => {
@@ -540,6 +649,10 @@ impl Config {
         }
         if let Some(text) = &self.timeout_text {
             out.push_str(&format!("timeout_text = {text}\n"));
+        }
+        out.push_str(&format!("notify = {}\n", self.notify));
+        if let Some(text) = &self.notify_text {
+            out.push_str(&format!("notify_text = {text}\n"));
         }
         if let Some(path) = &self.text_source {
             out.push_str(&format!("text_source = {path}\n"));
@@ -636,6 +749,8 @@ mod tests {
             presets: vec![90, 600, 5400],
             on_finish: Some("loginctl lock-session".into()),
             timeout_text: Some("时间到".into()),
+            notify: false,
+            notify_text: Some("该起来了".into()),
             text_source: Some("~/tmp/tinyticker-out.txt".into()),
             window_pos: Some((-10, 200)),
             ..Config::default()
@@ -818,17 +933,18 @@ mod tests {
         assert_eq!(bad.pomo, Pomo::default());
     }
 
-    /// 布尔开关共用同一套值串。默认值也一起钉住：百分秒与"显示秒"里，前者默认关
-    /// （代价是心跳），后者默认开（v0.5.0 以来的行为）。
+    /// 布尔开关共用同一套值串。默认值也一起钉住：百分秒与"显示秒"里前者默认关
+    /// （代价是心跳）、后者默认开（v0.5.0 以来的行为），"发通知"同样默认开。
     #[test]
     fn boolean_keys_parse_the_same_aliases() {
         let get = |cfg: &Config, key: &str| match key {
             "click_through" => cfg.click_through,
             "clock_12h" => cfg.clock_12h,
             "clock_seconds" => cfg.clock_seconds,
+            "notify" => cfg.notify,
             _ => cfg.centiseconds,
         };
-        for key in ["click_through", "clock_12h", "clock_seconds", "centiseconds"] {
+        for key in ["click_through", "clock_12h", "clock_seconds", "notify", "centiseconds"] {
             for on in ["true", "1", "yes", "on", "TRUE", "Yes"] {
                 let cfg = Config::from_str(&format!("{key} = {on}\n"));
                 assert!(get(&cfg, key), "{key} = {on} 应解析为 true");
@@ -841,6 +957,7 @@ mod tests {
         assert!(!Config::default().click_through); // 默认整窗可拖动
         assert!(!Config::default().centiseconds);
         assert!(Config::default().clock_seconds);
+        assert!(Config::default().notify);
     }
 
     /// `time_pad` 只认那三个值串，写错留默认档而不是把配置丢掉。
@@ -934,6 +1051,55 @@ mod tests {
         // 没有合格路径（HOME / XDG_CONFIG_HOME 都不在）时整个探测静默
         assert!(!Watch::new(None).changed(t0 + Duration::from_millis(2000)));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 路径优先级：显式指定 > XDG > HOME/.config，且 XDG 是相对路径时要能落到 HOME。
+    #[test]
+    fn config_dir_precedence() {
+        let app = env!("CARGO_PKG_NAME");
+        // 显式那档最优先，且原值照用（相对路径按当前工作目录解释，本进程不 chdir）
+        assert_eq!(
+            resolve_config_dir(Some("/tmp/tt-a"), Some("/xdg"), Some("/home")),
+            Some(PathBuf::from("/tmp/tt-a"))
+        );
+        assert_eq!(
+            resolve_config_dir(Some("relative/dir"), None, None),
+            Some(PathBuf::from("relative/dir"))
+        );
+        assert_eq!(
+            resolve_config_dir(None, Some("/xdg"), Some("/home")),
+            Some(PathBuf::from(format!("/xdg/{app}")))
+        );
+        assert_eq!(
+            resolve_config_dir(None, None, Some("/home")),
+            Some(PathBuf::from(format!("/home/.config/{app}")))
+        );
+        // XDG 是相对路径时按老规矩不算数，回落到 HOME
+        assert_eq!(
+            resolve_config_dir(None, Some("relative/xdg"), Some("/home")),
+            Some(PathBuf::from(format!("/home/.config/{app}")))
+        );
+        // 三档都没有：不读写文件，静默走默认值
+        assert_eq!(resolve_config_dir(None, None, None), None);
+        assert_eq!(resolve_config_dir(Some(""), Some(""), Some("")), None);
+    }
+
+    /// 自启条目：freedesktop 认的那几个键都要在，`Exec` 用真实路径。
+    #[test]
+    fn autostart_entry_has_the_keys_hosts_read() {
+        let s = autostart_entry("/usr/bin/tinyticker");
+        for key in [
+            "[Desktop Entry]",
+            "Type=Application",
+            "Name=TinyTicker",
+            "Exec=/usr/bin/tinyticker",
+            "Terminal=false",
+            "X-GNOME-Autostart-enabled=true",
+        ] {
+            assert!(s.contains(key), "条目里缺 {key}:\n{s}");
+        }
+        // 文件名与打包的 desktop 文件同名，用户想手动关掉就是删这个文件
+        assert_eq!(AUTOSTART_FILE, "io.github.panzhifu.tinyticker.desktop");
     }
 
     #[test]

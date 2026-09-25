@@ -59,6 +59,8 @@ pub struct Intent {
     /// `--hide` / `--show`：把挂件的可见性设成给定值。
     /// 只对**已在跑的那个实例**有意义，冷启动时新实例总是可见的（见 `main.rs` 的提示）。
     pub hidden: Option<bool>,
+    /// `--and <命令>`：武装一条一次性结束命令。只走转发这条路，因此**永不落盘**。
+    pub and_then: Option<String>,
 }
 
 impl Intent {
@@ -66,7 +68,8 @@ impl Intent {
     /// 这样垃圾参数根本不会上到套接字上。
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut intent = Intent::default();
-        for arg in args {
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-s" | "--stopwatch" => intent.mode = Some(Mode::Stopwatch),
                 "-c" | "--countdown" => intent.mode = Some(Mode::Countdown),
@@ -75,7 +78,15 @@ impl Intent {
                 "-r" | "--running" => intent.autostart = true,
                 "--hide" => intent.hidden = Some(true),
                 "--show" => intent.hidden = Some(false),
+                // 带值参数：`--and 锁屏.cmd` / `--and=...` 两种写法
+                "--and" | "--then" => {
+                    intent.and_then = Some(it.next().cloned().ok_or("--and 后面要跟一条命令")?);
+                }
                 other => {
+                    if let Some(v) = other.strip_prefix("--and=") {
+                        intent.and_then = Some(v.to_string());
+                        continue;
+                    }
                     // 时长：相对写法（"25m"）或绝对时刻（"14:30"，已过算明天同一时刻）
                     let secs = parse::parse_duration(other).or_else(|| {
                         parse::parse_absolute(other).map(|t| parse::secs_until(t, clock::now_hms()))
@@ -119,6 +130,10 @@ impl Intent {
             // 只给 `-r` 时是"把当前这个跑起来"，而不是重新按一个预设
             out.push(Command::Start);
         }
+        // 一次性结束命令放最后：它武装的是"这一次跑完干什么"，得等计时器先定下来
+        if let Some(cmd) = &self.and_then {
+            out.push(Command::ArmFinish(cmd.clone()));
+        }
         out
     }
 }
@@ -142,6 +157,11 @@ fn decode(line: &str) -> Vec<String> {
 /// 退回 temp 目录时必须带上 uid，否则多用户机器上会互相踢。
 #[must_use]
 pub fn socket_path() -> std::path::PathBuf {
+    // 显式指定过配置目录 = 用户要的是"另一套互不相干的实例"，套接字也跟着搬进那个目录；
+    // 否则第二个实例会把命令转给第一个，两个配置目录就分不开了
+    if let Some(dir) = crate::config::config_dir_override() {
+        return dir.join("tinyticker.sock");
+    }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_dir());
@@ -313,6 +333,36 @@ mod tests {
             vec![Command::Start]
         );
         assert!(Intent::parse(&[]).unwrap().commands().is_empty());
+    }
+
+    /// `--and` 带一条命令，两种写法都认；缺值要报错而不是把下一条参数吃掉当默认。
+    #[test]
+    fn and_arms_a_one_shot_finish_command() {
+        let i = Intent::parse(&["25m".into(), "--and".into(), "loginctl lock-session".into()]).unwrap();
+        assert_eq!(i.duration, Some(1500));
+        assert_eq!(i.and_then.as_deref(), Some("loginctl lock-session"));
+        assert_eq!(
+            i.commands(),
+            vec![
+                Command::Preset(1500),
+                Command::ArmFinish("loginctl lock-session".into())
+            ],
+            "武装命令排在时长之后"
+        );
+        // 等号写法：整条命令里带空格也不用拆成两个参数
+        assert_eq!(
+            Intent::parse(&["--and=notify-send 好了".into()]).unwrap().and_then.as_deref(),
+            Some("notify-send 好了")
+        );
+        // 别名
+        assert!(Intent::parse(&["--then".into(), "x".into()]).unwrap().and_then.is_some());
+        // 缺值：报错，不能静默把后面的时长参数吞掉
+        assert!(Intent::parse(&["--and".into()]).is_err());
+        assert!(Intent::parse(&["--and".into(), "25m".into()])
+            .unwrap()
+            .and_then
+            .as_deref()
+            == Some("25m"), "带值参数吃掉的那一条不该再被当成时长");
     }
 
     /// `--hide` / `--show` 是设定值而不是翻面，所以重复执行同一个命令结果不变。

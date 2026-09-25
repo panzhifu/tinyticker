@@ -60,12 +60,16 @@ TinyTicker —— 极简悬浮倒计时 / 秒表
   -k, --clock      以时钟挂件模式启动
   -r, --running    启动后立即开始计时
   --hide, --show   隐藏 / 显示挂件（只对已经在跑的那个实例有效）
+  -C, --config-dir 指定配置目录（或设 TINYTICKER_CONFIG_DIR）：配置与套接字都落在
+                   那个目录里，所以可以同时跑两套互不相干的挂件
+  --and <命令>     武装一条一次性结束命令（别名 --then）：下次计时结束执行一次就失效，
+                   不写进配置——常驻的 on_finish 误留一次就每次结束都触发，这条不会
   -h, --help       显示帮助
   -V, --version    显示版本
 
 交互:
   托盘左键        开始 / 暂停（中键重置，右键完整菜单）
-  托盘右键菜单    开始 / 暂停 / 重置 / 隐藏挂件 / 时长预设 / 模式切换（倒计时/秒表/番茄钟/时钟）/ 外观（透明度·配色·特效·图标·时间格式）/ 退出
+  托盘右键菜单    开始 / 暂停 / 重置 / 隐藏挂件 / 弹通知 / 开机自启 / 时长预设 / 模式切换 / 外观（透明度·配色·文字颜色·特效·图标·时间格式）/ 恢复默认设置 / 重置窗口位置 / 退出
   托盘图标滚轮    缩放悬浮窗
   悬浮窗          左键按住拖动，右键关闭；滚轮缩放；计时结束弹系统通知
 
@@ -74,9 +78,12 @@ TinyTicker —— 极简悬浮倒计时 / 秒表
       tinyticker 25m      → 已在跑的挂件立刻开始 25 分钟倒计时
       tinyticker -k       → 切到时钟挂件模式
       tinyticker 14:30 -r → 倒计时到 14:30 并开始
+      tinyticker 25m --and \"loginctl lock-session\"
+                          → 这次跑完锁屏，仅此一次；不写配置，下次结束不再锁
   因此全局快捷键不必我们自己实现：在 KDE / GNOME / niri 的快捷键设置里
   绑一条 `tinyticker 25m` 就行。套接字在 $XDG_RUNTIME_DIR/tinyticker.sock
   （不可用时退到 /tmp/tinyticker-<uid>.sock），权限 0600，只有同一用户能连。
+  加 `--config-dir <目录>` 时配置与套接字都搬进那个目录，于是可以同时跑两套互不相干的挂件。
 
 配置（时长 / 模式 / 颜色 / 透明度 / 缩放 / 番茄钟 / 显示精度与补零 / 结束命令 / 窗口位置）存于:
 ";
@@ -90,6 +97,30 @@ fn print_usage() {
     }
 }
 
+/// 摘出 `--config-dir <路径>` / `--config-dir=<路径>` / `-C <路径>`，返回剩下的参数。
+///
+/// 它改的是"本进程去哪儿找配置与套接字"，所以**不进转发列表**：剩下的参数交给那个
+/// 目录下的实例。指定之后套接字也落在那个目录里，两套配置因此互不相干。
+fn take_config_dir(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut dir = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--config-dir=") {
+            dir = Some(v.to_string());
+        } else if a == "--config-dir" || a == "-C" {
+            dir = it.next().cloned();
+            if dir.is_none() {
+                eprintln!("--config-dir 后面要跟一个路径");
+                std::process::exit(2);
+            }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (dir, rest)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -101,6 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "-V" || a == "--version") {
         println!("tinyticker {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    // 配置目录必须在任何一次路径解析之前定下来（`config_path` 与 `socket_path` 都读它）
+    let (config_dir, args) = take_config_dir(&args);
+    if let Some(dir) = config_dir {
+        config::set_config_dir(&dir);
     }
 
     // 先解析再转发：垃圾参数在这里就被拦下，不会上到套接字上让收端静默丢掉。
@@ -165,4 +201,28 @@ fn run_backend(
     return x11::run(cmd_rx, handle_rx, config, autostart);
     #[cfg(not(feature = "x11"))]
     Err("此构建只含 Wayland 后端，而当前会话没有 WAYLAND_DISPLAY".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_config_dir;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--config-dir` 三种写法都要被摘干净：它不该出现在转发给另一个实例的参数里。
+    #[test]
+    fn config_dir_is_taken_out_of_the_args() {
+        let (dir, rest) = take_config_dir(&v(&["--config-dir", "/tmp/x", "25m"]));
+        assert_eq!(dir.as_deref(), Some("/tmp/x"));
+        assert_eq!(rest, v(&["25m"]), "路径本身不算时长参数");
+        let (dir, rest) = take_config_dir(&v(&["--config-dir=/tmp/y", "-r"]));
+        assert_eq!(dir.as_deref(), Some("/tmp/y"));
+        assert_eq!(rest, v(&["-r"]));
+        assert_eq!(take_config_dir(&v(&["-C", "/tmp/z"])).0.as_deref(), Some("/tmp/z"));
+        let (dir, rest) = take_config_dir(&v(&["25m", "-s"]));
+        assert_eq!(dir, None, "没给就不该造出一个目录");
+        assert_eq!(rest, v(&["25m", "-s"]));
+    }
 }

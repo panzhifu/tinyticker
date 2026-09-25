@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use crate::tray::TrayHandle;
 
 use crate::clock;
-use crate::config::{COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path};
+use crate::config::{
+    COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path, toggle_autostart,
+};
 use crate::effect::{self, Effect, Gradient};
 use crate::render::{self, premultiply, Canvas};
 use crate::text;
@@ -116,6 +118,13 @@ pub struct Widget {
     hidden: bool,
     /// 配置文件的变更探测：手改 `config.conf` 不用重启就生效（#17）。
     cfg_watch: Watch,
+    /// **只存在于内存里**的一次性结束命令（`tinyticker 25m --and "..."`）。
+    ///
+    /// 存在的理由是安全而不是能力：`on_finish` 是常驻配置，一次误留就变成"每次
+    /// 计时结束都关机"。这条走完一次自己清空，不需要谁记得去改配置文件。
+    armed: Option<String>,
+    /// 请求后端把窗口挪回出厂位置（`Command::Reset*` 置位，后端每拍取走一次）。
+    reposition: bool,
     /// 上一帧的内容指纹（文本 / 状态 / 尺寸 / 字号 / 动画相位）。
     last_frame: Option<(String, String, u32, u32, u32, u32)>,
 }
@@ -139,6 +148,8 @@ impl Widget {
             started: Instant::now(),
             hidden: false,
             cfg_watch: Watch::new(config_path()),
+            armed: None,
+            reposition: false,
             last_frame: None,
         }
     }
@@ -168,6 +179,13 @@ impl Widget {
     /// 挂件当前是否被藏着（后端据此决定要不要呈现）。
     pub fn hidden(&self) -> bool {
         self.hidden
+    }
+
+    /// 取走"把窗口挪回出厂位置"的请求（一次性的，取完就清）。
+    pub fn take_reposition(&mut self) -> bool {
+        let r = self.reposition;
+        self.reposition = false;
+        r
     }
 
     /// 心跳间隔：静态内容 200ms 就够，动画特效要 50ms，走动的百分秒要 20ms。
@@ -267,6 +285,30 @@ impl Widget {
             }
             Command::ToggleHidden => self.set_hidden(!self.hidden),
             Command::SetHidden(v) => self.set_hidden(v),
+            Command::ToggleNotify => {
+                self.config.notify = !self.config.notify;
+                self.persist_appearance();
+            }
+            Command::ArmFinish(cmd) => self.armed = Some(cmd),
+            Command::ToggleAutostart => match toggle_autostart() {
+                Ok(on) => eprintln!(
+                    "→ {}",
+                    if on { "已登记开机自启（~/.config/autostart/）" } else { "已取消开机自启" }
+                ),
+                // 没有合格的 HOME / XDG_CONFIG_HOME 时本来也没地方放条目
+                Err(e) => eprintln!("⚠️ 改开机自启失败: {e}"),
+            },
+            Command::ResetConfig => {
+                self.apply_config(Config::default());
+                self.reposition = true;
+                self.persist_appearance();
+                eprintln!("↺ 已恢复出厂设置（时长预设档位与托盘图标要重启才回到菜单上）");
+            }
+            Command::ResetPosition => {
+                self.config.window_pos = None;
+                self.reposition = true;
+                self.persist_appearance();
+            }
             Command::Quit => return true,
         }
         false
@@ -326,6 +368,17 @@ impl Widget {
         self.invalidate();
     }
 
+    /// 这次结束该执行哪条命令：一次性的优先且用完清空，否则回到常驻的 `on_finish`。
+    ///
+    /// 只有倒计时归零与番茄钟专注完成算"计时结束"——休息结束不许把待执行的那条
+    /// 一次性命令悄悄吃掉。
+    fn take_finish_cmd(&mut self, ev: Finished) -> Option<String> {
+        if !matches!(ev, Finished::Countdown | Finished::PomodoroWork) {
+            return None;
+        }
+        self.armed.take().or_else(|| self.config.on_finish.clone())
+    }
+
     /// 推进计时，并处理本次产生的结束事件（通知 + on_finish 命令）。
     pub fn tick(&mut self) {
         self.text_src.refresh();
@@ -341,13 +394,20 @@ impl Widget {
             Finished::PomodoroLongBreak => ("🌿 长休息结束，开始下一组", "开始"),
             Finished::PomodoroAllDone => ("🎉 番茄钟全部完成", "再来一组"),
         };
-        if let Some(handle) = &self.tray {
-            tray::notify(handle, body, action);
+        // 通知可以整个关掉（`on_finish` 照旧执行），也可以把正文写死成一句话——
+        // 写死时五种事件共用同一句，那是用户的选择而不是我们的
+        if self.config.notify {
+            let text = self.config.notify_text.as_deref().unwrap_or(body);
+            if let Some(handle) = &self.tray {
+                tray::notify(handle, text, action);
+            }
         }
         // 锁屏 / 关机 / 打开文件等场景都由用户命令覆盖
-        if matches!(ev, Finished::Countdown | Finished::PomodoroWork)
-            && let Some(cmd) = self.config.on_finish.clone()
-        {
+        let had_armed = self.armed.is_some();
+        if let Some(cmd) = self.take_finish_cmd(ev) {
+            if had_armed {
+                eprintln!("↦ 执行一次性结束命令（`--and`，只此一次）");
+            }
             // 后台线程等待子进程退出，避免僵尸进程，也不阻塞 UI
             std::thread::spawn(move || {
                 let spawned = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
@@ -355,7 +415,7 @@ impl Widget {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }
-                    Err(e) => eprintln!("⚠️ on_finish 执行失败: {e}"),
+                    Err(e) => eprintln!("⚠️ 结束命令执行失败: {e}"),
                 }
             });
         }
@@ -489,6 +549,7 @@ impl Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::Pad;
     use std::time::Instant;
 
     /// 最近一帧的状态行。内容只存在指纹里（`Frame` 不重复存一份），断言就从那儿读。
@@ -614,6 +675,56 @@ mod tests {
         w.apply_config(Config { zoom: 2.0, bg_alpha: 128, ..Config::default() });
         assert_eq!(w.zoom, 2.0, "缩放是当场结算的");
         assert_eq!(w.config.bg_alpha, 128);
+    }
+
+    /// 恢复默认设置：显示相关的都回到出厂值，跑动中的计时器不被掐掉，
+    /// 并且把"挪回出厂位置"的请求挂上（后端取走一次就该清掉）。
+    #[test]
+    fn reset_restores_defaults_without_killing_a_running_timer() {
+        let cfg = Config {
+            duration_secs: 900,
+            bg_alpha: 200,
+            centiseconds: true,
+            time_pad: Pad::Full,
+            zoom: 2.5,
+            ..Config::default()
+        };
+        let mut w = Widget::new(cfg, true);
+        assert!(!w.handle_cmd(Command::ResetConfig));
+        assert_eq!(w.config.bg_alpha, Config::default().bg_alpha);
+        assert!(!w.config.centiseconds);
+        assert_eq!(w.config.time_pad, Pad::None);
+        assert_eq!(w.zoom, 1.0, "缩放跟着配置回到出厂值");
+        assert!(w.timer.running && w.timer.total == 900, "正在跑的倒计时不该被重置打断");
+        assert!(w.take_reposition(), "重置要顺带请求挪回出厂位置");
+        assert!(!w.take_reposition(), "请求是一次性的");
+        // 单独重置位置：只清 window_pos，不动别的
+        let mut w2 = Widget::new(Config { bg_alpha: 200, ..Config::default() }, false);
+        w2.handle_cmd(Command::ResetPosition);
+        assert_eq!(w2.config.window_pos, None);
+        assert_eq!(w2.config.bg_alpha, 200, "重置位置不该牵连外观");
+        assert!(w2.take_reposition());
+    }
+
+    /// 一次性结束命令优先、用完清空，且不相关的事件不许把它吃掉。
+    #[test]
+    fn armed_finish_command_is_one_shot() {
+        let cfg = Config { on_finish: Some("echo persistent".into()), ..Config::default() };
+        let mut w = Widget::new(cfg, false);
+        assert_eq!(w.take_finish_cmd(Finished::Countdown).as_deref(), Some("echo persistent"));
+        w.handle_cmd(Command::ArmFinish("echo once".into()));
+        assert_eq!(w.armed.as_deref(), Some("echo once"));
+        // 休息结束不是"计时结束"：不该执行，也不该把待执行的那条吃掉
+        assert_eq!(w.take_finish_cmd(Finished::PomodoroBreak), None);
+        assert_eq!(w.armed.as_deref(), Some("echo once"), "不相关的事件不该消费武装");
+        // 对上了就用一次性的，用完回到常驻配置
+        assert_eq!(w.take_finish_cmd(Finished::Countdown).as_deref(), Some("echo once"));
+        assert!(w.armed.is_none());
+        assert_eq!(w.take_finish_cmd(Finished::PomodoroWork).as_deref(), Some("echo persistent"));
+        // 热加载不该把武装中的命令冲掉：它本来就不在配置里
+        w.handle_cmd(Command::ArmFinish("echo twice".into()));
+        w.apply_config(Config::default());
+        assert_eq!(w.armed.as_deref(), Some("echo twice"));
     }
 
     /// 到点顶替数字行：自定义文本（含中文）走字形层，`"0"` 是留空，没配就照旧显示 0。

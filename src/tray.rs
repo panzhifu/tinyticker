@@ -31,7 +31,7 @@ use crate::sysinfo;
 use crate::timer::Mode;
 
 /// 托盘 → 主窗口的命令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Start,
     Pause,
@@ -64,6 +64,16 @@ pub enum Command {
     ToggleHidden,
     /// 把"是否隐藏"设成给定值——`tinyticker --hide` / `--show` 的语义，可重复执行。
     SetHidden(bool),
+    /// 切换计时结束时发不发桌面通知（写回 `notify`）。
+    ToggleNotify,
+    /// 登记 / 取消开机自启（写删 `~/.config/autostart/` 里那份同名条目）。
+    ToggleAutostart,
+    /// 把配置恢复成出厂值并立刻写盘。
+    ResetConfig,
+    /// 把窗口挪回出厂位置（并清掉 `window_x` / `window_y`）。
+    ResetPosition,
+    /// 武装一条**一次性**结束命令：下次计时结束时执行，然后自动回落。不进配置。
+    ArmFinish(String),
     Quit,
 }
 
@@ -145,8 +155,8 @@ impl Command {
     /// 这一项在单选组里的选中判据；非单选项返回 `None`。
     ///
     /// 从命令本身推导而不是另存一份字段，加按钮时不可能忘记登记，也不会接错线。
-    fn check(self) -> Option<Check> {
-        match self {
+    fn check(&self) -> Option<Check> {
+        match *self {
             Command::SetMode(m) => Some(Check::Mode(m)),
             Command::SetAlpha(a) => Some(Check::Alpha(a)),
             Command::SetPalette(i) => Some(Check::Palette(i)),
@@ -157,6 +167,8 @@ impl Command {
             Command::SetTimePad(p) => Some(Check::TimePad(p)),
             Command::ToggleClockSeconds => Some(Check::ClockSeconds),
             Command::ToggleHidden => Some(Check::Hidden),
+            Command::ToggleNotify => Some(Check::Notify),
+            Command::ToggleAutostart => Some(Check::Autostart),
             Command::SetHidden(_) => None,
             _ => None,
         }
@@ -177,6 +189,8 @@ enum Check {
     TimePad(Pad),
     ClockSeconds,
     Hidden,
+    Notify,
+    Autostart,
 }
 
 /// 托盘自己维护的一份显示状态。
@@ -200,6 +214,10 @@ struct State {
     clock_seconds: bool,
     /// 挂件是否被藏着（只影响那一行的勾选）。
     hidden: bool,
+    /// 到点发不发桌面通知。
+    notify: bool,
+    /// 是否已登记开机自启。这一格不进 Config：磁盘上那个文件本身就是状态。
+    autostart: bool,
     /// 配了可用的 `tray_gif` 没有；没配的话 GIF 那一档点了也只能退回表盘，索性置灰
     gif: bool,
 }
@@ -225,12 +243,14 @@ impl State {
             clock_seconds: cfg.clock_seconds,
             // 挂件总是以"看得见"启动（hidden 不进配置），所以这里恒 false
             hidden: false,
+            notify: cfg.notify,
+            autostart: crate::config::autostart_enabled(),
             gif: cfg.tray_gif.as_deref().is_some_and(|p| !p.trim().is_empty()),
         }
     }
 
     /// 这一项当前能不能点。
-    fn enabled(&self, cmd: Command) -> bool {
+    fn enabled(&self, cmd: &Command) -> bool {
         !matches!(cmd, Command::SetIcon(IconMode::Gif)) || self.gif
     }
 
@@ -246,12 +266,14 @@ impl State {
             Check::TimePad(p) => self.pad == p,
             Check::ClockSeconds => self.clock_seconds,
             Check::Hidden => self.hidden,
+            Check::Notify => self.notify,
+            Check::Autostart => self.autostart,
         }
     }
 
     /// 发出命令后同步镜像。只有会影响 `checked` 的命令在此登记，其余忽略。
-    fn note(&mut self, cmd: Command) {
-        match cmd {
+    fn note(&mut self, cmd: &Command) {
+        match *cmd {
             Command::SetMode(m) => self.mode = m,
             Command::SetAlpha(a) => {
                 self.alpha = a;
@@ -277,6 +299,8 @@ impl State {
             Command::ToggleClockSeconds => self.clock_seconds = !self.clock_seconds,
             Command::ToggleHidden => self.hidden = !self.hidden,
             Command::SetHidden(v) => self.hidden = v,
+            Command::ToggleNotify => self.notify = !self.notify,
+            Command::ToggleAutostart => self.autostart = !self.autostart,
             _ => {}
         }
     }
@@ -297,6 +321,9 @@ struct Server {
     pixmap: Vec<u8>,
     /// 菜单 `checked` 与图标内容的依据。只在托盘线程上读写，`RefCell` 足够。
     state: std::cell::RefCell<State>,
+    /// 悬停提示的正文，每秒随采样刷新。SNI 里宿主是**拉取**这个属性的，所以我们
+    /// 只能自己判断"变了没有"，变了再发 `NewToolTip` 催它回读。
+    tooltip: std::cell::RefCell<String>,
 }
 
 /// 往节点表追加一个节点并登记为根菜单的一项，返回它的 id。
@@ -340,11 +367,15 @@ fn build_nodes(presets: &[u32], gif_configured: bool) -> Vec<Node> {
     push_top(&mut n, &mut root, button("⏸ 暂停", Command::Pause));
     push_top(&mut n, &mut root, button("⟳ 重置", Command::Reset));
     push_top(&mut n, &mut root, button("👻 隐藏挂件", Command::ToggleHidden));
+    push_top(&mut n, &mut root, button("🔔 弹通知", Command::ToggleNotify));
+    push_top(&mut n, &mut root, button("🚀 开机自启", Command::ToggleAutostart));
     push_top(&mut n, &mut root, separator());
     let presets_menu = push_top(&mut n, &mut root, submenu("时长预设"));
     let modes = push_top(&mut n, &mut root, submenu("模式"));
     let look = push_top(&mut n, &mut root, submenu("外观"));
     push_top(&mut n, &mut root, separator());
+    push_top(&mut n, &mut root, button("↺ 恢复默认设置", Command::ResetConfig));
+    push_top(&mut n, &mut root, button("⌂ 重置窗口位置", Command::ResetPosition));
     push_top(&mut n, &mut root, button("✕ 退出", Command::Quit));
 
     for secs in presets {
@@ -523,6 +554,37 @@ fn gauge_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Vec<u8>) {
     (S as i32, S as i32, px)
 }
 
+/// 字节速率 → 人话。50 KB/s 以下直接给整数字节，以上按 1024 递进到 mantissa 落在
+/// `[50, 1024)` 的那一档，保留一位小数（`51199 B/s` / `50.0 KB/s` / `2.0 MB/s`）。
+fn fmt_rate(bps: u64) -> String {
+    const UNITS: [&str; 4] = ["B/s", "KB/s", "MB/s", "GB/s"];
+    if bps < 51_200 {
+        return format!("{bps} {}", UNITS[0]);
+    }
+    let mut v = bps as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{v:.1} {}", UNITS[u])
+}
+
+/// 悬停提示的正文：把已经采到的指标拼成一行。没有电池就不写那一段。
+fn tooltip_text(src: &sysinfo::Sources) -> String {
+    let mut s = format!(
+        "CPU {}% · 内存 {}% · ↓ {} ↑ {}",
+        src.cpu,
+        src.mem,
+        fmt_rate(src.net_down),
+        fmt_rate(src.net_up)
+    );
+    if let Some(b) = src.battery {
+        s.push_str(&format!(" · 电池 {}%{}", b.percent, if b.charging { "⚡" } else { "" }));
+    }
+    s
+}
+
 /// 网络水位表的刻度：上下行取大的那个，按**对数**映到 0-100。
 ///
 /// 用对数是因为带宽跨六个数量级：线性刻度的话，浏览网页与满速下载会挤在同一格水位上。
@@ -670,6 +732,7 @@ fn run(
         nodes: build_nodes(&presets, state.gif),
         pixmap,
         state: std::cell::RefCell::new(state),
+        tooltip: std::cell::RefCell::new(String::new()),
     }));
 
     // 导出两个对象路径
@@ -716,6 +779,21 @@ fn run(
         if icon_at.elapsed() >= ICON_EVERY {
             icon_at = Instant::now();
             sources = sampler.sample();
+            // 悬停提示跟着采样走：宿主只在收到 NewToolTip 时才回读 ToolTip 属性
+            let tip = tooltip_text(&sources);
+            let changed = unsafe {
+                let cell = &mut *server;
+                let mut slot = cell.tooltip.borrow_mut();
+                if *slot == tip {
+                    false
+                } else {
+                    *slot = tip;
+                    true
+                }
+            };
+            if changed {
+                unsafe { emit_signal(dbus, conn, c"NewToolTip") };
+            }
         }
         // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
         let mode = unsafe { (*server).state.borrow().icon };
@@ -732,7 +810,7 @@ fn run(
         };
         // 像素真变了才发信号：宿主收到 NewIcon 会立刻回读 IconPixmap
         if changed {
-            unsafe { emit_new_icon(dbus, conn) };
+            unsafe { emit_signal(dbus, conn, c"NewIcon") };
         }
         if unsafe { (dbus.dbus_connection_read_write_dispatch)(conn, 200) } != d::TRUE {
             return Ok(()); // 连接断了（多数是退出登录）
@@ -740,13 +818,11 @@ fn run(
     }
 }
 
-/// `org.kde.StatusNotifierItem.NewIcon`：不声明刷新，宿主会一直显示启动时那份缓存。
-unsafe fn emit_new_icon(dbus: &DBus, conn: *mut d::DBusConnection) {
-    let msg = (dbus.dbus_message_new_signal)(
-        ITEM_PATH.as_ptr(),
-        ITEM_IFACE.as_ptr(),
-        c"NewIcon".as_ptr(),
-    );
+/// `org.kde.StatusNotifierItem` 的属性变更信号。不声明刷新，宿主会一直显示它
+/// 启动时缓存的那份——`NewIcon` 与 `NewToolTip` 是同一件事的两个成员。
+unsafe fn emit_signal(dbus: &DBus, conn: *mut d::DBusConnection, name: &CStr) {
+    let msg =
+        unsafe { (dbus.dbus_message_new_signal)(ITEM_PATH.as_ptr(), ITEM_IFACE.as_ptr(), name.as_ptr()) };
     if msg.is_null() {
         return;
     }
@@ -910,13 +986,13 @@ unsafe extern "C" fn on_message(
         }
         "Event" if path == menu_p && iface == menu_i => {
             if let Some(id) = read_event(dbus, args)
-                && let Some(cmd) = server.nodes.get(id as usize).and_then(|n| n.command)
+                && let Some(cmd) = server.nodes.get(id as usize).and_then(|n| n.command.as_ref())
                 // 置灰的项（比如没配路径的 GIF 档）不该有动作，哪怕宿主还是发了 Event
                 && server.state.borrow().enabled(cmd)
             {
                 // 先镜像再转发：菜单的 checked 读的是这一份，不能等主窗口回话
                 server.state.borrow_mut().note(cmd);
-                let _ = server.cmd_tx.send(cmd);
+                let _ = server.cmd_tx.send(cmd.clone());
             }
             reply(dbus, conn, msg, |_, _| {})
         }
@@ -1062,7 +1138,8 @@ unsafe fn write_sni_property(dbus: &DBus, it: *mut DBusMessageIter, server: &Ser
             put_str(dbus, &mut st, "");
             write_pixmap(dbus, &mut st, server);
             put_str(dbus, &mut st, "TinyTicker");
-            put_str(dbus, &mut st, "极简悬浮计时器");
+            // 正文是活的：CPU / 内存 / 上下行 / 电池，每秒随采样换一次
+            put_str(dbus, &mut st, &server.tooltip.borrow());
             close(dbus, &mut v, &mut st);
             close(dbus, it, &mut v);
         }
@@ -1149,12 +1226,12 @@ unsafe fn write_node_props(dbus: &DBus, it: *mut DBusMessageIter, server: &Serve
                 (
                     "enabled",
                     Prop::Bool(
-                        node.command.is_none_or(|c| server.state.borrow().enabled(c)),
+                        node.command.as_ref().is_none_or(|c| server.state.borrow().enabled(c)),
                     ),
                 ),
             ];
             // 单选组：把当前状态回灌成勾选，菜单才看得出「现在用的是哪一套」
-            if let Some(c) = node.command.and_then(Command::check) {
+            if let Some(c) = node.command.as_ref().and_then(Command::check) {
                 entries.push(("checked", Prop::Bool(server.state.borrow().checked(c))));
             }
             entries
@@ -1254,7 +1331,7 @@ unsafe fn write_node_property(
             dbus,
             it,
             node.kind == Kind::Button
-                && node.command.is_none_or(|c| server.state.borrow().enabled(c)),
+                && node.command.as_ref().is_none_or(|c| server.state.borrow().enabled(c)),
         ),
         "visible" => variant_bool(dbus, it, true),
         "children-display" => {
@@ -1528,6 +1605,35 @@ mod tests {
         assert_eq!(IconMode::from_name("disk"), None);
     }
 
+    /// 速率单位按 1024 递进，小流量保留整数字节。
+    #[test]
+    fn rate_formatting() {
+        assert_eq!(fmt_rate(0), "0 B/s");
+        assert_eq!(fmt_rate(51_199), "51199 B/s", "50 KB/s 以下直接给字节");
+        assert_eq!(fmt_rate(51_200), "50.0 KB/s");
+        assert_eq!(fmt_rate(2 * 1024 * 1024), "2.0 MB/s");
+        assert_eq!(fmt_rate(40u64 * 1024 * 1024 * 1024), "40.0 GB/s");
+        assert!(fmt_rate(u64::MAX).ends_with("GB/s"), "封顶在 GB/s，不外推到 TB");
+    }
+
+    /// 提示正文：没电池就不写那一段，有就把充电标记带上。
+    #[test]
+    fn tooltip_lists_what_was_sampled() {
+        let src = sysinfo::Sources {
+            cpu: 12,
+            mem: 44,
+            battery: None,
+            net_down: 1024 * 1024,
+            net_up: 2048,
+        };
+        assert_eq!(tooltip_text(&src), "CPU 12% · 内存 44% · ↓ 1.0 MB/s ↑ 2048 B/s");
+        let with_batt = sysinfo::Sources {
+            battery: Some(sysinfo::Battery { percent: 87, charging: true }),
+            ..src
+        };
+        assert!(tooltip_text(&with_batt).ends_with("· 电池 87%⚡"), "充电标记该在末尾");
+    }
+
     /// 网络水位是对数刻度：静默归零、区间内分得开、封顶不溢出。
     #[test]
     fn net_level_is_log_scaled_and_bounded() {
@@ -1585,7 +1691,7 @@ mod tests {
             "外观下应是 透明度 / 配色 / 文字颜色 / 文字特效 / 图标内容 / 时间格式 六个子菜单"
         );
         let acts = |parent: i32| -> Vec<Option<Command>> {
-            n[parent as usize].children.iter().map(|i| n[*i as usize].command).collect()
+            n[parent as usize].children.iter().map(|i| n[*i as usize].command.clone()).collect()
         };
         let (alpha_id, palette_id, colors_id, effect_id, icon_id, fmt_id) = (
             look.children[0],
@@ -1673,7 +1779,7 @@ mod tests {
         let items: Vec<(String, Option<Command>)> = submenu
             .children
             .iter()
-            .map(|i| (n[*i as usize].label.clone(), n[*i as usize].command))
+            .map(|i| (n[*i as usize].label.clone(), n[*i as usize].command.clone()))
             .collect();
         assert_eq!(
             items,
@@ -1691,15 +1797,15 @@ mod tests {
     fn gif_item_is_disabled_without_a_path() {
         let cfg = Config::default();
         let s = State::from_config(&cfg);
-        assert!(!s.enabled(Command::SetIcon(IconMode::Gif)), "没配路径该不可点");
-        assert!(s.enabled(Command::SetIcon(IconMode::Clock)));
-        assert!(s.enabled(Command::SetAlpha(96)), "非图标项不该被牵连");
+        assert!(!s.enabled(&Command::SetIcon(IconMode::Gif)), "没配路径该不可点");
+        assert!(s.enabled(&Command::SetIcon(IconMode::Clock)));
+        assert!(s.enabled(&Command::SetAlpha(96)), "非图标项不该被牵连");
 
         let with = Config { tray_gif: Some("~/p/s.gif".into()), ..Config::default() };
-        assert!(State::from_config(&with).enabled(Command::SetIcon(IconMode::Gif)));
+        assert!(State::from_config(&with).enabled(&Command::SetIcon(IconMode::Gif)));
         // 只有空白也算没配
         let blank = Config { tray_gif: Some("   ".into()), ..Config::default() };
-        assert!(!State::from_config(&blank).enabled(Command::SetIcon(IconMode::Gif)));
+        assert!(!State::from_config(&blank).enabled(&Command::SetIcon(IconMode::Gif)));
 
         let labelled = build_nodes(&cfg.presets, false);
         let gif = labelled.iter().find(|x| x.label.starts_with("GIF 动图")).expect("菜单里该有 GIF 项");
@@ -1712,7 +1818,7 @@ mod tests {
     fn only_radio_items_are_checkable() {
         let n = build_nodes(&Config::default().presets, true);
         for node in &n {
-            let Some(cmd) = node.command else { continue };
+            let Some(cmd) = node.command.as_ref() else { continue };
             let checkable = cmd.check().is_some();
             // 五个单选组，加上百分秒 / 显示秒 / 隐藏挂件三个勾选框
             // （SetHidden 是命令行走的设定值，菜单上没有它对应的那一项）
@@ -1728,6 +1834,8 @@ mod tests {
                     | Command::ToggleCentiseconds
                     | Command::ToggleClockSeconds
                     | Command::ToggleHidden
+                    | Command::ToggleNotify
+                    | Command::ToggleAutostart
             );
             assert_eq!(checkable, in_group, "{} 的勾选属性推错了", node.label);
         }
@@ -1742,37 +1850,37 @@ mod tests {
         assert!(s.checked(Check::Alpha(96)));
         assert!(s.checked(Check::Icon(IconMode::Clock)));
 
-        s.note(Command::SetMode(Mode::Pomodoro));
+        s.note(&Command::SetMode(Mode::Pomodoro));
         assert!(s.checked(Check::Mode(Mode::Pomodoro)));
         assert!(!s.checked(Check::Mode(Mode::Countdown)), "旧的那项必须取消勾选");
 
-        s.note(Command::SetAlpha(0));
+        s.note(&Command::SetAlpha(0));
         assert!(s.checked(Check::Alpha(0)) && !s.checked(Check::Alpha(96)));
 
         // 时长预设之类不影响任何勾选，别把它们误登记进去
-        s.note(Command::Preset(600));
-        s.note(Command::Start);
+        s.note(&Command::Preset(600));
+        s.note(&Command::Start);
         assert!(s.checked(Check::Mode(Mode::Pomodoro)));
 
         // 百分秒是勾选框：点一下翻面，且不牵连任何单选组
         assert!(!s.checked(Check::Centiseconds), "默认该关着，开着的代价是心跳");
-        s.note(Command::ToggleCentiseconds);
+        s.note(&Command::ToggleCentiseconds);
         assert!(s.checked(Check::Centiseconds));
         assert!(s.checked(Check::Mode(Mode::Pomodoro)), "翻勾选框不该动了模式勾选");
-        s.note(Command::ToggleCentiseconds);
+        s.note(&Command::ToggleCentiseconds);
         assert!(!s.checked(Check::Centiseconds));
         let on = Config { centiseconds: true, ..Config::default() };
         assert!(State::from_config(&on).checked(Check::Centiseconds));
 
         // 补零是单选组：换档要把旧那档取消
         assert!(s.checked(Check::TimePad(Pad::None)));
-        s.note(Command::SetTimePad(Pad::Full));
+        s.note(&Command::SetTimePad(Pad::Full));
         assert!(s.checked(Check::TimePad(Pad::Full)));
         assert!(!s.checked(Check::TimePad(Pad::None)), "旧档必须取消勾选");
         assert!(!s.checked(Check::Centiseconds), "换档不该牵连百分秒");
         // 显示秒默认开着，点一下关掉
         assert!(s.checked(Check::ClockSeconds));
-        s.note(Command::ToggleClockSeconds);
+        s.note(&Command::ToggleClockSeconds);
         assert!(!s.checked(Check::ClockSeconds));
     }
 
@@ -1797,7 +1905,7 @@ mod tests {
         }
         // 点一次预设就重新有得勾
         let mut st = st;
-        st.note(Command::SetPalette(4));
+        st.note(&Command::SetPalette(4));
         assert!(st.checked(Check::Palette(4)) && !st.checked(Check::Palette(2)));
     }
 }
