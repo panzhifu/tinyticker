@@ -77,6 +77,8 @@ pub enum Command {
     SetEffect(Effect),
     /// 换托盘图标显示的内容（写回 `tray_icon`，与透明度/配色同样要落盘）。
     SetIcon(IconMode),
+    /// 切换"图标里的占用指标用数字还是水位"（写回 `tray_numbers`）。
+    ToggleNumbers,
     /// 切换数字行的百分之一秒（写回 `centiseconds`）。
     ToggleCentiseconds,
     /// 换计时数字行的补零档位（写回 `time_pad`）。
@@ -257,7 +259,8 @@ fn run(
     let mut sampler = sysinfo::Sampler::new();
     let mut player = gif::Player::new(gif_path.as_deref());
     let (_, _, pixmap) =
-        icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms(), &mut player);
+        icon_pixmap(state.icon, &sampler.sample(), crate::clock::now_hms(), &mut player,
+            state.numbers);
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
@@ -332,8 +335,11 @@ fn run(
             }
         }
         // 图标内容可能刚被菜单改过，每轮从 state 取而不是记在局部变量里
-        let mode = unsafe { (*server).state.borrow().icon };
-        let (_, _, px) = icon_pixmap(mode, &sources, crate::clock::now_hms(), &mut player);
+        let (mode, numbers) = {
+            let st = unsafe { (*server).state.borrow() };
+            (st.icon, st.numbers)
+        };
+        let (_, _, px) = icon_pixmap(mode, &sources, crate::clock::now_hms(), &mut player, numbers);
         // 裸指针只在两次派发之间换整个 Vec：回调拿到的 &Server 不会看到写了一半的图标
         let changed = unsafe {
             let server = &mut *server;

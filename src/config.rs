@@ -229,6 +229,9 @@ pub struct Config {
     pub tray_icon: IconMode,
     /// 动图图标的路径（`tray_icon = gif` 时才有意义）。支持开头的 `~/`。
     pub tray_gif: Option<String>,
+    /// 托盘图标里的占用指标用**数字**画，而不是水位。只影响那四档（CPU / 内存 /
+    /// 电量 / 网络），表盘与动图不受它管。
+    pub tray_numbers: bool,
     /// 番茄钟节奏（专注 / 短休 / 长休 / 每几轮一长休 / 跑几组）。
     pub pomo: Pomo,
     /// 托盘「时长预设」子菜单的档位（秒，按配置顺序），点击即重置并开始。
@@ -273,6 +276,7 @@ impl Default for Config {
             centiseconds: false,
             tray_icon: IconMode::Clock,
             tray_gif: None,
+            tray_numbers: false,
             pomo: Pomo::default(),
             presets: DEFAULT_PRESETS.to_vec(),
             on_finish: None,
@@ -494,6 +498,7 @@ impl Config {
                         cfg.tray_icon = m;
                     }
                 }
+                "tray_numbers" => cfg.tray_numbers = value.parse().unwrap_or(false),
                 "tray_gif" => {
                     if !value.is_empty() {
                         cfg.tray_gif = Some(value.to_string());
@@ -636,6 +641,7 @@ impl Config {
         out.push_str(&format!("time_pad = {}\n", self.time_pad.name()));
         out.push_str(&format!("centiseconds = {}\n", self.centiseconds));
         out.push_str(&format!("tray_icon = {}\n", self.tray_icon.name()));
+        out.push_str(&format!("tray_numbers = {}\n", self.tray_numbers));
         if let Some(path) = &self.tray_gif {
             out.push_str(&format!("tray_gif = {path}\n"));
         }
@@ -908,6 +914,17 @@ mod tests {
         let bad = Config::from_str("color_bg = #111111_#222222\ntext_effect = bloom\n");
         assert_eq!(bad.color_bg, Config::default().color_bg);
         assert_eq!(bad.text_effect, Effect::None);
+    }
+
+    /// 图标数字档的键要能往返：默认关（保住"水位"这个老观感），写了就认，写错当关。
+    #[test]
+    fn tray_numbers_round_trips() {
+        assert!(!Config::default().tray_numbers, "默认该是水位");
+        let on = Config::from_str("tray_numbers = true\n");
+        assert!(on.tray_numbers);
+        assert!(on.serialize().contains("tray_numbers = true\n"));
+        assert!(Config::from_str(&on.serialize()).tray_numbers, "写出去要读得回来");
+        assert!(!Config::from_str("tray_numbers = maybe\n").tray_numbers, "认不出当关");
     }
 
     /// 颜色的四种写法要能穿过**配置文件**这条路（不只是 `parse_color` 单测）：

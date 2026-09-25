@@ -144,15 +144,127 @@ pub(super) fn net_level(down: u64, up: u64) -> u8 {
     ((bits(rate) - min_bits) * 100 / span).min(100) as u8
 }
 
+/// 数字档的底：圆角方块。
+///
+/// 不用 [`face()`] 那个圆盘是因为算过账——内盘半径 12.5，在 y=7 那一行只剩 18 px 宽，
+/// 而一行速率要 32 px。字会骑到白表圈上（第一版实测就是这样）。方块只把四角削掉，
+/// 中间两行是满宽的。
+fn num_face() -> Vec<u8> {
+    let mut px = vec![0u8; S * S * 4];
+    let r = 6.0f32;
+    let edge = S as f32 - 1.0 - r;
+    for y in 0..S {
+        for x in 0..S {
+            // 到最近那颗角圆心的距离：超过 r 就在被削掉的角上，留空
+            let d = dist(x as f32 - (x as f32).clamp(r, edge), y as f32 - (y as f32).clamp(r, edge));
+            if d > r {
+                continue;
+            }
+            // 最外一圈换成灰边：纯 DARK 在浅色主题下等于没有轮廓
+            if d > r - 1.2 {
+                put(&mut px, x, y, 90, 90, 100);
+            } else {
+                put(&mut px, x, y, DARK.0, DARK.1, DARK.2);
+            }
+        }
+    }
+    px
+}
+
+/// 数字档：把百分比烤进图标里。Catime 的 `CreatePercentIcon16`（`percent_text.c:60-135`）
+/// 是同一件事，只是它用 `TextOutW` 而这里用内置点阵——二进制里不该有字体。
+/// 没有电池的机器选这一档仍是空底，与"0%"区分开。
+fn percent_pixmap(percent: Option<u8>, charging: bool) -> (i32, i32, Vec<u8>) {
+    let mut px = num_face();
+    if let Some(p) = percent {
+        // 充电中一律绿色，与水位档同一条规则
+        let c = if charging { (80, 220, 120) } else { level_color(p) };
+        // 一律不压扁：丢列会把 `M` `0` 这类字形啃坏，实测比顶边更难看
+        draw_row(&mut px, &format!("{p}%"), (S - 8) / 2, c, 0);
+    }
+    (S as i32, S as i32, px)
+}
+
+/// 网络的数字档是两行：上面一行是下行流量，下面一行是上行流量（下载在上的读法与
+/// 资源管理器一致，配色沿用 `level_color` 那套绿/琥珀）。
+fn net_pixmap(down: u64, up: u64) -> (i32, i32, Vec<u8>) {
+    let mut px = num_face();
+    // 不带 `D` / `U` 前缀：加上就五字，压扁会啃掉字形，不压又超出 32 px。方向靠
+    // "上=下行流量、绿；下=上行流量、琥珀"这两条约定，与悬停提示里的 ↓↑ 同一顺序
+    draw_row(&mut px, &rate_short(down), 7, (80, 220, 120), 0);
+    draw_row(&mut px, &rate_short(up), 17, (255, 200, 80), 0);
+    (S as i32, S as i32, px)
+}
+
+/// 给图标用的紧凑速率：最多四个字符（`0B` / `983B` / `332K` / `1.1M`）。
+///
+/// 与 [`fmt_rate`] 的分工是"给谁看"：悬停提示里单位要拼全（`1.2 MB/s`），图标里
+/// 一个字符都嫌多。
+fn rate_short(bps: u64) -> String {
+    const UNITS: [char; 4] = ['B', 'K', 'M', 'G'];
+    let mut v = bps as f64;
+    let mut u = 0;
+    while v >= 999.5 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    // 封顶那一档不再往上走，所以位数会失控；计数器被重置时确实可能算出荒谬的差值，
+    // 而图标只有 32 px——宁可写 999G 也不许把字画出盘外
+    let v = v.min(999.0);
+    if u == 0 {
+        format!("{v:.0}B")
+    } else if v < 10.0 {
+        format!("{v:.1}{}", UNITS[u])
+    } else {
+        format!("{v:.0}{}", UNITS[u])
+    }
+}
+
+/// 把一行 ASCII 居中画进 32x32。`narrow` 是每个字丢掉的右列数：位序是 bit0 在最左，
+/// 所以丢右边不影响字形骨架。
+///
+/// 需要丢列是因为 `D1.2M` 这种五字串按 8 px 一格要 40 px，图标只有 32 px；压到
+/// 6 px 一格刚好。百分号那一档四字以内，`narrow = 0` 不压。
+fn draw_row(px: &mut [u8], s: &str, y: usize, color: (u8, u8, u8), narrow: usize) {
+    let w = 8 - narrow;
+    let x0 = S.saturating_sub(s.len() * w) / 2;
+    for (i, ch) in s.chars().enumerate() {
+        if !ch.is_ascii() {
+            continue;
+        }
+        for (row, bits) in crate::font8x8::FONT8X8_BASIC[usize::from(ch as u8)].iter().enumerate() {
+            let py = y + row;
+            if py >= S {
+                continue;
+            }
+            for col in 0..w {
+                if bits & (1 << col) != 0 {
+                    let x = x0 + i * w + col;
+                    if x < S {
+                        put(px, x, py, color.0, color.1, color.2);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 按 `mode` 生成当前该显示的图标。
 pub(super) fn icon_pixmap(
     mode: IconMode,
     src: &sysinfo::Sources,
     now: (u32, u32, u32),
     player: &mut gif::Player,
+    numbers: bool,
 ) -> (i32, i32, Vec<u8>) {
     match mode {
         IconMode::Clock => clock_pixmap(now),
+        IconMode::Cpu if numbers => percent_pixmap(Some(src.cpu), false),
+        IconMode::Memory if numbers => percent_pixmap(Some(src.mem), false),
+        IconMode::Battery if numbers => {
+            percent_pixmap(src.battery.map(|b| b.percent), src.battery.is_some_and(|b| b.charging))
+        }
+        IconMode::Network if numbers => net_pixmap(src.net_down, src.net_up),
         IconMode::Cpu => gauge_pixmap(Some(src.cpu), false),
         IconMode::Memory => gauge_pixmap(Some(src.mem), false),
         IconMode::Battery => {
@@ -326,5 +438,64 @@ mod tests {
         assert_eq!(net_level(u64::MAX, 0), 100, "超量要夹紧而不是回绕");
         // 上下行取大：只有上传在跑也该看得见
         assert_eq!(net_level(0, 2 * 1024 * 1024), big);
+    }
+
+    /// 紧凑速率最多四个字符——图标里连 `D`/`U` 前缀一共五格，压扁后正好 30 px。
+    #[test]
+    fn rate_short_never_exceeds_four_chars() {
+        assert_eq!(rate_short(0), "0B");
+        assert_eq!(rate_short(983), "983B");
+        assert_eq!(rate_short(340_000), "332K");
+        assert_eq!(rate_short(1_200_000), "1.1M");
+        // 边界与荒谬值都要夹紧（计数器被重置时算得出天文数字的差值）
+        for v in [1u64, 1023, 1024, 999 * 1024, 1 << 30, u64::MAX] {
+            let s = rate_short(v);
+            assert!(s.chars().count() <= 4, "{v} 写成了 {s}");
+        }
+    }
+
+    /// 数字档要真的把字画进底里，而且不许越界：`put` 不做边界检查，写出去就是踩内存。
+    #[test]
+    fn percent_digits_add_ink_without_leaking_outside() {
+        let (_, _, hollow) = percent_pixmap(None, false);
+        let (_, _, some) = percent_pixmap(Some(42), false);
+        let (_, _, full) = percent_pixmap(Some(100), false);
+        // `filled` 排除深色盘面与白环，但方块那圈灰边算内容，所以比的是增量
+        let (h, s, f) = (filled(&hollow), filled(&some), filled(&full));
+        assert!(s > h, "数字要添墨: {h} -> {s}");
+        assert!(f > s, "多一位数字要多一些墨: {s} -> {f}");
+        assert!(f - h < S * S / 3, "字不该把底涂满: 多了 {}", f - h);
+        // 四角是被削掉的，字越界就会把这些位置涂脏
+        for (x, y) in [(0, 0), (S - 1, 0), (0, S - 1), (S - 1, S - 1)] {
+            assert_eq!(full[(y * S + x) * 4], 0, "角上该是空的");
+        }
+        // 充电一律绿，与水位档同一条规则：9% 平时是绿，充电时更不该变红
+        let (_, _, charging) = percent_pixmap(Some(9), true);
+        let green = |px: &[u8], i: usize| px[i + 2] > 150 && px[i + 1] < 150;
+        assert!(
+            (0..S * S).any(|k| green(&charging, k * 4)),
+            "充电时该出现绿色，而不是 9% 的红"
+        );
+    }
+
+    /// 网络的两行按颜色分开数：绿行与琥珀行不许重叠，也不许贴着上下边。
+    #[test]
+    fn net_number_rows_are_two_separate_bands() {
+        let (_, _, px) = net_pixmap(1_200_000, 340_000);
+        let at = |x: usize, y: usize| {
+            let i = (y * S + x) * 4;
+            (px[i + 1], px[i + 2], px[i + 3])
+        };
+        let band = |pred: fn((u8, u8, u8)) -> bool| {
+            let rows: Vec<usize> = (0..S)
+                .filter(|y| (0..S).any(|x| pred(at(x, *y))))
+                .collect();
+            (rows.first().copied(), rows.last().copied())
+        };
+        let down = band(|(r, g, _)| g > 150 && r < 150);
+        let up = band(|(r, g, b)| r > 200 && g > 150 && b < 120);
+        assert!(down.0.is_some() && up.0.is_some(), "两行都该有字: {down:?} {up:?}");
+        assert!(down.1 < up.0, "上下两行不许重叠: {down:?} {up:?}");
+        assert!(down.0.unwrap() >= 4 && up.1.unwrap() < S - 4, "不许贴着上下边");
     }
 }

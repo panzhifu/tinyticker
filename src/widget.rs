@@ -250,6 +250,10 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::ToggleNumbers => {
+                self.config.tray_numbers = !self.config.tray_numbers;
+                self.persist_appearance();
+            }
             Command::SetPalette(i) => {
                 if let Some(p) = PALETTES.get(i) {
                     self.config.color_bg = p.bg;
