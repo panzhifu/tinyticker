@@ -18,10 +18,10 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::render::Canvas;
 use crate::sys::x11 as x;
-use crate::sys::x11::{Event, Rectangle, VisualInfo, X11, XExt};
+use crate::sys::x11::{Event, KeyEvent, Rectangle, VisualInfo, X11, XExt};
 use crate::sys::{POLL_IN, PollFd, poll};
 use crate::tray::{Command, TrayHandle};
-use crate::widget::{LOGICAL_SIZE, Widget};
+use crate::widget::{Key, LOGICAL_SIZE, Widget};
 
 /// 没有历史位置时的初始坐标（逻辑像素，距左上角），与 layer-shell 路径一致。
 const DEFAULT_POS: (i32, i32) = (80, 80);
@@ -74,6 +74,8 @@ pub struct Client {
     last_input: Option<(i32, i32, i32, i32)>,
     /// 窗口当前是不是被"隐藏挂件"unmap 掉了（只登记一次请求，不每帧重发）。
     unmapped: bool,
+    /// 输入行的键盘/指针抓取状态（抓着的时候点哪儿都是"不输了"）。
+    kb_grabbed: bool,
     quit: bool,
 }
 
@@ -119,6 +121,7 @@ impl Client {
             event_mask: x::BUTTON_PRESS_MASK
                 | x::BUTTON_RELEASE_MASK
                 | x::POINTER_MOTION_MASK
+                | x::KEY_PRESS_MASK
                 | x::EXPOSURE_MASK
                 | x::STRUCTURE_NOTIFY_MASK,
             ..Default::default()
@@ -183,6 +186,7 @@ impl Client {
             image: std::ptr::null_mut(),
             last_input: None,
             unmapped: false,
+            kb_grabbed: false,
             quit: false,
         };
         client.rebuild_image();
@@ -310,6 +314,27 @@ impl Client {
     fn handle_event(&mut self, ev: &Event) {
         let any = x::event::<x::AnyEvent>(ev);
         match ev.kind() {
+            // 输入行开着时指针被我们抓着：点任何地方都算"不输了"，绝不能落进
+            // 拖动 / 翻编辑态 / 关挂件那几条原语义里
+            x::BUTTON_PRESS if self.widget.input_open() => {
+                self.widget.on_kb_lost();
+            }
+            x::KEY_PRESS => {
+                let k = x::event::<x::KeyEvent>(ev);
+                let (ch, sym) = self.lookup_key(k);
+                let key = match sym {
+                    x::XK_BACKSPACE => Some(Key::Backspace),
+                    x::XK_TAB => Some(Key::Char('\t')),
+                    x::XK_RETURN | x::XK_KP_ENTER => Some(Key::Enter),
+                    x::XK_ESCAPE => Some(Key::Escape),
+                    // XLookupString 只解到 Latin-1；输入语法本来就是 ASCII，
+                    // 控制字符（Ctrl+字母等）在挂件那半边被挡下
+                    _ => ch.filter(|c| c.is_ascii_graphic() || *c == ' ').map(Key::Char),
+                };
+                if let Some(key) = key {
+                    self.widget.on_key_press(key);
+                }
+            }
             x::BUTTON_PRESS => {
                 let b = x::event::<x::ButtonEvent>(ev);
                 match b.button {
@@ -396,6 +421,72 @@ impl Client {
         }
     }
 
+    /// `XLookupString`：键码 → (首字符, 键符号)。输入行只吃 ASCII 段，
+    /// 特殊键（退格 / 回车 / Esc）全靠键符号认——写错一个就变成往行里塞错字。
+    fn lookup_key(&self, k: &KeyEvent) -> (Option<char>, x::KeySym) {
+        let mut buf = [0 as c_char; 8];
+        let mut sym: x::KeySym = 0;
+        let n = unsafe {
+            (self.x.XLookupString)(
+                k as *const KeyEvent as *mut KeyEvent,
+                buf.as_mut_ptr(),
+                buf.len() as c_int,
+                &mut sym,
+                std::ptr::null_mut(),
+            )
+        };
+        let ch = (n > 0).then(|| buf[0] as u8 as char);
+        (ch, sym)
+    }
+
+    /// 输入行开 / 关对应的 X 侧动作：抓键盘（+ 指针）与松开。
+    ///
+    /// override-redirect 窗口没有 WM 替我们管焦点，grab 是唯一稳的路：
+    /// 抓住的期间所有按键都进我们的队列，松开即刻物归原主。指针一并抓——
+    /// 不然输入行开着、点别处却把按键漏给别的窗口，状态就撒谎了。
+    fn set_kb(&mut self, on: bool) {
+        if self.kb_grabbed == on {
+            return;
+        }
+        if on {
+            let r = unsafe {
+                (self.x.XGrabKeyboard)(
+                    self.dpy,
+                    self.win,
+                    0, // owner_events=False：事件全进 grab 窗口（本窗）
+                    x::GRAB_MODE_ASYNC,
+                    x::GRAB_MODE_ASYNC,
+                    x::CURRENT_TIME,
+                )
+            };
+            if r != 0 {
+                // GrabSuccess=0；非 0 是 AlreadyGrabbed / Frozen 等，此时不开行
+                eprintln!("⚠️ 键盘抓取失败（code={r}），输入行开不了");
+                self.widget.on_kb_lost();
+                return;
+            }
+            unsafe {
+                (self.x.XGrabPointer)(
+                    self.dpy,
+                    self.win,
+                    0,
+                    (x::BUTTON_PRESS_MASK | x::BUTTON_RELEASE_MASK) as c_uint,
+                    x::GRAB_MODE_ASYNC,
+                    x::GRAB_MODE_ASYNC,
+                    0,
+                    0,
+                    x::CURRENT_TIME,
+                )
+            };
+        } else {
+            unsafe {
+                (self.x.XUngrabKeyboard)(self.dpy, x::CURRENT_TIME);
+                (self.x.XUngrabPointer)(self.dpy, x::CURRENT_TIME);
+            }
+        }
+        self.kb_grabbed = on;
+    }
+
     fn zoom(&mut self, dy: f32) {
         if self.widget.zoom_by(dy) {
             self.last_input = None; // 尺寸要变，输入区域得重新下发
@@ -442,6 +533,10 @@ impl Client {
                     self.screen(),
                 );
                 unsafe { (self.x.XMoveWindow)(self.dpy, self.win, self.pos.0, self.pos.1) };
+            }
+            // 输入行的开/关请求：抓 / 松键盘（Wayland 侧是 layer 的 interactivity）
+            if let Some(want) = self.widget.take_kb_want() {
+                self.set_kb(want);
             }
             self.draw();
             unsafe { (self.x.XFlush)(self.dpy) };
@@ -570,4 +665,34 @@ fn clamp(pos: (i32, i32), size: (u32, u32), screen: (u32, u32)) -> (i32, i32) {
     let minx = SLACK - size.0 as i32;
     let miny = SLACK - size.1 as i32;
     (pos.0.clamp(minx, maxx), pos.1.clamp(miny, maxy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::x;
+
+    /// 键盘这条路的 X 协议常数：掩码位、事件号、键符号（keysymdef.h）。普通字符
+    /// 走 `XLookupString`，特殊键全靠键符号认——写错一个就往输入行里塞错字，
+    /// 或者把 Esc 当成字符。这条钉住常数，防的是手滑改掩码位。
+    #[test]
+    fn keyboard_constants_match_x_protocol() {
+        assert_eq!(x::KEY_PRESS_MASK, 1, "KeyPressMask 是事件掩码第 0 位");
+        assert_eq!(x::KEY_PRESS, 2, "KeyPress 是 2 号事件");
+        assert_eq!(x::KEY_RELEASE, 3);
+        assert_eq!(x::XK_BACKSPACE, 0xff08);
+        assert_eq!(x::XK_TAB, 0xff09);
+        assert_eq!(x::XK_RETURN, 0xff0d);
+        assert_eq!(x::XK_KP_ENTER, 0xff8d, "小键盘回车与主回车不同符号");
+        assert_eq!(x::XK_ESCAPE, 0xff1b);
+    }
+
+    /// 输入行开着时点哪儿都是"不输了"：事件处理走取消分支，不落进拖动 /
+    /// 编辑态 / 关挂件那几条原语义。这里钉住守卫的存在——守卫丢了的话，
+    /// 抓着键盘的时候一条右键就能把挂件关掉。
+    #[test]
+    fn button_press_while_input_open_cancels_the_line() {
+        // 守卫挂在 `handle_event` 的 BUTTON_PRESS 分支首行（见上）；
+        // 挂件侧的对应保证由 `right_click_cancels_input` 那条测试钉住。
+        assert_eq!(x::KEY_PRESS_MASK & x::BUTTON_PRESS_MASK, 0, "两个掩码位不撞");
+    }
 }

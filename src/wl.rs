@@ -22,21 +22,36 @@ use crate::tray::TrayHandle;
 use crate::config::Config;
 use crate::render::Canvas;
 use crate::sys::wayland::{Ifaces, Obj, Wl, WlArgument, WlInterface};
+use crate::sys::xkb::Xkb;
 use crate::sys::{Lib, POLL_IN, PollFd, poll};
 use crate::tray::Command;
-use crate::widget::{Frame, LOGICAL_SIZE, Widget};
+use crate::widget::{Frame, Key, LOGICAL_SIZE, Widget};
 
 /// Linux input-event 按键码，`wl_pointer.button` 原样透传。
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+/// wl_seat 能力位：pointer=1，keyboard=2。
+const SEAT_POINTER: u32 = 1;
+const SEAT_KEYBOARD: u32 = 2;
+/// `wl_seat` 的请求号：`get_pointer` 是 0，`get_keyboard` 是 1（v5 加了 `release`=3）。
+const SEAT_GET_POINTER: u32 = 0;
+const SEAT_GET_KEYBOARD: u32 = 1;
+/// `wl_keyboard.keymap` 的 format：1 = XKB v1 文本（0 = no keymap）。
+const KEYMAP_XKB_V1: u32 = 1;
+/// `wl_keyboard.key` 的 state：1 = 按下，0 = 松开。
+const KEY_STATE_PRESSED: u32 = 1;
+// —— 键符号（keysymdef.h 里输入行用得到的几个特殊键；普通字符走 xkb_keysym_to_utf8）——
+const XK_BACKSPACE: u32 = 0xff08;
+const XK_TAB: u32 = 0xff09;
+const XK_RETURN: u32 = 0xff0d;
+const XK_KP_ENTER: u32 = 0xff8d;
+const XK_ESCAPE: u32 = 0xff1b;
 /// 没有历史位置时的初始坐标（逻辑像素，距左上角）。
 const DEFAULT_POS: (i32, i32) = (80, 80);
 /// layer-shell：overlay 层、anchor top|left、键盘不交互。
 const LAYER_OVERLAY: u32 = 3;
 const ANCHOR_TOP_LEFT: u32 = 1 | 4;
-/// wl_seat 能力位。
-const SEAT_POINTER: u32 = 1;
 /// wp_cursor_shape_device_v1 的 `default`（普通箭头）。
 /// 注意这个枚举**从 1 开始**（0 是无效值）：3 是 `help`，写成 3 会显示成问号光标。
 const SHAPE_DEFAULT: u32 = 1;
@@ -75,6 +90,8 @@ unsafe extern "C" {
 
 const PROT_RW: c_int = 1 | 2;
 const MAP_SHARED: c_int = 1;
+/// keymap 只读：私有映射（写时复制，反正我们不写）。
+const MAP_PRIVATE: c_int = 2;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
 /// libwayland 的 `f`（`wl_fixed_t`）是 **24.8** 定点数，1.0 = **256**
@@ -113,6 +130,15 @@ struct Events {
     frame: Cell<bool>,
     /// 最近一次指针事件 serial（设光标形状要用）
     serial: Cell<u32>,
+    // —— 键盘（输入行用；键盘对象只在 bind_keyboard 里建）——
+    /// xkbcommon 会话：keymap 事件到来时填充，`None` = 没拿到 keymap（没法翻译）
+    xkb: RefCell<Option<Xkb>>,
+    /// 翻译好的按键队列：`(键, 是否按下)`，主循环每拍排空
+    keys: RefCell<Vec<(Key, bool)>>,
+    /// `wl_keyboard.leave`：焦点丢了，输入行该收
+    kb_leave: Cell<bool>,
+    /// `wl_keyboard.repeat_info` 的 `(rate, delay_ms)`；(0, 0) = 还没收到
+    kb_repeat: Cell<(i32, i32)>,
 }
 
 /// `wl_buffer.release` 回调要区分是哪块缓冲，data 指针带上下标。
@@ -151,6 +177,11 @@ pub struct Client {
     shm: Obj,
     _shell: Obj,
     _seat: Option<Obj>,
+    /// 键盘设备（输入行用；`None` = 座位没键盘能力或 xkbcommon 不可用）。
+    keyboard: Option<Obj>,
+    /// layer 的键盘交互模式当前值（0 = 不抢，1 = exclusive）。
+    /// 只在输入行开着时临时提到 1，关行即还——常驻抢键盘对常驻挂件是灾难。
+    kb_interactive: bool,
     surface: Obj,
     layer: Obj,
     viewport: Option<Obj>,
@@ -279,7 +310,7 @@ impl Client {
         );
         request(&wl, layer, LAYER_SET_ANCHOR, &[uint(ANCHOR_TOP_LEFT)]);
         request(&wl, layer, LAYER_SET_EXCLUSIVE_ZONE, &[int(0)]); // 不独占空间
-        request(&wl, layer, LAYER_SET_KEYBOARD, &[uint(0)]); // 永不抢焦点
+        request(&wl, layer, LAYER_SET_KEYBOARD, &[uint(0)]); // 默认不抢；输入行开着时临时 exclusive（set_kb）
         request(
             &wl,
             layer,
@@ -330,6 +361,8 @@ impl Client {
             shm,
             _shell: shell,
             _seat: seat,
+            keyboard: None,
+            kb_interactive: false,
             surface,
             layer,
             viewport,
@@ -366,12 +399,65 @@ impl Client {
             // 能力位要等一次 roundtrip 才收到
             unsafe { (client.wl.roundtrip)(client.display) };
             client.bind_pointer(&seat);
+            client.bind_keyboard(&seat);
         } else {
             eprintln!("⚠️ 合成器未提供 wl_seat，挂件无法接收鼠标输入");
+            client.widget.set_kb_available(false);
         }
         // 只提交状态：configure 要等首次 commit 之后才下发
         client.commit();
         Ok(client)
+    }
+
+    /// 键盘设备 + xkbcommon 会话。输入行的前提：座位有键盘能力，且能 dlopen
+    /// libxkbcommon 解 keymap——两者缺一就把「⌨ 输入时长」那一路关掉（托盘
+    /// 那一项会置灰），其余功能不受影响。
+    fn bind_keyboard(&mut self, seat: &Obj) {
+        if self.events.seat_caps.get() & SEAT_KEYBOARD == 0 {
+            eprintln!("⚠️ 座位无键盘能力，输入行不可用");
+            self.widget.set_kb_available(false);
+            return;
+        }
+        let Some(xkb) = Xkb::load() else {
+            eprintln!("⚠️ libxkbcommon 不可用，输入行不可用");
+            self.widget.set_kb_available(false);
+            return;
+        };
+        *self.events.xkb.borrow_mut() = Some(xkb);
+        let keyboard = request_new(
+            &self.wl,
+            *seat,
+            SEAT_GET_KEYBOARD,
+            self.ifaces.keyboard,
+            &mut [WlArgument::NIL, WlArgument::obj(*seat)],
+        );
+        // wl_keyboard 事件序：keymap enter leave key modifiers repeat_info
+        let table = leak_listeners(vec![
+            cb(on_kb_keymap as *const c_void),
+            cb(on_kb_enter as *const c_void),
+            cb(on_kb_leave as *const c_void),
+            cb(on_kb_key as *const c_void),
+            cb(on_kb_modifiers as *const c_void),
+            cb(on_kb_repeat as *const c_void),
+        ]);
+        unsafe { (self.wl.add_listener)(keyboard, table, edata(self.events)) };
+        self.keyboard = Some(keyboard);
+    }
+
+    /// layer 的键盘交互模式。输入行开着 = exclusive（合成器把键盘交给挂件），
+    /// 关掉立即回到 0——「永不抢焦点」是常态，借键盘只在输时长的那几秒。
+    fn set_kb(&mut self, on: bool) {
+        if self.kb_interactive == on {
+            return;
+        }
+        request(
+            &self.wl,
+            self.layer,
+            LAYER_SET_KEYBOARD,
+            &[uint(u32::from(on))],
+        );
+        self.kb_interactive = on;
+        self.commit();
     }
 
     /// 指针设备 + 自增指针 + 光标形状。
@@ -385,7 +471,7 @@ impl Client {
         let pointer = request_new(
             &self.wl,
             *seat,
-            0,
+            SEAT_GET_POINTER,
             self.ifaces.pointer,
             &mut [WlArgument::NIL, WlArgument::obj(*seat)],
         );
@@ -601,6 +687,26 @@ impl Client {
         if e.right_pressed.replace(false) {
             // 编辑态下右键是"退出编辑态"，只有普通态才是关掉挂件
             self.quit = self.widget.right_click();
+        }
+        // 键盘：焦点丢了 = 不输了；按键送进输入行（没开输入行时挂件自己忽略）。
+        // 队列排空不挑时机：翻译发生在回调里，这里只是搬运。
+        if e.kb_leave.replace(false) {
+            self.widget.on_kb_lost();
+        }
+        for (key, pressed) in e.keys.borrow_mut().drain(..) {
+            if pressed {
+                self.widget.on_key_press(key);
+            } else {
+                self.widget.on_key_release(key);
+            }
+        }
+        let (rate, delay) = e.kb_repeat.get();
+        if rate > 0 {
+            self.widget.set_kb_repeat(rate, delay);
+        }
+        // 输入行的开/关请求 → layer 的键盘交互模式（借键盘 / 还键盘）
+        if let Some(want) = self.widget.take_kb_want() {
+            self.set_kb(want);
         }
         Ok(())
     }
@@ -884,6 +990,11 @@ fn cb(f: *const c_void) -> unsafe extern "C" fn() {
     unsafe { std::mem::transmute(f) }
 }
 
+/// 监听表共用的 data 指针：所有键盘/指针回调都经它回到 `Events`。
+fn edata(e: &Events) -> *mut c_void {
+    e as *const Events as *mut c_void
+}
+
 /// 监听表要活到进程结束（libwayland 一直持有指针），所以建一次就泄漏。
 fn leak_listeners(items: Vec<unsafe extern "C" fn()>) -> *mut unsafe extern "C" fn() {
     Box::leak(items.into_boxed_slice()).as_mut_ptr()
@@ -1084,9 +1195,97 @@ unsafe extern "C" fn on_relative_motion(
     e.rel_dy.set(e.rel_dy.get() + fixed(dy));
 }
 
+// —— 键盘的六个事件，顺序必须与协议一致（keymap…repeat_info）——
+
+/// keymap：一份以 NUL 结尾的 XKB v1 文本躺在 fd 里，映射进来交给 xkbcommon。
+/// fd 是协议给我们的副本，用完要关。
+unsafe extern "C" fn on_kb_keymap(data: *mut c_void, _o: Obj, format: u32, fd: c_int, size: u32) {
+    let e = unsafe { &*(data as *const Events) };
+    if format != KEYMAP_XKB_V1 {
+        eprintln!("⚠️ 未知 keymap 格式 {format}，输入行不可用");
+        unsafe { close(fd) };
+        return;
+    }
+    let map = unsafe { mmap(std::ptr::null_mut(), size as usize, PROT_RW, MAP_PRIVATE, fd, 0) };
+    if map == MAP_FAILED {
+        eprintln!("⚠️ keymap 映射失败，输入行不可用");
+        unsafe { close(fd) };
+        return;
+    }
+    let text = unsafe { CStr::from_ptr(map as *const c_char) };
+    let ok = e
+        .xkb
+        .borrow_mut()
+        .as_mut()
+        .is_some_and(|x| x.set_keymap(text));
+    unsafe {
+        munmap(map, size as usize);
+        close(fd);
+    }
+    if !ok {
+        eprintln!("⚠️ keymap 解析失败，输入行不可用");
+    }
+}
+
+/// enter：键盘交到我们手上。携带的"已按住的键"数组不消费——
+/// 输入行关心的是之后按下的键，半路接手的旧键让它自生自灭。
+unsafe extern "C" fn on_kb_enter(_data: *mut c_void, _o: Obj, _s: u32, _surf: Obj, _keys: *const c_void) {}
+
+/// leave：焦点丢了。输入行开着就该收——半截输入没有"稍后继续"的价值。
+unsafe extern "C" fn on_kb_leave(data: *mut c_void, _o: Obj, _s: u32, _surf: Obj) {
+    unsafe { &*(data as *const Events) }.kb_leave.set(true);
+}
+
+/// key：evdev 键码 +8 才是 xkb 的键码（X 协议的历史遗留，spec 写得明白）。
+/// 特殊键按键符号认，普通字符走 xkb_keysym_to_utf8；翻不出来的键直接丢。
+unsafe extern "C" fn on_kb_key(data: *mut c_void, _o: Obj, _s: u32, _t: u32, key: u32, state: u32) {
+    let e = unsafe { &*(data as *const Events) };
+    let pressed = state == KEY_STATE_PRESSED;
+    let xkb = e.xkb.borrow();
+    let Some(x) = xkb.as_ref() else { return };
+    // xkb 的键码 = evdev + 8
+    let sym = x.key_sym(key + 8);
+    let k = match sym {
+        XK_BACKSPACE => Some(Key::Backspace),
+        XK_TAB => Some(Key::Char('\t')),
+        XK_RETURN | XK_KP_ENTER => Some(Key::Enter),
+        XK_ESCAPE => Some(Key::Escape),
+        _ => x.key_char(key + 8).map(Key::Char),
+    };
+    if let Some(k) = k {
+        e.keys.borrow_mut().push((k, pressed));
+    }
+}
+
+/// modifiers：shift / CapsLock 靠它生效——不喂进状态机，Shift+数字出不来符号。
+unsafe extern "C" fn on_kb_modifiers(
+    data: *mut c_void,
+    _o: Obj,
+    _s: u32,
+    dep: u32,
+    latch: u32,
+    lock: u32,
+    group: u32,
+) {
+    let e = unsafe { &*(data as *const Events) };
+    if let Some(x) = e.xkb.borrow_mut().as_mut() {
+        x.update_mods(dep, latch, lock, group);
+    }
+}
+
+/// repeat_info：rate 次/秒、delay 毫秒。合成器不替我们重复，这两个数就是
+/// 挂件补发的节拍（挂件侧 `Widget::set_kb_repeat`）。
+unsafe extern "C" fn on_kb_repeat(data: *mut c_void, _o: Obj, rate: i32, delay: i32) {
+    unsafe { &*(data as *const Events) }.kb_repeat.set((rate, delay));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{REGION_ADD, SURFACE_ATTACH, SURFACE_COMMIT, SURFACE_SET_INPUT_REGION, fixed};
+    use super::{
+        KEYMAP_XKB_V1, KEY_STATE_PRESSED, REGION_ADD, SEAT_GET_KEYBOARD, SEAT_GET_POINTER,
+        SEAT_KEYBOARD, SEAT_POINTER, SURFACE_ATTACH, SURFACE_COMMIT, SURFACE_SET_INPUT_REGION,
+        XK_BACKSPACE, XK_ESCAPE, XK_KP_ENTER, XK_RETURN, XK_TAB, fixed,
+    };
 
     /// `wl_fixed_t` 是 24.8，不是 16.16：线上 1 px 的位移就是 256。
     /// 这条钉住换算常数——写成 ÷65536 会让所有位移缩水 256 倍，
@@ -1136,5 +1335,23 @@ mod tests {
             "commit 与 set_input_region 只差一位，别写串"
         );
         // wl_compositor: create_surface=0, create_region=1（`new_region` 用的就是 1）
+    }
+
+    /// 键盘这条路的协议常数：`get_keyboard` 是 wl_seat 的 1 号请求、键盘能力位是
+    /// 第 2 位、keymap 只认 XKB v1、特殊键按键符号认。任何一处写错，要么键收不到
+    /// （能力位），要么往输入行里塞错字（键符号），要么 Esc 被当成字符。
+    #[test]
+    fn keyboard_requests_keep_their_protocol_numbers() {
+        assert_eq!(SEAT_GET_POINTER, 0, "wl_seat: get_pointer=0");
+        assert_eq!(SEAT_GET_KEYBOARD, 1, "wl_seat: get_keyboard=1");
+        assert_eq!(SEAT_POINTER, 1, "能力位 pointer=1");
+        assert_eq!(SEAT_KEYBOARD, 2, "能力位 keyboard=2");
+        assert_eq!(KEYMAP_XKB_V1, 1, "keymap format：1 = XKB v1 文本");
+        assert_eq!(KEY_STATE_PRESSED, 1, "key state：1 = 按下");
+        assert_eq!(XK_BACKSPACE, 0xff08);
+        assert_eq!(XK_TAB, 0xff09);
+        assert_eq!(XK_RETURN, 0xff0d);
+        assert_eq!(XK_KP_ENTER, 0xff8d, "小键盘回车与主回车不同符号");
+        assert_eq!(XK_ESCAPE, 0xff1b);
     }
 }

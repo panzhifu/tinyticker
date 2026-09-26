@@ -184,6 +184,7 @@ pub struct Ifaces {
     pub region: *const WlInterface,
     pub seat: *const WlInterface,
     pub pointer: *const WlInterface,
+    pub keyboard: *const WlInterface,
     pub output: *const WlInterface,
     pub callback: *const WlInterface,
 
@@ -320,6 +321,7 @@ impl Ifaces {
             region: core("wl_region_interface")?,
             seat: core("wl_seat_interface")?,
             pointer,
+            keyboard: core("wl_keyboard_interface")?,
             output,
             callback: core("wl_callback_interface")?,
             layer_shell,

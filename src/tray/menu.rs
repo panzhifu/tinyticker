@@ -124,6 +124,10 @@ pub(super) struct State {
     pub(super) gif: bool,
     /// 配了 `alarm_sound` 没有；没配的话「试听音效」无从播起，同样置灰
     pub(super) sound: bool,
+    /// 键盘可用性（后端启动时探明：Wayland 座位键盘能力 + libxkbcommon）。
+    /// 拿不到键盘时「⌨ 输入时长」置灰并写明原因——点了没动作却不说明，
+    /// 比置灰更难查。不进 Config：它是会话能力，不是用户选择。
+    pub(super) kb_ok: bool,
     /// 语言子菜单的勾选看**配置值**（auto/zh/en 三档单选）。
     pub(super) language: Language,
     /// `pomo_seq` 当前段号，由主循环回填；不在序列番茄钟上就是 `None`。
@@ -162,6 +166,8 @@ impl State {
                 .as_deref()
                 .is_some_and(|p| !p.trim().is_empty()),
             sound: cfg.alarm_sound.is_some(),
+            // 键盘按"可用"乐观起：后端探明拿不到才经 SyncKb 推一次置灰
+            kb_ok: true,
             language: cfg.language,
             pomo_step: None,
         }
@@ -175,10 +181,13 @@ impl State {
         let hidden = std::mem::take(&mut self.hidden);
         let edit = std::mem::take(&mut self.edit);
         let step = self.pomo_step;
+        let kb = self.kb_ok;
         *self = Self::from_config(cfg);
         self.hidden = hidden;
         self.edit = edit;
         self.pomo_step = step;
+        // 键盘可用性是会话能力不是配置投影：热加载不许把它冲回乐观值
+        self.kb_ok = kb;
     }
 
     /// 这一项当前能不能点。置灰的两档都在标签里写了原因（点了没动作却不说明，
@@ -187,6 +196,7 @@ impl State {
         match cmd {
             Command::SetIcon(IconMode::Gif) => self.gif,
             Command::PreviewSound => self.sound,
+            Command::InputTime => self.kb_ok,
             _ => true,
         }
     }
@@ -271,6 +281,7 @@ pub(super) fn build_nodes(
     presets: &[u32],
     gif_configured: bool,
     sound_configured: bool,
+    kb_ok: bool,
     pomo_seq: &[u32],
     lang: Language,
 ) -> Vec<Node> {
@@ -327,6 +338,24 @@ pub(super) fn build_nodes(
         &mut n,
         &mut root,
         button(tr_in(lang, "🛠 编辑态", "🛠 Edit mode"), Command::ToggleEdit),
+    );
+    // 输入行：键盘不可用（座位没键盘能力 / 缺 libxkbcommon）时置灰并写明原因，
+    // 与「试听音效」未配时同一规矩
+    push_top(
+        &mut n,
+        &mut root,
+        button(
+            if kb_ok {
+                tr_in(lang, "⌨ 输入时长", "⌨ Type a duration")
+            } else {
+                tr_in(
+                    lang,
+                    "⌨ 输入时长（无键盘）",
+                    "⌨ Type a duration (no keyboard)",
+                )
+            },
+            Command::InputTime,
+        ),
     );
     push_top(
         &mut n,
@@ -574,8 +603,9 @@ mod tests {
     use super::*;
 
     /// 默认按中文构建（与 `Config::default().language` 的 resolve 结果同侧）。
+    /// 键盘按可用建：多数测试不关心那一项的置灰。
     fn nodes(presets: &[u32], gif: bool) -> Vec<Node> {
-        build_nodes(presets, gif, false, &[], Language::Zh)
+        build_nodes(presets, gif, false, true, &[], Language::Zh)
     }
 
     #[test]
@@ -812,7 +842,7 @@ mod tests {
     /// 英文构建：标签换血，命令一个不换。
     #[test]
     fn english_labels_same_commands() {
-        let n = build_nodes(&Config::default().presets, true, false, &[], Language::En);
+        let n = build_nodes(&Config::default().presets, true, false, true, &[], Language::En);
         assert!(
             n.iter()
                 .any(|x| x.command == Some(Command::Start) && x.label == "▶ Start")
@@ -836,7 +866,7 @@ mod tests {
     /// 打勾跟着主循环回填的段号走，不跟点击走。
     #[test]
     fn pomodoro_steps_submenu_follows_the_sequence() {
-        let n = build_nodes(&[60], true, false, &[1500, 300, 900], Language::Zh);
+        let n = build_nodes(&[60], true, false, true, &[1500, 300, 900], Language::Zh);
         let menu = n
             .iter()
             .find(|x| x.label == "🍅 番茄分段")
@@ -976,6 +1006,7 @@ mod tests {
             &Config::default().presets,
             true,
             false,
+            true,
             &[1500, 300],
             Language::Zh,
         );

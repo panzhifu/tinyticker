@@ -107,6 +107,9 @@ pub enum Command {
     PreviewSound,
     /// 把编辑态设成给定值——`tinyticker --edit` / `--no-edit`，可重复执行。
     SetEdit(bool),
+    /// 打开输入行（托盘「⌨ 输入时长」/ `tinyticker --input`）：在挂件上键入时长，
+    /// 回车按预设的语义开始、Esc 取消。键盘只借这一次，关行即还。
+    InputTime,
     /// 切换计时结束时发不发桌面通知（写回 `notify`）。
     ToggleNotify,
     /// 登记 / 取消开机自启（写删 `~/.config/autostart/` 里那份同名条目）。
@@ -235,6 +238,10 @@ enum TrayMsg {
     SyncEdit(bool),
     /// 「隐藏挂件」那一格同理：`tinyticker --hide` / `--show` 走的是套接字。
     SyncHidden(bool),
+    /// 「⌨ 输入时长」那一格的可点性：键盘可用性是后端在启动时探明的
+    /// （Wayland = 座位键盘能力 + libxkbcommon），托盘自己不知道，得主循环告知。
+    /// 不可用就置灰并把原因写进标签（与「试听音效」未配时同一规矩）。
+    SyncKb(bool),
     /// 用一份新配置回填所有配置派生的勾选格，并按新语言重建菜单节点。
     /// 热加载与套接字那两条不经过菜单的路都靠它收口（取代逐项 `Sync*` 的趋势：
     /// 加一个配置项不会漏一条回填消息）。
@@ -337,6 +344,12 @@ pub fn sync_hidden(handle: &TrayHandle, hidden: bool) {
     let _ = handle.tx.send(TrayMsg::SyncHidden(hidden));
 }
 
+/// 「⌨ 输入时长」那一格的可点性：键盘可用性由后端探明（座位能力 + libxkbcommon），
+/// 托盘自己不知道，主循环在句柄到手时告知一次。
+pub fn sync_kb(handle: &TrayHandle, ok: bool) {
+    let _ = handle.tx.send(TrayMsg::SyncKb(ok));
+}
+
 /// 倒计时进度变了推一次（`tray_throttle = timer` 的驱动源；1% 一格，不每秒刷屏）。
 pub fn sync_progress(handle: &TrayHandle, percent: u8) {
     let _ = handle.tx.send(TrayMsg::SyncProgress(percent));
@@ -388,7 +401,8 @@ fn run(
         &mut player,
         state.numbers,
     );
-    let nodes = build_nodes(&presets, state.gif, state.sound, &pomo_seq, lang);
+    // 键盘可用性启动时按"可用"乐观：后端探明拿不到才经 SyncKb 推一次置灰
+    let nodes = build_nodes(&presets, state.gif, state.sound, true, &pomo_seq, lang);
     let server: *mut Server = Box::leak(Box::new(Server {
         dbus,
         cmd_tx,
@@ -446,6 +460,17 @@ fn run(
                 TrayMsg::Notify(note) => unsafe { send_notification(dbus, conn, &note) },
                 TrayMsg::SyncEdit(on) => unsafe { (*server).state.borrow_mut().edit = on },
                 TrayMsg::SyncHidden(v) => unsafe { (*server).state.borrow_mut().hidden = v },
+                // 键盘可用性连着那一项的标签与可点性：格子和节点表都得跟上
+                TrayMsg::SyncKb(ok) => unsafe {
+                    let s = &mut *server;
+                    s.state.borrow_mut().kb_ok = ok;
+                    let (gif, sound, kb, lang) = {
+                        let st = s.state.borrow();
+                        (st.gif, st.sound, st.kb_ok, s.lang)
+                    };
+                    s.nodes =
+                        build_nodes(&s.presets.clone(), gif, sound, kb, &s.pomo_seq.clone(), lang);
+                },
                 TrayMsg::SyncPomo(step) => unsafe { (*server).state.borrow_mut().pomo_step = step },
                 TrayMsg::SyncProgress(p) => unsafe { (*server).progress.set(p) },
                 TrayMsg::SyncConfig(cfg) => unsafe {
@@ -455,10 +480,18 @@ fn run(
                     s.pomo_seq = cfg.pomo.seq.clone();
                     s.lang = cfg.language.resolve();
                     s.fixed_pct.set(cfg.tray_gif_speed);
-                    let gif = s.state.borrow().gif;
-                    let sound = s.state.borrow().sound;
-                    s.nodes =
-                        build_nodes(&s.presets.clone(), gif, sound, &s.pomo_seq.clone(), s.lang);
+                    let (gif, sound, kb) = {
+                        let st = s.state.borrow();
+                        (st.gif, st.sound, st.kb_ok)
+                    };
+                    s.nodes = build_nodes(
+                        &s.presets.clone(),
+                        gif,
+                        sound,
+                        kb,
+                        &s.pomo_seq.clone(),
+                        s.lang,
+                    );
                 },
             }
         }

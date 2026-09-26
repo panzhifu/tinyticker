@@ -72,6 +72,10 @@ pub struct Intent {
     pub pause: bool,
     pub toggle: bool,
     pub reset: bool,
+    /// `--input`：打开输入行（在挂件上键入时长）。与编辑态同族——界面动作
+    /// 不进配置；冷启动时主循环自己补发这条命令（见 `main.rs`），所以
+    /// 转发与冷启动两条路行为一致。
+    pub input: bool,
 }
 
 impl Intent {
@@ -96,6 +100,7 @@ impl Intent {
                 "--pause" => intent.pause = true,
                 "--toggle" => intent.toggle = true,
                 "--reset" => intent.reset = true,
+                "--input" => intent.input = true,
                 // 带值参数：`--and 锁屏.cmd` / `--and=...` 两种写法
                 "--and" | "--then" => {
                     intent.and_then = Some(it.next().cloned().ok_or("--and 后面要跟一条命令")?);
@@ -145,6 +150,10 @@ impl Intent {
         // 编辑态紧随其后：它只决定输入区域和右键含义，不碰读数
         if let Some(edit) = self.edit {
             out.push(Command::SetEdit(edit));
+        }
+        // 输入行再往后：先摆好界面（编辑态 / 输入行），再谈计时
+        if self.input {
+            out.push(Command::InputTime);
         }
         if let Some(mode) = self.mode {
             out.push(Command::SetMode(mode));
@@ -508,6 +517,31 @@ mod tests {
                 .commands(),
             vec![Command::Preset(1500), Command::Pause]
         );
+    }
+
+    /// `--input` 翻成 `Command::InputTime`，排在编辑态之后、模式之前：
+    /// 先摆好界面（编辑态 / 输入行）再谈计时。
+    #[test]
+    fn input_flag_maps_to_the_input_command() {
+        assert!(Intent::parse(&["--input".into()]).unwrap().input);
+        assert_eq!(
+            Intent::parse(&["--input".into()]).unwrap().commands(),
+            vec![Command::InputTime]
+        );
+        assert_eq!(
+            Intent::parse(&["--edit".into(), "--input".into(), "-s".into()])
+                .unwrap()
+                .commands(),
+            vec![
+                Command::SetEdit(true),
+                Command::InputTime,
+                Command::SetMode(Mode::Stopwatch)
+            ]
+        );
+        // 不进配置：输入行是界面动作，冷启动不该记住它
+        let mut cfg = Config::default();
+        Intent::parse(&["--input".into()]).unwrap().apply(&mut cfg);
+        assert_eq!(cfg, Config::default());
     }
 
     /// `--centis` 是设定值不是翻面：冷启动时它进配置（与模式同族），

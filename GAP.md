@@ -3,7 +3,7 @@
 > 生成日期：2026-09-24。配套阅读 [COMPARISON.md](COMPARISON.md)——那份是"谁有什么"的对比表，这份是"差在哪、为什么差、补要付多少"的差距分析。
 >
 > **取证基准**
-> - tinyticker：`main` 分支工作区（v0.6.0：第二梯队、零散 XS 整批、A 类声音/PNG 批三批已并入发布），230 项内联测试全通过、`cargo clippy --all-targets -- -D warnings` 零告警；`cargo build --release` 实测 684 888 B（0.653 MiB），`--no-default-features` 675 600 B（0.644 MiB）——A 类那一批（声音 + PNG/APNG + 帧序列源 + 限速两档 + tooltip 补全）合计 **+35 KB**。本文档写完后又长了字形层、套接字与各批格式/图标/语言/分页项，见 §5.1、§九 与各表的"已做"标注。
+> - tinyticker：`main` 分支工作区（v0.6.0：第二梯队、零散 XS 整批、A 类声音/PNG 批三批已并入发布；其后又清了 **R1 键盘通路整批**，见 §零/§十二），**243** 项内联测试全通过、`cargo clippy --all-targets -- -D warnings` 零告警；`cargo build --release` 实测 **693 360 B**（0.661 MiB），`--no-default-features` 684 360 B（0.653 MiB）——A 类那批 +35 KB、R1 键盘批 **+8.5 KB**（dlopen libxkbcommon + 两后端键盘事件 + 输入行状态机 + CLI `--input`）。字形层、套接字与各批格式/图标/语言/分页项见 §5.1、§九 与各表的"已做"标注。
 > - Catime：本地克隆 `../Catime`，`resource/resource.h:9` 写的是 **1.6.2**（README 顶栏还停在 1.5.0），约 99 178 行 C，配置项 **92 个**（`src/config/config_defaults.c:18-129` 的 `CONFIG_METADATA[]`）。
 > - 下文 Catime 的每条断言都给了 `文件:行`；tinyticker 的每条都给本仓库的 `文件:行`。凡是只读到声明没读到实现的，标注"未证"。
 
@@ -23,7 +23,7 @@
 
 三条根因：
 
-1. **R1 没有键盘通路。** Wayland 侧我们主动把 layer-shell 的键盘交互设为 0（`src/wl.rs:241`，注释即"永不抢焦点"），也从未 `get_keyboard`；X11 侧建窗事件掩码里根本没有 `KeyPressMask`（`src/x11.rs:115-119`）。于是所有需要输入的东西——时间输入框、HEX 调色板、插件脚本路径、Markdown 文件路径、热键编辑器——**不可达**，而不是"没做"。
+1. **R1 键盘通路 —— 已通（2026-09-26）**。Wayland 侧 `wl_seat.get_keyboard` 绑上了（`src/wl.rs` 的 `bind_keyboard`：座位能力位 + dlopen libxkbcommon 解合成器下发的 keymap，keymap/enter/leave/key/modifiers/repeat_info 六个事件全接，键码 = evdev + 8），layer 的键盘交互默认仍为 0、只在输入行开着的那几秒临时提到 exclusive（`set_kb`）；X11 侧事件掩码加了 `KeyPressMask`，键码翻译走 `XLookupString`，输入行开着时 `XGrabKeyboard` + `XGrabPointer`、点到别处即还（`src/x11.rs` 的 `set_kb`）。第一个消费者是**时长输入行**（托盘「⌨ 输入时长」/ `tinyticker --input`：状态行变 `> 25m_` 提示符，回车按预设语义开始、Esc 取消、失焦即收、非法输入缀 `?` 不关行）。剩下的消费者——HEX 调色板、插件脚本路径、Markdown 文件路径、热键编辑器——通路已通但 UI 还没长，见 §十二 #26 的"已做"标注。
 2. **R2 只有 8×8 ASCII 位图字体。** `font8x8.rs` 仅 `FONT8X8_BASIC`，码位 ≥128 曾一律留空位。——**2026-09-24 已补**：`src/text.rs` 用运行时 dlopen 的 libfreetype 填点阵覆盖不到的码位，数字行仍走点阵。剩下没解决的是"任意文本进数字行"和 shaping（连字 / RTL / 组合附加符），见 §5.1。
 3. **R3 没有进程外能力。** 无音频输出、无 TLS、不解码 PNG/WebP/JPG、不执行外部脚本、不连网络。`on_finish` 是唯一的外向出口（`src/config.rs`）。
 
@@ -285,7 +285,7 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 |---|---|---|---|
 | 24 | ~~声音提醒（WAV/PCM）~~ **已做（2026-09-25）** | ~~L~~ → 实测 L | dlopen `libasound.so.2`（六个符号，`sys/alsa.rs`）+ WAV 解码 + 合成 beep（`audio.rs`）。MP3 不做。见 §八 那行 |
 | 25 | ~~PNG / APNG 托盘动图~~ **已做（2026-09-25）** | ~~L~~ → 实测 L | 自研 DEFLATE（stored/固定/动态三种块型）+ 五种行滤波 + APNG dispose×blend（`png.rs`，类型与播放器收进 `anim.rs`，`tray_gif` 一个键、按魔数分发）；顺带做了它的**目录帧序列源**（文件名升序、每张一帧、间隔 100ms）。Adam7 拒收，WebP/JPG 维持永久排除。原估 +12 KB，连声音那一批实测共 **+35 KB** |
-| 26 | 键盘输入通路 | L | layer-shell `keyboard-interactive` + keymap 协议 + 自研 keysym→UTF-8（正常要走 xkbcommon，与零依赖冲突） |
+| 26 | ~~键盘输入通路~~ **已做（2026-09-26）** | ~~L~~ → 实测 **+8.5 KB** | dlopen libxkbcommon（`sys/xkb.rs`，九个符号，与 freetype/alsa 同待遇——构建期仍零依赖、`ldd` 仍只有 libc/libm/libgcc_s）+ 两后端键盘事件 + 输入行状态机 + CLI `--input`。没有自研 keysym 表——keymap 解析老实交给系统的 xkbcommon，"零依赖"指构建期与 crate，运行时 dlopen 的口径 §5.1 已立过先例。实测 230 → **243** 项测试（+13），684 888 → **693 360 B**（仅 Wayland 675 600 → 684 360） |
 | 27 | ~~任意文本 / CJK / TTF 光栅化~~ **已做（2026-09-24）** | ~~XL~~ → 实测 L | 走 dlopen libfreetype + 宿主字体，不内嵌字体数据、不引 crate，+26 KB。状态行已支持中文，数字行按设计保留点阵。剩下的缺口只有 shaping（连字 / RTL / 组合附加符）与"任意文本进数字行"，见 §5.1 |
 | 28 | 插件执行 + 信任 + 进程树回收 | M-L | 能力不难，**攻击面是成本**。建议永久维持"只读不执行"（`textsrc.rs:9`） |
 | 29 | Markdown 渲染 | XL | 依赖 26 + 27 |
@@ -332,3 +332,5 @@ Catime 的托盘远不止一个图标：它是一个带**动画子系统 + 数�
 第三梯队以后不建议为"对齐 Catime"而做，只为"我们自己想要"而做。
 
 > 零散 XS 批之后，A 类四件（声音、PNG/APNG、tooltip 开机时长/速率行、限速五档对齐）于同日做完，见 §七/§八/§十二：三批合计 230 项测试 / 684 888 B（A 类 +35 KB）。三条根因里 **R1（键盘）与 R3 的"进程外能力"只剩 MP3/WebP/JPG 解码与插件执行**——都按体积/攻击面理由明确不做。悬停即预览照旧是"两种哲学"那条；§十二 只剩第三梯队里 #26/#28/#29/#30 四条贵的与 R1/R3 根因。对齐性的便宜活到此清零。
+>
+> 2026-09-26：**R1 键盘通路整批清完（#26）**。dlopen libxkbcommon（`src/sys/xkb.rs`，九个符号）+ Wayland 侧 `wl_seat.get_keyboard` 与六个事件（keymap/enter/leave/key/modifiers/repeat_info，键码 evdev+8）+ X11 侧 `KeyPressMask`/`XLookupString`/键盘指针抓取 + 挂件输入行状态机（`> ` 提示符、回车走既有 parse、Esc/失焦取消、非法缀 `?`、光标闪烁、repeat_info 驱动的按键重复）+ 托盘「⌨ 输入时长」（键盘不可用置灰带原因，`TrayMsg::SyncKb` 回填）+ CLI `--input`（转发与冷启动两条路都开行）。设计取舍记两条：① 键盘只在输入行开着的那几秒归挂件——Wayland 临时 exclusive、X11 抓取即还，常驻抢键盘对常驻挂件是灾难；② 输入行不进配置，与 hidden/edit 同理。这一批合计 **+8.5 KB**（684 888 → 693 360，仅 Wayland 675 600 → 684 360），测试 230 → **243** 项。三条根因里 **R1 已闭合**；R3 的"进程外能力"只剩 MP3/WebP/JPG 解码与插件执行（按体积/攻击面理由维持不做）。§十二 只剩 #28/#29/#30 三条贵的。输入行的第一个消费者是时长；HEX 调色板/插件路径/Markdown 路径/热键编辑器的 UI 仍空——通路在，各自的活各自排。

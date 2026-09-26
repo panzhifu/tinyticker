@@ -14,6 +14,7 @@ pub mod dbus;
 pub mod freetype;
 pub mod wayland;
 pub mod x11;
+pub mod xkb;
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::size_of;

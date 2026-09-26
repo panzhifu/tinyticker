@@ -1,7 +1,7 @@
 # tinyticker vs Catime 功能对比
 
 > 更新日期：2026-09-25
-> tinyticker 版本：**0.6.0**（在 0.5.0 的零第三方依赖重写——自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟——之上累加：番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效、状态行中文、单实例参数转发、百分之一秒、补零三档与显示秒、网络速率图标、隐藏/显示挂件、配置原子写、编辑态、CSS 颜色名与 `rgb()`、图标数字档、动图限速、`pomo_seq`；零散批（空闲/时钟心跳下探 + self-pipe 唤醒、具名渐变、`status_font_px`、CLI 无时长动作、时钟百分秒、预设 50 档 + 分页、番茄分段、zh/en 双语层、勾选态回填收口），及 A 类批（到点提示音 WAV/beep、PNG/APNG 动图 + 目录帧序列源、限速五档对齐、tooltip 开机时长/倍率行））
+> tinyticker 版本：**0.6.0**（在 0.5.0 的零第三方依赖重写——自研 Wayland/X11 客户端 + layer-shell 置顶 + 自研托盘与 TZif 时钟——之上累加：番茄钟长休息、可配预设、外观菜单、GIF 动图、图标占用表、外部文本源、`src/effect.rs` 文字特效、状态行中文、单实例参数转发、百分之一秒、补零三档与显示秒、网络速率图标、隐藏/显示挂件、配置原子写、编辑态、CSS 颜色名与 `rgb()`、图标数字档、动图限速、`pomo_seq`；零散批（空闲/时钟心跳下探 + self-pipe 唤醒、具名渐变、`status_font_px`、CLI 无时长动作、时钟百分秒、预设 50 档 + 分页、番茄分段、zh/en 双语层、勾选态回填收口），及 A 类批（到点提示音 WAV/beep、PNG/APNG 动图 + 目录帧序列源、限速五档对齐、tooltip 开机时长/倍率行），及 R1 键盘批（时长输入行：dlopen libxkbcommon 解 keymap + Wayland/X11 两后端键盘事件 + 挂件 `> ` 输入行 + 托盘「⌨ 输入时长」/ `--input`））
 > Catime 版本：**v1.6.2**（本地参考克隆 `../Catime`，`resource/resource.h:9`；其 README 顶栏仍写 1.5.0）
 >
 > 本表回答"谁有什么"。**"差在哪、为什么差、补要付多少"看 [GAP.md](GAP.md)**——那份是逐文件读码后的代码级差距分析（含 Catime 92 个配置项与 30 条特效/颜色参数的取证，以及按补齐成本排的序）。本表若与 GAP.md 冲突，以 GAP.md 为准。
@@ -13,7 +13,7 @@
 | 定位 | 极简悬浮计时器（自用 / 学习向） | 功能完整的轻量计时工具箱 |
 | 平台 | Linux（Wayland 优先，X11 可选编译）；目标就是只做 Linux，不做跨平台移植 | 仅 Windows |
 | 语言 / 技术栈 | Rust + 自研 Wayland 客户端（layer-shell + ARGB shm，直调 libwayland-client）+ 自研 X11 客户端（override-redirect ARGB，直调 libX11）+ 自研托盘（直调 libdbus） | 纯 C + Win32 API + GDI |
-| 二进制体积 | Wayland 极小版 0.64 MB（675 600 B）/ 含 X11 通用版 0.65 MB（684 888 B），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
+| 二进制体积 | Wayland 极小版 0.65 MB（684 360 B）/ 含 X11 通用版 0.66 MB（693 360 B），工作区版本实测（未压缩，UPX 后更小） | 995 KB（32 位） |
 | 许可 | MIT | Apache-2.0 |
 
 ## 二、功能对比表
@@ -46,10 +46,10 @@
 | 托盘图标 | ✅（0.2.0 起程序化绘制 32x32；工作区版本按派发节拍重绘、指针按本地时间摆；动图容器 **GIF / PNG / APNG / 目录帧序列源**——`tray_gif` 一个键按魔数/目录分发（A 类批），WebP/JPG 仍永久排除） | ✅（GIF / WebP / ANI 走动画，ICO/PNG/BMP/JPG/TIF 走静态，全部靠系统 **WIC** 解，只有 ANI 是手写 RIFF；还支持"一个文件夹当一段动画"的帧序列源，≤512 帧） |
 | 字体 | 内置 8x8 位图字体（仅 ASCII，不支持中文显示） | 13 款内嵌 TTF（出厂即为裁剪过的 "Essence" 子集）+ 自定义字体目录 + 系统字体对话框。**裁剪工具在官网，不在仓库**（`tools/` 只有 icon/png/资源打包三个脚本） |
 | 托盘鼠标手势 | ✅（工作区版本：**左键 = 开始/暂停，中键 = 重置，右键 = 菜单，图标上滚轮 = 缩放**；`ItemIsMenu` 因此报 `false`） | ⚠️ 只有两种：**左键 = 计时控制菜单，右键 = 设置菜单**（`tray_click.c:44-48`）。中键与双击无实现，托盘滚轮是个**没有任何发送方的保留消息**（`resource_app_ids.h:34`）——这一项我们反而更多 |
-| 输入任意时长 | ❌（需要文本输入框，本项目只有 8x8 位图渲染器，且两端都拿不到键盘；改走托盘预设 + 命令行参数） | ✅（左键菜单再进一层弹多行输入框 `ShowCountdownInputDialog`；能弹框是因为它有完整对话框 + 键盘通路） |
+| 输入任意时长 | ✅（2026-09-26，R1 键盘批：**输入行**——托盘「⌨ 输入时长」/ `tinyticker --input` 打开，状态行变 `> 25m_` 提示符，回车走既有 parse（相对/绝对同一语法）、Esc 取消、失焦即收、非法输入缀 `?` 不关行、光标闪烁 + repeat_info 驱动的按键重复；键盘只在开着的那几秒归挂件——Wayland 临时 exclusive、X11 `XGrabKeyboard` 即还） | ✅（左键菜单再进一层弹多行输入框 `ShowCountdownInputDialog`；能弹框是因为它有完整对话框 + 键盘通路） |
 | 托盘限速指标五档 | ✅（A 类批对齐 `ANIMATION_SPEED_METRIC`：off / cpu / memory / **timer**（倒计时进度当负载）/ **fixed**（`tray_gif_speed`，默认双倍速）；128 点可改曲线仍不做——要键盘与对话框） | ✅（五档 + 可改曲线） |
 | 托盘实时显示 CPU/内存/电池/网络 | ✅（工作区版本：托盘「外观 → 图标内容」**六选一**并带勾选，内盘自底向上涨水位，每秒重绘并发 `NewIcon`；`tray_numbers` 再把那四档换成**直接写数字**（`42%`，网络是上下两行速率，2026-09-25）；数据来自 `/proc/stat` 差分、`MemAvailable`、`/sys/class/power_supply`、`/proc/net/dev` 差分（网络那一档是**对数水位**，1 KB/s 空盘 ~ 10 MB/s 满盘、上下行取大），未引入任何 crate） | ✅（每网卡上/下行 B/s 的**数字**读数，独立采样线程，单位按资源管理器口径缩放） |
-| 全局快捷键 | ⚠️ 不自己注册（Wayland 无统一协议），改由单实例套接字让 DE 的快捷键设置替我们做：绑一条 `tinyticker 25m` 即可；零散批之后动作面扩到 `--toggle` / `--pause` / `--reset` / `--centis` / `--hide` / `--edit`，暂停继续这类无时长语义的也能绑了 | ✅ **14 个**，全部默认 `None`（`config_defaults.c:110-123`），语法 `Ctrl+Alt+A` / `F1-F24` / `0xNN` / 34 个具名键 |
+| 全局快捷键 | ⚠️ 不自己注册（Wayland 无统一协议），改由单实例套接字让 DE 的快捷键设置替我们做：绑一条 `tinyticker 25m` 即可；零散批之后动作面扩到 `--toggle` / `--pause` / `--reset` / `--centis` / `--hide` / `--edit`，暂停继续这类无时长语义的也能绑了；R1 批再加 `--input`（打开输入行当场键入时长） | ✅ **14 个**，全部默认 `None`（`config_defaults.c:110-123`），语法 `Ctrl+Alt+A` / `F1-F24` / `0xNN` / 34 个具名键 |
 | 单实例 / 二次启动下命令 | ✅（工作区版本，`src/ipc.rs`）：`$XDG_RUNTIME_DIR/tinyticker.sock`，0600；参数原样送过去由收端跑同一个解析器，命令复用既有的 `cmd_tx` 通道，两个后端一行没改 | ✅（`WM_COPYDATA` 转给已存在的窗口，`window_message_commands.c:74-105`） |
 | 右键关闭窗口 | ✅（编辑态下改成"退出编辑态"，见上面那行） | 编辑模式下右键退出编辑 |
 | **计时输入** | | |
@@ -117,7 +117,7 @@
 
 剩下的差距**不是散落的几十个点，而是三条根因**（详见 [GAP.md](GAP.md) §零）：
 
-1. **R1 没有键盘通路**——layer-shell 的 `keyboard-interactive` 恒为 0、X11 侧没有 `KeyPressMask`。时间输入框、HEX 调色板、热键编辑器、Markdown 路径全部因此不可达。
+1. **R1 ~~没有键盘通路~~ 已通（2026-09-26）**——Wayland 侧 `wl_seat.get_keyboard` + dlopen libxkbcommon 解 keymap（输入行开着时临时 exclusive），X11 侧 `KeyPressMask` + `XLookupString` + 键盘/指针抓取；第一个消费者是时长输入行（托盘项 / `--input`）。HEX 调色板、热键编辑器、Markdown 路径的 UI 仍空——通路在，各自的活各自排。
 2. **R2 只有 8×8 ASCII 位图字体**——~~CJK、任意自定义文本、富文本因此不可达~~ **状态行那半边已于 2026-09-24 补上**：dlopen libfreetype + 宿主字体，不内嵌字体数据、不引 crate（+26 KB）。数字行按设计保留点阵；shaping（连字 / RTL / 组合附加符）仍不做。
 3. **R3 没有进程外能力**——无音频输出、无 TLS、不解码 PNG/WebP/JPG、不执行脚本。
 
@@ -125,4 +125,4 @@
 
 差距变化：0.3.0 时对比表中有 6 项 ❌，0.4.0 消除其中 4 项（时钟、番茄钟、滚轮缩放、绝对时间 + 顺带补上自定义命令），0.4.1 再补 12/24h 制式与点击穿透，0.5.0 补上 Wayland 置顶与自定位（不再需要合成器规则），工作区版本清掉长休息/可配预设/文字特效/渐变/占用表/外部文本源六项，再补状态行中文（字形层）、百分秒、单实例转发、配置热加载与显隐、GAP 第一梯队 #1-#14 全批，以及编辑态一档（2026-09-25）。本次逐文件读码另需修正本表 6 处（点击穿透、Catime 版本号、预设数、绝对时间语法、字体裁剪工具归属、插件启动方式）——见 GAP.md §十。零散 XS 批（2026-09-25 同日）：心跳阶梯下探 + self-pipe 唤醒、具名渐变、`status_font_px`、CLI 无时长动作、时钟百分秒、预设 50 档 + 分页、番茄分段托盘项、zh/en 双语层、勾选态回填收口——GAP §十二 那张零散表整批清完。
 
-> 体积验证：Wayland 极小版 0.64 MB / 含 X11 通用版 0.65 MB（未压缩，675 600 / 684 888 字节；第一梯队 + #15-#18 那轮长了 31 KB，第二梯队与零散 XS 批再长 ~19 KB，A 类批（声音 + PNG/APNG + 帧序列 + 限速两档）+35 KB）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc / libm 与 libgcc_s。
+> 体积验证：Wayland 极小版 0.65 MB / 含 X11 通用版 0.66 MB（未压缩，684 360 / 693 360 字节；第一梯队 + #15-#18 那轮长了 31 KB，第二梯队与零散 XS 批再长 ~19 KB，A 类批（声音 + PNG/APNG + 帧序列 + 限速两档）+35 KB，R1 键盘批（libxkbcommon + 两后端键盘事件 + 输入行 + `--input`）+8.5 KB）。winit + wayland-client + softbuffer + ldtray 全部换成运行时 dlopen 系统库（libwayland-client / libX11 / libXext / libdbus / libfreetype / libxkbcommon），`Cargo.lock` 里只剩 tinyticker 自己，`ldd` 只剩 libc / libm 与 libgcc_s。

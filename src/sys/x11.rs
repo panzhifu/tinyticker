@@ -132,6 +132,26 @@ pub struct MotionEvent {
     pub same_screen: c_int,
 }
 
+/// `XKeyEvent`：与 `XButtonEvent` 同布局，末两格是 keycode / same_screen。
+#[repr(C)]
+pub struct KeyEvent {
+    pub type_: c_int,
+    pub serial: c_ulong,
+    pub send_event: c_int,
+    pub display: *mut Display,
+    pub window: Window,
+    pub root: Window,
+    pub subwindow: Window,
+    pub time: Time,
+    pub x: c_int,
+    pub y: c_int,
+    pub x_root: c_int,
+    pub y_root: c_int,
+    pub state: c_uint,
+    pub keycode: c_uint,
+    pub same_screen: c_int,
+}
+
 /// `XConfigureEvent`。
 #[repr(C)]
 pub struct ConfigureEvent {
@@ -265,6 +285,7 @@ pub const CW_EVENT_MASK: c_ulong = 1 << 11;
 pub const CW_COLORMAP: c_ulong = 1 << 13;
 pub const CW_CURSOR: c_ulong = 1 << 14;
 // —— 事件掩码 ——
+pub const KEY_PRESS_MASK: c_long = 1 << 0;
 pub const BUTTON_PRESS_MASK: c_long = 1 << 2;
 pub const BUTTON_RELEASE_MASK: c_long = 1 << 3;
 pub const POINTER_MOTION_MASK: c_long = 1 << 6;
@@ -273,6 +294,8 @@ pub const EXPOSURE_MASK: c_long = 1 << 15;
 pub const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
 pub const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
 // —— 事件类型 ——
+pub const KEY_PRESS: c_int = 2;
+pub const KEY_RELEASE: c_int = 3;
 pub const BUTTON_PRESS: c_int = 4;
 pub const BUTTON_RELEASE: c_int = 5;
 pub const MOTION_NOTIFY: c_int = 6;
@@ -292,6 +315,14 @@ pub const BTN_WHEEL_DOWN: c_uint = 5;
 // —— 指针 grab ——
 pub const GRAB_MODE_ASYNC: c_int = 1;
 pub const CURRENT_TIME: Time = 0;
+// —— 键符号（keysymdef.h 里输入行用得到的几个特殊键；普通字符走 XLookupString）——
+pub const XK_BACKSPACE: c_ulong = 0xff08;
+pub const XK_TAB: c_ulong = 0xff09;
+pub const XK_RETURN: c_ulong = 0xff0d;
+pub const XK_ESCAPE: c_ulong = 0xff1b;
+pub const XK_KP_ENTER: c_ulong = 0xff8d;
+/// `KeySym` 就是 `unsigned long`。
+pub type KeySym = c_ulong;
 // —— XCreateImage ——
 pub const Z_PIXMAP: c_int = 2;
 // —— Shape extension ——
@@ -364,6 +395,13 @@ bindings! { X11, "libX11.so.6";
         *mut Display, Window, c_int, c_uint, c_int, c_int, Window, Cursor, Time
     ) -> c_int;
     fn XUngrabPointer(*mut Display, Time) -> c_int;
+    // 键盘：输入行用。抓键盘是 override-redirect 窗口拿到按键的唯一稳路
+    //（没有 WM 替它管焦点），XLookupString 负责键码 → 字符/键符号。
+    fn XGrabKeyboard(*mut Display, Window, c_int, c_int, c_int, Time) -> c_int;
+    fn XUngrabKeyboard(*mut Display, Time) -> c_int;
+    fn XLookupString(
+        *mut KeyEvent, *mut c_char, c_int, *mut KeySym, *mut c_void
+    ) -> c_int;
     fn XQueryExtension(
         *mut Display, *const c_char, *mut c_int, *mut c_int, *mut c_int
     ) -> c_int;

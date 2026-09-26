@@ -14,6 +14,7 @@ use crate::config::{
     COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path, toggle_autostart,
 };
 use crate::effect::{self, Effect, Gradient};
+use crate::parse;
 use crate::render::{self, Canvas, premultiply};
 use crate::text;
 use crate::textsrc;
@@ -49,6 +50,37 @@ pub const IDLE_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// 动画相位进帧指纹时的量化步长，与 [`ANIM_INTERVAL`] 对齐。
 const ANIM_STEP_MS: u32 = 50;
+
+/// 输入行文本上限。默认窗口 200 逻辑像素、状态行一格 8px：`> ` 提示符 +
+/// 20 字符 + 校验标记 + 光标正好放得下；时长串（"1h 30m 10s"）远用不到这么多。
+const INPUT_MAX: usize = 20;
+
+/// 输入行的键。两个后端各自把协议事件翻成这一种（Wayland 走 dlopen 的
+/// libxkbcommon，X11 走 `XLookupString`），挂件只认它——输入行为因此逐键一致。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    /// 键面字符（已按当前键盘布局换算）。
+    Char(char),
+    Backspace,
+    Enter,
+    Escape,
+}
+
+/// 正在编辑的时长输入行。
+struct InputLine {
+    text: String,
+    /// 心跳计数：50ms 一拍，`blink % 20 < 10` 是实心段（500ms 一闪）。
+    blink: u32,
+    /// 按住的键（Wayland 合成器不自动重复，由我们按 repeat_info 补发）。
+    repeat: Option<Repeat>,
+}
+
+struct Repeat {
+    key: Key,
+    /// 下一次补发这颗键的时刻：第一次在 delay 之后，之后按 period 推。
+    next: Instant,
+    period: Duration,
+}
 
 /// 一帧的完整内容与布局（buffer 物理像素坐标）。
 ///
@@ -166,6 +198,18 @@ pub struct Widget {
     last_pomo: Option<usize>,
     /// 上一次回填给托盘的倒计时进度（`tray_throttle = timer` 的驱动量；只在变化时推）。
     last_progress: u8,
+    /// 输入行（托盘「⌨ 输入时长」/ `tinyticker --input`）。**不进配置**：
+    /// 一个临时输入框没有理由常驻，冷启动总该是收起的状态（与 `hidden` 同理）。
+    input: Option<InputLine>,
+    /// 键盘可用性：后端在启动时探明（Wayland = 座位键盘能力 + libxkbcommon，
+    /// X11 = 恒可用，`XLookupString` 来自必装的 libX11）。不可用时输入行打不开。
+    kb_ok: bool,
+    /// 向后端请求的键盘状态：`Some(true)` = 要键盘，`Some(false)` = 还回去。
+    /// 与 `reposition` 同一手法的取走式请求，后端每拍取走一次。
+    kb_request: Option<bool>,
+    /// Wayland 的按键重复参数（delay, period），来自 `wl_keyboard.repeat_info`；
+    /// X11 走服务端自动重复（多余的 KeyPress 就是重复），恒为 `None`。
+    kb_repeat: Option<(Duration, Duration)>,
 }
 
 impl Widget {
@@ -193,6 +237,10 @@ impl Widget {
             last_frame: None,
             last_pomo: None,
             last_progress: 0,
+            input: None,
+            kb_ok: true,
+            kb_request: None,
+            kb_repeat: None,
         }
     }
 
@@ -239,11 +287,177 @@ impl Widget {
         r
     }
 
+    // —— 键盘输入行（R1 通路）——
+
+    /// 后端在启动时探明键盘可用性后落一次（Wayland：座位键盘能力 + libxkbcommon；
+    /// X11：恒可用）。只有"不可用"才需要回填托盘，默认乐观。
+    pub fn set_kb_available(&mut self, ok: bool) {
+        self.kb_ok = ok;
+    }
+
+    /// 打开输入行（托盘「⌨ 输入时长」/ `tinyticker --input`）。
+    ///
+    /// 键盘要向后端要（Wayland 临时把 layer 的 keyboard-interactivity 提到
+    /// exclusive，X11 抓键盘+指针），关掉立刻还回去——常驻抢键盘对常驻挂件
+    /// 是灾难，这一档只活在输入行开着的那几秒里。
+    pub fn open_input(&mut self) {
+        if self.input.is_some() {
+            return; // 已经开着：再点一次不翻面，也不是"清空重来"
+        }
+        if self.hidden {
+            eprintln!("⚠️ 挂件藏着，先 `tinyticker --show` 或托盘取消隐藏再输时长");
+            return;
+        }
+        if !self.kb_ok {
+            eprintln!("⚠️ 当前会话拿不到键盘输入（Wayland 需要 wl_seat 键盘能力与 libxkbcommon）");
+            return;
+        }
+        self.input = Some(InputLine {
+            text: String::new(),
+            blink: 0,
+            repeat: None,
+        });
+        self.kb_request = Some(true);
+    }
+
+    /// 输入行现在开没开（后端把按键事件按它决定要不要送进来）。
+    pub fn input_open(&self) -> bool {
+        self.input.is_some()
+    }
+
+    fn close_input(&mut self) {
+        if self.input.take().is_some() {
+            // 键盘还回去；后端每拍取走这个请求
+            self.kb_request = Some(false);
+        }
+    }
+
+    /// 键盘焦点没了（Wayland `wl_keyboard.leave` / X11 抓取期间点到别处）：
+    /// 整行取消，内容不保留——半截输入没有"稍后继续"的价值。
+    pub fn on_kb_lost(&mut self) {
+        self.close_input();
+    }
+
+    /// 后端送来一个按下的键。`Instant::now()` 只用来给重复计时器定起点。
+    pub fn on_key_press(&mut self, key: Key) {
+        self.key_down(key, Instant::now());
+    }
+
+    fn key_down(&mut self, key: Key, now: Instant) {
+        let Some(input) = self.input.as_mut() else { return };
+        input.blink = 0; // 一按键光标就实心，敲完才继续闪
+        // 重复引擎只服务可重复的键；X11 的服务端自动重复不需要它
+        if let Some((delay, period)) =
+            self.kb_repeat.filter(|_| matches!(key, Key::Char(_) | Key::Backspace))
+        {
+            input.repeat = Some(Repeat {
+                key,
+                next: now + delay,
+                period,
+            });
+        }
+        self.apply_key(key);
+    }
+
+    /// 后端送来一个松开的键（Wayland 才有；用于掐掉重复）。
+    pub fn on_key_release(&mut self, key: Key) {
+        if let Some(input) = self.input.as_mut()
+            && input.repeat.as_ref().is_some_and(|r| r.key == key)
+        {
+            input.repeat = None;
+        }
+    }
+
+    /// Wayland 的 `repeat_info`（rate 次/秒，delay 毫秒）。合成器不替我们重复，
+    /// 这两个数就是补发的节拍。X11 后端不会调它。
+    pub fn set_kb_repeat(&mut self, rate: i32, delay_ms: i32) {
+        self.kb_repeat = if rate > 0 && delay_ms > 0 {
+            let period = Duration::from_millis(1000 / rate.max(1) as u64).max(Duration::from_millis(20));
+            Some((Duration::from_millis(delay_ms as u64), period))
+        } else {
+            None
+        };
+    }
+
+    /// 后端取走键盘开/关请求（与 `take_reposition` 同手法，一次性的）。
+    pub fn take_kb_want(&mut self) -> Option<bool> {
+        self.kb_request.take()
+    }
+
+    fn apply_key(&mut self, key: Key) {
+        match key {
+            Key::Char(c) => {
+                let Some(input) = self.input.as_mut() else { return };
+                // 语法就是 ASCII：数字 + h/m/s/t + 空格 + ':'。控制字符与多字节一律不收，
+                // 非法输入靠回车时的报错说话，不在键入时就拦
+                if input.text.len() < INPUT_MAX && (c.is_ascii_graphic() || c == ' ') {
+                    input.text.push(c);
+                }
+            }
+            Key::Backspace => {
+                if let Some(input) = self.input.as_mut() {
+                    input.text.pop();
+                }
+            }
+            Key::Enter => self.submit_input(),
+            Key::Escape => self.close_input(),
+        }
+    }
+
+    /// 回车：读得懂就按预设的语义开始（切回倒计时、重置、立即跑），读不懂
+    /// 保持输入行开着——活动校验的 `?` 还挂在行尾，用户改完再按就是了。
+    fn submit_input(&mut self) {
+        let Some(text) = self.input.as_ref().map(|i| i.text.trim().to_string()) else {
+            return;
+        };
+        if text.is_empty() {
+            return; // 空串不算错误：只是没有内容，行留着
+        }
+        let secs = parse::parse_duration(&text).or_else(|| {
+            parse::parse_absolute(&text).map(|t| parse::secs_until(t, clock::now_hms()))
+        });
+        match secs {
+            Some(secs) => {
+                self.close_input();
+                self.timer.start_countdown(secs);
+                eprintln!("⌨ 已按输入开始 {secs}s 的倒计时");
+            }
+            None => eprintln!("⌨ 读不懂 {text:?}，写 25m / 1h 30m 10s / 14:30 / 14 30t"),
+        }
+    }
+
+    /// 输入行的每拍推进：光标闪烁 + 按键重复（Wayland 合成器不替我们重复）。
+    /// `now` 是注入的：单测不用等真实时钟。
+    fn tick_input_at(&mut self, now: Instant) {
+        let Some(input) = self.input.as_mut() else { return };
+        input.blink = input.blink.wrapping_add(1);
+        let Some(rep) = input.repeat.take() else { return };
+        if now < rep.next {
+            input.repeat = Some(rep);
+            return;
+        }
+        let key = rep.key;
+        self.apply_key(key);
+        // 补回重复（可重复的只有字符与退格，apply_key 不会把输入行关掉）
+        if let Some(input) = self.input.as_mut() {
+            input.repeat = Some(Repeat {
+                key,
+                next: now + rep.period,
+                period: rep.period,
+            });
+        }
+    }
+
     /// 心跳阶梯：空闲 1s → 走针时钟 250ms → 静态内容 200ms → 动画 50ms → 百分秒 20ms。
     ///
     /// 只有真在动的东西才提频：停住的读数百分位是冻的，白醒只会烧 CPU；空闲档
     /// 的即时响应靠 `wake` 管道，不靠多醒几次。
     pub fn tick_interval(&self) -> Duration {
+        // 输入行开着：光标闪烁与按键重复都要 50ms 档伺候。它是几秒级的临时态，
+        // 收起即回原档；脏检查保证没敲键的拍子不会真的重画
+        if self.input.is_some() {
+            return ANIM_INTERVAL;
+        }
         if self.hidden {
             // 藏着的时候没人看：计时照跑就留 200ms 档，连计时都没跑就降到最慢档
             return if self.timer.running || self.animating() {
@@ -267,6 +481,11 @@ impl Widget {
 
     /// 接收托盘线程发来的句柄（用于发通知）。
     pub fn accept_tray_handle(&mut self, handle: TrayHandle) {
+        // 键盘可用性是后端在启动时探明的（Wayland 座位能力 + libxkbcommon），
+        // 托盘默认按可用建菜单；只有拿不到键盘才需要把那一项置灰
+        if !self.kb_ok {
+            tray::sync_kb(&handle, false);
+        }
         self.tray = Some(handle);
     }
 
@@ -385,6 +604,8 @@ impl Widget {
             Command::SetHidden(v) => self.set_hidden(v),
             Command::ToggleEdit => self.set_edit(!self.edit),
             Command::SetEdit(v) => self.set_edit(v),
+            // 输入行与编辑态同族：界面动作不进配置，托盘与 `--input` 都落到这里
+            Command::InputTime => self.open_input(),
             Command::ToggleNotify => {
                 self.config.notify = !self.config.notify;
                 self.persist_appearance();
@@ -518,6 +739,8 @@ impl Widget {
 
     /// 推进计时，并处理本次产生的结束事件（通知 + on_finish 命令）。
     pub fn tick(&mut self) {
+        // 输入行先行：光标闪烁与按键重复都按心跳走（此刻心跳在 50ms 档）
+        self.tick_input_at(Instant::now());
         self.text_src.refresh();
         self.reload_config();
         self.timer.maybe_tick();
@@ -669,9 +892,22 @@ impl Widget {
         };
         // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态。
         // 截断按**实测像素宽**算，不是按字数——中文一格点阵宽写不下时也必须整字退让。
-        // 编辑态优先占住这一行：那是模式提示（"此刻按右键是退出编辑态"），
-        // 比外部文本的内容更要紧——用户得先看得见自己在哪一档。
-        let status = if self.edit {
+        // 输入行优先占住这一行：`> ` 提示符 + 文本，读不懂缀一个 `?`，光标用 `_`
+        // 闪烁（点阵自带这个字形，不必动 freetype）。输入语法本来就是 ASCII，
+        // 所以整行都落在点阵里——状态行的 TTF 通路一次都不会被碰到。
+        // 编辑态其次占住：那是模式提示，比外部文本的内容更要紧。
+        let status = if let Some(input) = &self.input {
+            let valid = input.text.is_empty()
+                || parse::parse_duration(input.text.trim()).is_some()
+                || parse::parse_absolute(input.text.trim()).is_some();
+            let raw = format!(
+                "> {}{}{}",
+                input.text,
+                if valid { "" } else { "?" },
+                if input.blink % 20 < 10 { "_" } else { "" },
+            );
+            text::fit(&raw, scale, width)
+        } else if self.edit {
             "EDIT".to_string()
         } else {
             match self.text_src.text() {
@@ -768,6 +1004,10 @@ impl Widget {
             return;
         }
         self.hidden = hidden;
+        if hidden {
+            // 藏起来的挂件没法输入：输入行跟着收，键盘一并还回去
+            self.close_input();
+        }
         // 重新显示时必须重画：脏检查只看内容指纹，而内容在隐藏期间可能压根没变过，
         // 不 invalidate 的话表面会一直停在"没有缓冲"的空白状态
         self.invalidate();
@@ -807,9 +1047,14 @@ impl Widget {
         self.set_edit(!self.edit);
     }
 
-    /// 挂件上按右键：编辑态下先退出编辑态，否则按原来的语义退出程序。
+    /// 挂件上按右键：输入行开着先收行（键盘还抓在手里，此时"退出程序"是事故），
+    /// 编辑态下再退编辑态，否则按原来的语义退出程序。
     /// 返回 `true` 表示后端应当收尾退出。
     pub fn right_click(&mut self) -> bool {
+        if self.input.is_some() {
+            self.close_input();
+            return false;
+        }
         if self.edit {
             self.set_edit(false);
             return false;
@@ -1351,5 +1596,182 @@ mod tests {
         );
         w.invalidate();
         assert!(w.build_frame(200, 100, 2).is_some());
+    }
+
+    // —— 输入行（R1 键盘通路）——
+
+    /// 输入行当前文本（测试读法）。
+    fn input_text(w: &Widget) -> Option<String> {
+        w.input.as_ref().map(|i| i.text.clone())
+    }
+
+    /// 开行：状态行换提示符，"要键盘"的请求恰好发一次。
+    #[test]
+    fn input_line_opens_takes_the_keyboard_and_renders_the_prompt() {
+        let mut w = Widget::new(Config::default(), false);
+        assert!(!w.handle_cmd(Command::InputTime), "开输入行不是退出命令");
+        assert!(w.input_open());
+        assert_eq!(w.take_kb_want(), Some(true), "后端该拿到要键盘的请求");
+        assert_eq!(w.take_kb_want(), None, "请求是一次性的");
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert!(
+            last_status(&w).starts_with("> "),
+            "状态行该是提示符，实际 {:?}",
+            last_status(&w)
+        );
+        // 输入行开着时心跳提到动画档：光标闪烁与按键重复都靠这一拍
+        assert_eq!(w.tick_interval(), ANIM_INTERVAL);
+        // 再开一次不翻面，也不重复要键盘
+        w.handle_cmd(Command::InputTime);
+        assert!(w.input_open());
+        assert_eq!(w.take_kb_want(), None);
+    }
+
+    /// 键入 + 回车：按预设的语义开始（切回倒计时、重置、立即跑），行收起、键盘还回去。
+    #[test]
+    fn typing_and_enter_starts_the_countdown() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        for c in "25m".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "> 25m_");
+        w.on_key_press(Key::Enter);
+        assert!(!w.input_open(), "提交后输入行要收起来");
+        assert_eq!(w.take_kb_want(), Some(false), "键盘要还回去");
+        assert_eq!(w.take_kb_want(), None);
+        assert_eq!(w.timer.mode, Mode::Countdown);
+        assert_eq!((w.timer.total, w.timer.running), (1500, true));
+    }
+
+    /// 退格改字，Esc 取消——取消不碰计时器。
+    #[test]
+    fn backspace_edits_and_escape_cancels_without_starting() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        for c in "25mx".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        w.on_key_press(Key::Backspace);
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "> 25m_");
+        w.on_key_press(Key::Escape);
+        assert!(!w.input_open());
+        assert_eq!(w.take_kb_want(), Some(false));
+        assert_eq!(
+            (w.timer.total, w.timer.running),
+            (60, false),
+            "Esc 不该碰计时器"
+        );
+    }
+
+    /// 读不懂的输入：状态行缀 `?`，回车不动作也不关行——改完再按就是了。
+    #[test]
+    fn invalid_input_is_marked_and_enter_keeps_the_line_open() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        assert_eq!(w.take_kb_want(), Some(true), "开行先要键盘");
+        for c in "2x5".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "> 2x5?_");
+        w.on_key_press(Key::Enter);
+        assert!(w.input_open(), "读不懂就别关，让用户改");
+        assert_eq!(w.take_kb_want(), None, "没关行就不该还键盘");
+        assert_eq!(w.timer.total, 60, "更不该按一个坏读数开始");
+        // 改好了照常走
+        for _ in 0..3 {
+            w.on_key_press(Key::Backspace);
+        }
+        for c in "90".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        w.on_key_press(Key::Enter);
+        assert_eq!(w.timer.total, 90);
+        assert!(!w.input_open());
+    }
+
+    /// 绝对时刻走同一条解析：`14:30` 落成"到明天/今天 14:30 的秒数"。
+    #[test]
+    fn absolute_time_input_starts_a_countdown_to_that_time() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        for c in "14:30".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        w.on_key_press(Key::Enter);
+        let want = parse::secs_until(parse::parse_absolute("14:30").unwrap(), clock::now_hms());
+        assert_eq!(w.timer.total, want);
+        assert!(w.timer.running);
+    }
+
+    /// 失焦与右键都是"不输了"：整行取消、键盘还回去、绝不顺带退出程序。
+    #[test]
+    fn focus_loss_and_right_click_cancel_the_line() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        w.on_key_press(Key::Char('9'));
+        w.on_kb_lost();
+        assert!(!w.input_open());
+        assert_eq!(w.take_kb_want(), Some(false));
+        assert!(!w.timer.running, "焦点丢了不等于要开始计时");
+        // 再开一次：右键收行而不是关挂件
+        w.handle_cmd(Command::InputTime);
+        assert!(!w.right_click(), "输入行开着时右键绝不能退出程序");
+        assert!(!w.input_open());
+        // 普通态的右键语义原样
+        assert!(w.right_click(), "没有输入行没有编辑态，右键仍是关挂件");
+    }
+
+    /// 重复引擎：按 repeat_info 的 delay/period 补发按住的键，松键立刻停；
+    /// Enter 不进重复引擎（它一按就把行收了）。
+    #[test]
+    fn repeat_engine_emits_held_keys_by_repeat_info() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        w.set_kb_repeat(25, 300); // 25 次/秒 → period 40ms，delay 300ms
+        let t0 = Instant::now();
+        w.key_down(Key::Char('2'), t0);
+        assert_eq!(input_text(&w).as_deref(), Some("2"), "按下本身先出一次");
+        w.tick_input_at(t0 + Duration::from_millis(299));
+        assert_eq!(input_text(&w).as_deref(), Some("2"), "delay 没到不补发");
+        w.tick_input_at(t0 + Duration::from_millis(310));
+        assert_eq!(input_text(&w).as_deref(), Some("22"));
+        w.tick_input_at(t0 + Duration::from_millis(360));
+        assert_eq!(input_text(&w).as_deref(), Some("222"), "之后按 period 补发");
+        w.on_key_release(Key::Char('2'));
+        w.tick_input_at(t0 + Duration::from_millis(500));
+        assert_eq!(input_text(&w).as_deref(), Some("222"), "松键立刻停");
+        // Enter 不重复：一按就提交收行
+        w.key_down(Key::Enter, t0);
+        w.tick_input_at(t0 + Duration::from_millis(800));
+        assert_eq!(input_text(&w), None, "回车提交并收起，不重复");
+        assert_eq!(w.timer.total, 222, "222 是读得懂的（222 秒）");
+    }
+
+    /// 键盘不可用（后端探明的）时开行被拒：不产生请求，也不留半截状态。
+    #[test]
+    fn keyboard_unavailable_refuses_to_open() {
+        let mut w = Widget::new(Config::default(), false);
+        w.set_kb_available(false);
+        w.handle_cmd(Command::InputTime);
+        assert!(!w.input_open());
+        assert_eq!(w.take_kb_want(), None);
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "PAUSED", "状态行不该被输入行占住");
+    }
+
+    /// 藏挂件顺手收输入行；藏着的时候开行也打不开。
+    #[test]
+    fn hiding_the_widget_closes_the_input_line() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputTime);
+        w.handle_cmd(Command::SetHidden(true));
+        assert!(!w.input_open(), "藏起来的挂件没法输入");
+        assert_eq!(w.take_kb_want(), Some(false), "键盘也得还");
+        w.handle_cmd(Command::InputTime);
+        assert!(!w.input_open());
     }
 }
