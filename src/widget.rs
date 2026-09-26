@@ -11,14 +11,15 @@ use crate::tray::TrayHandle;
 use crate::audio;
 use crate::clock;
 use crate::config::{
-    COLOR_OPTIONS, Config, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path, toggle_autostart,
+    COLOR_OPTIONS, Config, MAX_PRESETS, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path,
+    parse_span_list, toggle_autostart,
 };
 use crate::effect::{self, Effect, Gradient};
 use crate::parse;
 use crate::render::{self, Canvas, premultiply};
 use crate::text;
 use crate::textsrc;
-use crate::timer::{Finished, Mode, Timer};
+use crate::timer::{Finished, MAX_POMO_STEPS, Mode, Timer};
 use crate::tray::{self, Command};
 
 /// 逻辑画布大小（参考值；实际像素缓冲跟随窗口物理尺寸 × 缩放系数）。
@@ -51,9 +52,58 @@ pub const IDLE_INTERVAL: Duration = Duration::from_millis(1000);
 /// 动画相位进帧指纹时的量化步长，与 [`ANIM_INTERVAL`] 对齐。
 const ANIM_STEP_MS: u32 = 50;
 
-/// 输入行文本上限。默认窗口 200 逻辑像素、状态行一格 8px：`> ` 提示符 +
-/// 20 字符 + 校验标记 + 光标正好放得下；时长串（"1h 30m 10s"）远用不到这么多。
-const INPUT_MAX: usize = 20;
+/// 输入行文本上限。默认窗口 200 逻辑像素、状态行一格 8px 放得下提示符 + 22 字符 +
+/// 校验标记 + 光标；分段/预设是逗号串（`25m,5m,15m`），32 容得下六七段，再长由
+/// `text::fit` 整字截断——小窗下的尾部盲区比把列表砍短好。
+const INPUT_MAX: usize = 32;
+
+/// 输入行的四种模式。提示符各不相同，提交语义见 [`Widget::submit_input`]；
+/// 入口在托盘：根菜单「⌨ 输入时长」+ 三个天然子菜单（分段/预设/颜色）里的编辑项。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputMode {
+    /// `> ` 时长：相对（`25m` / `1h 30m`）与绝对（`14:30` / `14 30t`）都收，
+    /// 回车按预设语义开始倒计时。
+    Duration,
+    /// `# ` 颜色：`Gradient` 全语法（`1a2b3c` / `#f00` / CSS 名 / `rgb()` / 具名渐变），
+    /// 落到运行色。屏幕取色在 Wayland 上要 portal，不做；文本输入这半边够用。
+    Color,
+    /// `% ` 番茄分段：`25m,5m,15m`（≤ [`MAX_POMO_STEPS`] 段，复用配置同一解析器），
+    /// 整条替换，非法整条不采信。
+    Pomo,
+    /// `= ` 时长预设：`90,1500,5400`（≤ [`MAX_PRESETS`] 档），整条替换托盘子菜单。
+    Presets,
+}
+
+impl InputMode {
+    /// 状态行的提示符。全部 ASCII：输入语法就是 ASCII，整行落在点阵里，
+    /// 状态行的 TTF 通路一次都不会被碰到。
+    fn prompt(self) -> &'static str {
+        match self {
+            InputMode::Duration => "> ",
+            InputMode::Color => "# ",
+            InputMode::Pomo => "% ",
+            InputMode::Presets => "= ",
+        }
+    }
+
+    /// 活动校验：读得懂返回 `true`。空串一律中性（还没打字，不缀 `?`）——
+    /// 四个模式共用"空回车 = 不动作"的规矩，所以这里只管非空串。
+    fn valid(self, text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() {
+            return true;
+        }
+        match self {
+            InputMode::Duration => {
+                parse::parse_duration(t).is_some() || parse::parse_absolute(t).is_some()
+            }
+            InputMode::Color => Gradient::parse(t).is_some(),
+            // 与配置文件同一把尺子：`parse_span_list`（每段 ≤24h、整条作废语义）
+            InputMode::Pomo => parse_span_list(t, MAX_POMO_STEPS).is_some(),
+            InputMode::Presets => parse_span_list(t, MAX_PRESETS).is_some(),
+        }
+    }
+}
 
 /// 输入行的键。两个后端各自把协议事件翻成这一种（Wayland 走 dlopen 的
 /// libxkbcommon，X11 走 `XLookupString`），挂件只认它——输入行为因此逐键一致。
@@ -66,8 +116,9 @@ pub enum Key {
     Escape,
 }
 
-/// 正在编辑的时长输入行。
+/// 正在编辑的输入行。`mode` 决定提示符与回车语义（见 [`InputMode`]）。
 struct InputLine {
+    mode: InputMode,
     text: String,
     /// 心跳计数：50ms 一拍，`blink % 20 < 10` 是实心段（500ms 一闪）。
     blink: u32,
@@ -300,12 +351,12 @@ impl Widget {
     /// 键盘要向后端要（Wayland 临时把 layer 的 keyboard-interactivity 提到
     /// exclusive，X11 抓键盘+指针），关掉立刻还回去——常驻抢键盘对常驻挂件
     /// 是灾难，这一档只活在输入行开着的那几秒里。
-    pub fn open_input(&mut self) {
+    pub fn open_input(&mut self, mode: InputMode) {
         if self.input.is_some() {
             return; // 已经开着：再点一次不翻面，也不是"清空重来"
         }
         if self.hidden {
-            eprintln!("⚠️ 挂件藏着，先 `tinyticker --show` 或托盘取消隐藏再输时长");
+            eprintln!("⚠️ 挂件藏着，先 `tinyticker --show` 或托盘取消隐藏再输入");
             return;
         }
         if !self.kb_ok {
@@ -313,6 +364,7 @@ impl Widget {
             return;
         }
         self.input = Some(InputLine {
+            mode,
             text: String::new(),
             blink: 0,
             repeat: None,
@@ -404,25 +456,76 @@ impl Widget {
         }
     }
 
-    /// 回车：读得懂就按预设的语义开始（切回倒计时、重置、立即跑），读不懂
-    /// 保持输入行开着——活动校验的 `?` 还挂在行尾，用户改完再按就是了。
+    /// 回车：按模式分派。读得懂就生效并收行，读不懂保持开着——活动校验的 `?`
+    /// 还挂在行尾，用户改完再按就是了。空串四个模式一律不动作。
     fn submit_input(&mut self) {
-        let Some(text) = self.input.as_ref().map(|i| i.text.trim().to_string()) else {
+        let Some((mode, text)) = self
+            .input
+            .as_ref()
+            .map(|i| (i.mode, i.text.trim().to_string()))
+        else {
             return;
         };
         if text.is_empty() {
             return; // 空串不算错误：只是没有内容，行留着
         }
-        let secs = parse::parse_duration(&text).or_else(|| {
-            parse::parse_absolute(&text).map(|t| parse::secs_until(t, clock::now_hms()))
-        });
-        match secs {
-            Some(secs) => {
-                self.close_input();
-                self.timer.start_countdown(secs);
-                eprintln!("⌨ 已按输入开始 {secs}s 的倒计时");
+        match mode {
+            InputMode::Duration => {
+                let secs = parse::parse_duration(&text).or_else(|| {
+                    parse::parse_absolute(&text).map(|t| parse::secs_until(t, clock::now_hms()))
+                });
+                match secs {
+                    Some(secs) => {
+                        self.close_input();
+                        self.timer.start_countdown(secs);
+                        eprintln!("⌨ 已按输入开始 {secs}s 的倒计时");
+                    }
+                    None => {
+                        eprintln!("⌨ 读不懂 {text:?}，写 25m / 1h 30m 10s / 14:30 / 14 30t")
+                    }
+                }
             }
-            None => eprintln!("⌨ 读不懂 {text:?}，写 25m / 1h 30m 10s / 14:30 / 14 30t"),
+            InputMode::Color => match Gradient::parse(&text) {
+                Some(g) => {
+                    self.close_input();
+                    self.config.color_running = g;
+                    self.persist_appearance();
+                    // 套接字/输入行这条不经过菜单：配色的勾要自己跟上
+                    self.sync_tray();
+                    eprintln!("⌨ 运行色已设为 {text}");
+                }
+                None => eprintln!(
+                    "⌨ 读不懂颜色 {text:?}，写 1a2b3c / #f00 / tomato / rgb(80,220,120) / candy"
+                ),
+            },
+            InputMode::Pomo => match parse_span_list(&text, MAX_POMO_STEPS) {
+                Some(seq) => {
+                    self.close_input();
+                    self.config.pomo.seq = seq;
+                    // 与 apply_config 同语义：节奏跟着走（番茄模式下 set_pomo 会重置）
+                    self.timer.set_pomo(&self.config.pomo);
+                    self.persist_appearance();
+                    // 段数本身是菜单结构：SyncConfig 重建「🍅 番茄分段」那串
+                    self.sync_tray();
+                    eprintln!("⌨ 番茄分段已更新为 {} 段", self.config.pomo.seq.len());
+                }
+                None => eprintln!(
+                    "⌨ 读不懂分段 {text:?}，写 25m,5m,15m（≤{MAX_POMO_STEPS} 段，逗号或空格分隔）"
+                ),
+            },
+            InputMode::Presets => match parse_span_list(&text, MAX_PRESETS) {
+                Some(list) => {
+                    self.close_input();
+                    self.config.presets = list;
+                    self.persist_appearance();
+                    // 档位列表同样是菜单结构：SyncConfig 重建「时长预设」
+                    self.sync_tray();
+                    eprintln!("⌨ 时长预设已更新为 {} 档", self.config.presets.len());
+                }
+                None => eprintln!(
+                    "⌨ 读不懂预设 {text:?}，写 90,1500,5400（≤{MAX_PRESETS} 档，逗号或空格分隔）"
+                ),
+            },
         }
     }
 
@@ -605,7 +708,11 @@ impl Widget {
             Command::ToggleEdit => self.set_edit(!self.edit),
             Command::SetEdit(v) => self.set_edit(v),
             // 输入行与编辑态同族：界面动作不进配置，托盘与 `--input` 都落到这里
-            Command::InputTime => self.open_input(),
+            Command::InputTime => self.open_input(InputMode::Duration),
+            // 颜色/分段/预设：同一条输入行换模式，入口在各自的天然子菜单里
+            Command::InputColor => self.open_input(InputMode::Color),
+            Command::InputPomo => self.open_input(InputMode::Pomo),
+            Command::InputPresets => self.open_input(InputMode::Presets),
             Command::ToggleNotify => {
                 self.config.notify = !self.config.notify;
                 self.persist_appearance();
@@ -678,18 +785,17 @@ impl Widget {
             return;
         }
         // 托盘图标不用重启了：`SyncConfig` 会把那一格回填到新值，图标每拍从
-        // state 取。真正还卡在启动时的只剩三样：预设档位与番茄分段（菜单结构）、
+        // state 取。预设档位与番茄分段也热了：SyncConfig 会拿新值重建菜单节点
+        // （s.presets / s.pomo_seq）。真正还卡在启动时的只剩两样：
         // GIF 路径（解码器建一次）、窗口位置（surface 归后端）。
-        let restart = next.presets != self.config.presets
-            || next.pomo.seq != self.config.pomo.seq
-            || next.tray_gif != self.config.tray_gif
+        let restart = next.tray_gif != self.config.tray_gif
             || next.window_pos != self.config.window_pos;
         self.apply_config(next);
         self.sync_tray();
         eprintln!(
             "↻ 配置已热加载{}",
             if restart {
-                "（时长预设 / 番茄分段 / GIF 动图 / 窗口位置要重启才生效）"
+                "（GIF 动图 / 窗口位置要重启才生效）"
             } else {
                 ""
             }
@@ -892,16 +998,16 @@ impl Widget {
         };
         // 外部文本源读到内容时顶替状态行；它为空/不可用则回到上面的正常状态。
         // 截断按**实测像素宽**算，不是按字数——中文一格点阵宽写不下时也必须整字退让。
-        // 输入行优先占住这一行：`> ` 提示符 + 文本，读不懂缀一个 `?`，光标用 `_`
-        // 闪烁（点阵自带这个字形，不必动 freetype）。输入语法本来就是 ASCII，
-        // 所以整行都落在点阵里——状态行的 TTF 通路一次都不会被碰到。
+        // 输入行优先占住这一行：提示符按模式（`> `时长 / `# `颜色 / `% `分段 /
+        // `= `预设），读不懂缀一个 `?`，光标用 `_` 闪烁（点阵自带这个字形，
+        // 不必动 freetype）。输入语法本来就是 ASCII，整行都落在点阵里——
+        // 状态行的 TTF 通路一次都不会被碰到。
         // 编辑态其次占住：那是模式提示，比外部文本的内容更要紧。
         let status = if let Some(input) = &self.input {
-            let valid = input.text.is_empty()
-                || parse::parse_duration(input.text.trim()).is_some()
-                || parse::parse_absolute(input.text.trim()).is_some();
+            let valid = input.mode.valid(&input.text);
             let raw = format!(
-                "> {}{}{}",
+                "{}{}{}{}",
+                input.mode.prompt(),
                 input.text,
                 if valid { "" } else { "?" },
                 if input.blink % 20 < 10 { "_" } else { "" },
@@ -1773,5 +1879,102 @@ mod tests {
         assert_eq!(w.take_kb_want(), Some(false), "键盘也得还");
         w.handle_cmd(Command::InputTime);
         assert!(!w.input_open());
+    }
+
+    // —— 输入行的另外三个模式（颜色 / 分段 / 预设）——
+
+    /// 颜色模式：CSS 名直落运行色并写盘收行；读不懂缀 `?`，回车不动作也不关行。
+    #[test]
+    fn color_mode_sets_the_running_color() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputColor);
+        assert_eq!(w.take_kb_want(), Some(true), "开行先要键盘");
+        // "coral" 在 Catime 那 30 条 CSS 名表里（tomato 之类不在，名表不扩）
+        for c in "coral".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "# coral_");
+        w.on_key_press(Key::Enter);
+        assert!(!w.input_open());
+        assert_eq!(
+            w.config.color_running,
+            Gradient::parse("coral").unwrap(),
+            "运行色该换成输入的那支"
+        );
+        // 读不懂：缀 ?、回车不动作也不关行
+        w.handle_cmd(Command::InputColor);
+        assert_eq!(w.take_kb_want(), Some(true));
+        for c in "zzz".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "# zzz?_");
+        w.on_key_press(Key::Enter);
+        assert!(w.input_open());
+        assert_eq!(w.take_kb_want(), None, "没关行就不该还键盘");
+    }
+
+    /// 分段模式：`25m,5m,15m` 整条替换 `pomo_seq`，节奏跟着走；非法整条不采信。
+    #[test]
+    fn pomo_mode_rewrites_the_sequence() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputPomo);
+        assert_eq!(w.take_kb_want(), Some(true));
+        for c in "25m,5m,15m".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "% 25m,5m,15m_");
+        w.on_key_press(Key::Enter);
+        assert!(!w.input_open());
+        assert_eq!(w.config.pomo.seq, vec![1500, 300, 900]);
+        // 节奏跟着走：换到番茄钟后第一段就是序列的头一段
+        w.handle_cmd(Command::SetMode(Mode::Pomodoro));
+        assert_eq!(w.timer.display_secs(), 1500);
+        // 非法：整条不采信，行留着、序列不动
+        w.handle_cmd(Command::InputPomo);
+        for c in "25m,xx".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "% 25m,xx?_");
+        w.on_key_press(Key::Enter);
+        assert!(w.input_open());
+        assert_eq!(w.config.pomo.seq, vec![1500, 300, 900], "非法输入不该动序列");
+    }
+
+    /// 预设模式：整条替换档位列表（托盘那串由 SyncConfig 重建）。
+    #[test]
+    fn presets_mode_replaces_the_list() {
+        let mut w = Widget::new(Config::default(), false);
+        w.handle_cmd(Command::InputPresets);
+        assert_eq!(w.take_kb_want(), Some(true));
+        for c in "90,1500,5400".chars() {
+            w.on_key_press(Key::Char(c));
+        }
+        assert!(w.build_frame(200, 100, 1).is_some());
+        assert_eq!(last_status(&w), "= 90,1500,5400_");
+        w.on_key_press(Key::Enter);
+        assert!(!w.input_open());
+        assert_eq!(w.config.presets, vec![90, 1500, 5400]);
+    }
+
+    /// 空回车四个模式一律不动作：行留着、键盘不还、配置不碰。
+    #[test]
+    fn empty_enter_is_a_no_op_in_every_mode() {
+        for cmd in [
+            Command::InputTime,
+            Command::InputColor,
+            Command::InputPomo,
+            Command::InputPresets,
+        ] {
+            let mut w = Widget::new(Config::default(), false);
+            w.handle_cmd(cmd.clone());
+            assert_eq!(w.take_kb_want(), Some(true));
+            w.on_key_press(Key::Enter);
+            assert!(w.input_open(), "{cmd:?}：空回车该把行留着");
+            assert_eq!(w.take_kb_want(), None, "没关行就不该还键盘");
+        }
     }
 }

@@ -34,7 +34,7 @@ pub const DEFAULT_PRESETS: [u32; 6] = [60, 300, 900, 1500, 2700, 3600];
 /// 预设条数上限，对齐 Catime 的 `MAX_TIME_OPTIONS`（`include/timer/timer.h:22-24`）。
 /// 超过 20 条时托盘菜单会把余下的折进「更多 ▸」子菜单（`tray/menu.rs` 的分页），
 /// 不再是"菜单再长就该分页了而我们不分页"的那个理由。
-const MAX_PRESETS: usize = 50;
+pub(crate) const MAX_PRESETS: usize = 50;
 
 /// 预设子菜单里平铺多少项，剩下的进「更多 ▸」。20 是拍的：一屏菜单里
 /// 常用档位要直接看得见，不必多点一层。
@@ -52,7 +52,8 @@ const MAX_ROUNDS: u32 = 100;
 /// 逗号或空格分隔均可。任一段非法（解析不出、为 0、超过 24 小时）或总段数超限，
 /// 整条作废并回落到默认值——静默丢掉一项会让菜单悄悄少一格，更难查。
 /// 因为空格就是分隔符，带空格的写法（`"1h 30m"`）不能用作单段，写 `"1h30m"`。
-fn parse_span_list(value: &str, max: usize) -> Option<Vec<u32>> {
+/// `pub(crate)`：输入行的分段/预设两个模式直接复用它，校验与落盘同一把尺子。
+pub(crate) fn parse_span_list(value: &str, max: usize) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for token in value.split([',', ' ', '\t']) {
         let token = token.trim();

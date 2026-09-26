@@ -196,7 +196,11 @@ impl State {
         match cmd {
             Command::SetIcon(IconMode::Gif) => self.gif,
             Command::PreviewSound => self.sound,
-            Command::InputTime => self.kb_ok,
+            // 四条输入命令共用同一个前提：会话拿得到键盘
+            Command::InputTime
+            | Command::InputColor
+            | Command::InputPomo
+            | Command::InputPresets => self.kb_ok,
             _ => true,
         }
     }
@@ -393,14 +397,52 @@ pub(super) fn build_nodes(
         &mut root,
         submenu(tr_in(lang, "时长预设", "Presets")),
     );
-    // 番茄钟分段：只在配了 `pomo_seq` 时出现——经典配方没有"段"可列
-    let pomo_menu = (!pomo_seq.is_empty()).then(|| {
-        push_top(
-            &mut n,
-            &mut root,
-            submenu(tr_in(lang, "🍅 番茄分段", "🍅 Pomodoro steps")),
-        )
-    });
+    // 输入行的编辑项标签：键盘不可用就置灰并写原因（与根菜单「⌨ 输入时长」同一规矩）
+    let edit_label = |zh: &'static str,
+                      zh_off: &'static str,
+                      en: &'static str,
+                      en_off: &'static str| {
+        if kb_ok {
+            tr_in(lang, zh, en)
+        } else {
+            tr_in(lang, zh_off, en_off)
+        }
+    };
+    // 就地编辑：输入行换预设模式（`90,1500,5400` 整条替换），排在档位列表之前
+    {
+        let id = n.len() as i32;
+        n.push(button(
+            edit_label(
+                "✏ 编辑预设…",
+                "✏ 编辑预设（无键盘）",
+                "✏ Edit presets…",
+                "✏ Edit presets (no keyboard)",
+            ),
+            Command::InputPresets,
+        ));
+        n[presets_menu as usize].children.push(id);
+    }
+    // 番茄钟分段：序列为空时也建——「编辑分段」正是从经典配方到任意序列的那扇门，
+    // 藏进"配了才出现"的话，序列永远只能从配置文件里长出来
+    let pomo_menu = push_top(
+        &mut n,
+        &mut root,
+        submenu(tr_in(lang, "🍅 番茄分段", "🍅 Pomodoro steps")),
+    );
+    // 就地编辑：输入行换分段模式（`25m,5m,15m` 整条替换），排在段列表之前
+    {
+        let id = n.len() as i32;
+        n.push(button(
+            edit_label(
+                "✏ 编辑分段…",
+                "✏ 编辑分段（无键盘）",
+                "✏ Edit segments…",
+                "✏ Edit segments (no keyboard)",
+            ),
+            Command::InputPomo,
+        ));
+        n[pomo_menu as usize].children.push(id);
+    }
     let modes = push_top(&mut n, &mut root, submenu(tr_in(lang, "模式", "Mode")));
     let look = push_top(
         &mut n,
@@ -448,20 +490,19 @@ pub(super) fn build_nodes(
         n.push(button(&format!("⏱ {label}"), Command::Preset(*secs)));
         n[preset_slot].children.push(id);
     }
-    if let Some(menu) = pomo_menu {
-        // 每段一项、当前段打勾（GAP §四："托盘那半边没做"的那半句）。点了跳去那段：
-        // 与时长预设同一个手感——立刻把读数换成本段时长，运行与否不变。
-        for (i, secs) in pomo_seq.iter().enumerate() {
-            let id = n.len() as i32;
-            let label = preset_label_in(*secs, lang);
-            let name = if lang.resolve() == Language::En {
-                format!("Step {} · {}", i + 1, label)
-            } else {
-                format!("第 {} 段 · {}", i + 1, label)
-            };
-            n.push(button(&name, Command::SetPomoStep(i)));
-            n[menu as usize].children.push(id);
-        }
+    // 每段一项、当前段打勾（GAP §四："托盘那半边没做"的那半句）。点了跳去那段：
+    // 与时长预设同一个手感——立刻把读数换成本段时长，运行与否不变。
+    // 序列为空时上面只有编辑项，段列表自然为空。
+    for (i, secs) in pomo_seq.iter().enumerate() {
+        let id = n.len() as i32;
+        let label = preset_label_in(*secs, lang);
+        let name = if lang.resolve() == Language::En {
+            format!("Step {} · {}", i + 1, label)
+        } else {
+            format!("第 {} 段 · {}", i + 1, label)
+        };
+        n.push(button(&name, Command::SetPomoStep(i)));
+        n[pomo_menu as usize].children.push(id);
     }
     for (label_zh, label_en, mode) in [
         ("倒计时", "Countdown", Mode::Countdown),
@@ -509,6 +550,20 @@ pub(super) fn build_nodes(
             Command::SetPalette(i),
         ));
         n[palette as usize].children.push(id);
+    }
+    // 就地编辑：输入行换颜色模式（Gradient 全语法落到运行色），排在色值列表之前
+    {
+        let id = n.len() as i32;
+        n.push(button(
+            edit_label(
+                "✏ 输入颜色…",
+                "✏ 输入颜色（无键盘）",
+                "✏ Type a color…",
+                "✏ Type a color (no keyboard)",
+            ),
+            Command::InputColor,
+        ));
+        n[colors as usize].children.push(id);
     }
     // 颜色预设的标签就是值串本身（两种语言一样），具名五条额外带上名字
     for (i, v) in COLOR_OPTIONS.iter().enumerate() {
@@ -675,15 +730,22 @@ mod tests {
         assert_eq!(n[icon_id as usize].label, "图标内容");
         assert_eq!(n[fmt_id as usize].label, "时间格式");
 
-        // 那 30 条取自 Catime 的数字色要一条条排进菜单，标签就是值串本身
+        // 头一项是输入行的编辑入口，后面 30 条取自 Catime 的数字色要一条条排进
+        // 菜单，标签就是值串本身
         let colors = acts(colors_id);
+        assert_eq!(colors.first(), Some(&Some(Command::InputColor)));
+        let colors = &colors[1..];
         assert_eq!(colors.len(), COLOR_OPTIONS.len());
-        for (k, id) in n[colors_id as usize].children.iter().enumerate() {
-            assert_eq!(n[*id as usize].command, Some(Command::SetRunningColor(k)));
+        for (k, id) in n[colors_id as usize].children.iter().enumerate().skip(1) {
+            assert_eq!(
+                n[*id as usize].command,
+                Some(Command::SetRunningColor(k - 1))
+            );
             assert_eq!(
                 n[*id as usize].label,
-                color_label(COLOR_OPTIONS[k]),
-                "第 {k} 条标签不对"
+                color_label(COLOR_OPTIONS[k - 1]),
+                "第 {} 条标签不对",
+                k - 1
             );
         }
         // 每条都得能被 Gradient 解析，否则点了就是静默无效
@@ -796,6 +858,11 @@ mod tests {
         assert_eq!(
             items,
             vec![
+                // 头一项是输入行的编辑入口，档位列表跟在后面
+                (
+                    "✏ 编辑预设…".to_string(),
+                    Some(Command::InputPresets)
+                ),
                 ("⏱ 1 分 30 秒".to_string(), Some(Command::Preset(90))),
                 ("⏱ 25 分".to_string(), Some(Command::Preset(1500))),
                 ("⏱ 1 小时 30 分".to_string(), Some(Command::Preset(5400))),
@@ -815,10 +882,10 @@ mod tests {
             .expect("没有「时长预设」子菜单");
         assert_eq!(
             n[submenu_idx].children.len(),
-            PRESET_PAGE + 1,
-            "平铺 20 项 + 一个「更多 ▸」"
+            PRESET_PAGE + 2,
+            "编辑入口 + 平铺 20 项 + 一个「更多 ▸」"
         );
-        let more_idx = n[submenu_idx].children[PRESET_PAGE] as usize;
+        let more_idx = n[submenu_idx].children[PRESET_PAGE + 1] as usize;
         assert_eq!(n[more_idx].label, "更多 ▸");
         assert_eq!(n[more_idx].kind, Kind::Submenu);
         assert_eq!(n[more_idx].children.len(), many.len() - PRESET_PAGE);
@@ -835,7 +902,7 @@ mod tests {
         // 没超限就一个子菜单都不该造出来
         let few = nodes(&many[..PRESET_PAGE], true);
         let sub = few.iter().find(|x| x.label == "时长预设").unwrap();
-        assert_eq!(sub.children.len(), PRESET_PAGE);
+        assert_eq!(sub.children.len(), PRESET_PAGE + 1, "编辑入口 + 一页档位");
         assert!(!few.iter().any(|x| x.label == "更多 ▸"));
     }
 
@@ -862,23 +929,43 @@ mod tests {
         assert_eq!(cmds(&n), cmds(&zh));
     }
 
-    /// 番茄分段：配了 `pomo_seq` 才有子菜单，每段一项且按 `SetPomoStep` 绑段号；
-    /// 打勾跟着主循环回填的段号走，不跟点击走。
+    /// 番茄分段：子菜单恒建（编辑项是"从经典配方到任意序列"的入口），配了序列
+    /// 再追加每段一项、按 `SetPomoStep` 绑段号；打勾跟着主循环回填的段号走。
     #[test]
     fn pomodoro_steps_submenu_follows_the_sequence() {
         let n = build_nodes(&[60], true, false, true, &[1500, 300, 900], Language::Zh);
         let menu = n
             .iter()
             .find(|x| x.label == "🍅 番茄分段")
-            .expect("配了序列就该有子菜单");
-        assert_eq!(menu.children.len(), 3);
-        for (i, id) in menu.children.iter().enumerate() {
-            assert_eq!(n[*id as usize].command, Some(Command::SetPomoStep(i)));
-            assert!(n[*id as usize].label.contains(&format!("第 {} 段", i + 1)));
+            .expect("子菜单现在恒建");
+        // 头一项是输入行的编辑入口，段列表跟在后面
+        assert_eq!(
+            n[menu.children[0] as usize].command,
+            Some(Command::InputPomo)
+        );
+        assert_eq!(menu.children.len(), 4);
+        for (i, id) in menu.children.iter().enumerate().skip(1) {
+            assert_eq!(
+                n[*id as usize].command,
+                Some(Command::SetPomoStep(i - 1))
+            );
+            assert!(
+                n[*id as usize]
+                    .label
+                    .contains(&format!("第 {} 段", i))
+            );
         }
-        // 没配序列就整个子菜单不存在（空子菜单会被 well_formed 测试拒绝）
+        // 没配序列子菜单也在——只剩编辑项，那正是设序列的门
         let none = nodes(&[60], true);
-        assert!(!none.iter().any(|x| x.label == "🍅 番茄分段"));
+        let empty = none
+            .iter()
+            .find(|x| x.label == "🍅 番茄分段")
+            .expect("空序列也该有子菜单");
+        assert_eq!(empty.children.len(), 1);
+        assert_eq!(
+            n[empty.children[0] as usize].command,
+            Some(Command::InputPomo)
+        );
 
         // 勾选态：只有回填过的那一段亮着
         let cfg = Config::default();

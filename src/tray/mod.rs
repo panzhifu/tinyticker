@@ -110,6 +110,15 @@ pub enum Command {
     /// 打开输入行（托盘「⌨ 输入时长」/ `tinyticker --input`）：在挂件上键入时长，
     /// 回车按预设的语义开始、Esc 取消。键盘只借这一次，关行即还。
     InputTime,
+    /// 输入行换颜色模式（「外观 ▸ 文字颜色」子菜单的编辑项）：Gradient 全语法，
+    /// 回车落到运行色并写回配置。
+    InputColor,
+    /// 输入行换分段模式（「🍅 番茄分段」子菜单的编辑项）：`25m,5m,15m` 整条替换
+    /// `pomo_seq`，菜单那串经 SyncConfig 当场重建。
+    InputPomo,
+    /// 输入行换预设模式（「时长预设」子菜单的编辑项）：`90,1500,5400` 整条替换，
+    /// 档位列表经 SyncConfig 当场重建。
+    InputPresets,
     /// 切换计时结束时发不发桌面通知（写回 `notify`）。
     ToggleNotify,
     /// 登记 / 取消开机自启（写删 `~/.config/autostart/` 里那份同名条目）。
@@ -478,6 +487,8 @@ fn run(
                     s.state.borrow_mut().resync(&cfg);
                     // 序列变了要重造的子菜单不只是勾选：段数本身是菜单结构
                     s.pomo_seq = cfg.pomo.seq.clone();
+                    // 预设档位同理（输入行/热加载改了 presets，托盘那串要跟着换）
+                    s.presets = cfg.presets.clone();
                     s.lang = cfg.language.resolve();
                     s.fixed_pct.set(cfg.tray_gif_speed);
                     let (gif, sound, kb) = {
