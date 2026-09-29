@@ -152,7 +152,19 @@ fn load_file(path: &std::path::Path) -> Option<Animation> {
         );
         return None;
     }
-    decode(&bytes)
+    // 解不出必须留一句话：这条失败路径是静默的，而托盘会悄悄退回表盘——
+    // "图标怎么不按我配的来" 这种问题没有这行日志根本无从下手（实测踩过：
+    // 180×180 的 GIF 超了 128×128 的画布预算，排查半天才发现是静默 None）
+    match decode(&bytes) {
+        Some(a) => Some(a),
+        None => {
+            eprintln!(
+                "⚠️ tray_gif 解不出来（只认 GIF87a/89a 与 PNG/APNG，画布 ≤128×128、≤64 帧）：{}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 /// 目录帧序列：文件名升序取前 [`MAX_FOLDER_FILES`] 个 `.png`/`.gif`，每张图贡献
