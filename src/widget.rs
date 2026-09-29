@@ -11,8 +11,8 @@ use crate::tray::TrayHandle;
 use crate::audio;
 use crate::clock;
 use crate::config::{
-    COLOR_OPTIONS, Config, MAX_PRESETS, PALETTES, Watch, ZOOM_MAX, ZOOM_MIN, config_path,
-    parse_span_list, toggle_autostart,
+    COLOR_OPTIONS, Config, MAX_PRESETS, PALETTES, STATUS_FONT_PX_RANGE, Watch, ZOOM_MAX, ZOOM_MIN,
+    config_path, parse_span_list, toggle_autostart,
 };
 use crate::effect::{self, Effect, Gradient};
 use crate::parse;
@@ -72,6 +72,21 @@ pub enum InputMode {
     Pomo,
     /// `= ` 时长预设：`90,1500,5400`（≤ [`MAX_PRESETS`] 档），整条替换托盘子菜单。
     Presets,
+    /// `@ ` 网址：回车落成 `on_finish = xdg-open <url>`（超时动作 ▸ 打开网址…）。
+    Url,
+    /// `/ ` 文件路径：回车落成 `on_finish = xdg-open <path>`（超时动作 ▸ 打开文件…）。
+    Path,
+}
+
+/// 把用户输入拼成 `xdg-open '<arg>'`，单引号按 POSIX 规则转义。空串 / 控制字符返回
+/// `None`——输入行本就只收 ASCII 可打印字符，这里是兜底而不是主要防线。
+fn shell_open_command(target: &str) -> Option<String> {
+    let t = target.trim();
+    if t.is_empty() || t.chars().any(char::is_control) {
+        return None;
+    }
+    let quoted = t.replace('\'', "'\\''");
+    Some(format!("xdg-open '{quoted}'"))
 }
 
 impl InputMode {
@@ -83,6 +98,8 @@ impl InputMode {
             InputMode::Color => "# ",
             InputMode::Pomo => "% ",
             InputMode::Presets => "= ",
+            InputMode::Url => "@ ",
+            InputMode::Path => "/ ",
         }
     }
 
@@ -101,6 +118,8 @@ impl InputMode {
             // 与配置文件同一把尺子：`parse_span_list`（每段 ≤24h、整条作废语义）
             InputMode::Pomo => parse_span_list(t, MAX_POMO_STEPS).is_some(),
             InputMode::Presets => parse_span_list(t, MAX_PRESETS).is_some(),
+            // URL / 路径不挑形状：空串已被上面的早退挡掉，非空就算读得懂
+            InputMode::Url | InputMode::Path => true,
         }
     }
 }
@@ -526,6 +545,19 @@ impl Widget {
                     "⌨ 读不懂预设 {text:?}，写 90,1500,5400（≤{MAX_PRESETS} 档，逗号或空格分隔）"
                 ),
             },
+            // 超时动作：打开网址 / 打开文件都落成 `on_finish = xdg-open '<目标>'`
+            InputMode::Url | InputMode::Path => match shell_open_command(&text) {
+                Some(cmd) => {
+                    self.close_input();
+                    self.config.on_finish = Some(cmd);
+                    self.persist_appearance();
+                    // 输入行这条不经过菜单：超时动作那一档的勾要自己跟上
+                    self.sync_tray();
+                    let what = if mode == InputMode::Url { "网址" } else { "文件" };
+                    eprintln!("⌨ 结束动作已设为打开{what}：{text}");
+                }
+                None => eprintln!("⌨ 目标读不懂 {text:?}：不许空串或控制字符"),
+            },
         }
     }
 
@@ -636,6 +668,49 @@ impl Widget {
                     self.persist_appearance();
                 }
             }
+            Command::SetFinish(a) => {
+                let next = a.command().map(str::to_string);
+                if self.config.on_finish != next {
+                    self.config.on_finish = next;
+                    self.persist_appearance();
+                }
+            }
+            Command::SetTextFont(choice) => {
+                let f = choice.font();
+                if self.config.text_font != f {
+                    self.config.text_font = f;
+                    // 字形后端换了要就地重开（`text::init` 会把旧 face 与栅格缓存换掉）
+                    if let Some(w) = text::init(&self.config.text_font) {
+                        eprintln!("{w}");
+                    }
+                    self.persist_appearance();
+                }
+            }
+            Command::SetStatusFontPx(px) => {
+                let px = px.clamp(STATUS_FONT_PX_RANGE.0, STATUS_FONT_PX_RANGE.1);
+                if self.config.status_font_px != px {
+                    self.config.status_font_px = px;
+                    text::set_px_per_cell(px);
+                    self.persist_appearance();
+                }
+            }
+            // 置灰表头：只用来画一条说明，点到了也不做事
+            Command::Noop => {}
+            Command::About => {
+                let text = format!("TinyTicker {}", env!("CARGO_PKG_VERSION"));
+                if let Some(handle) = &self.tray {
+                    tray::notify(handle, &text, crate::lang::tr("好的", "OK"));
+                }
+                eprintln!("ℹ {text}");
+            }
+            Command::OpenGuide => {
+                // 与结束命令同一条路子：后台线程起，不阻塞 UI
+                const GUIDE_URL: &str = "https://github.com/panzhifu/tinyticker";
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("xdg-open").arg(GUIDE_URL).spawn();
+                });
+                eprintln!("→ 打开使用指南 {GUIDE_URL}");
+            }
             Command::ToggleNumbers => {
                 self.config.tray_numbers = !self.config.tray_numbers;
                 self.persist_appearance();
@@ -713,6 +788,9 @@ impl Widget {
             Command::InputColor => self.open_input(InputMode::Color),
             Command::InputPomo => self.open_input(InputMode::Pomo),
             Command::InputPresets => self.open_input(InputMode::Presets),
+            // 超时动作里的「打开网址/文件」：输入行换到 URL / 路径模式
+            Command::InputUrl => self.open_input(InputMode::Url),
+            Command::InputPath => self.open_input(InputMode::Path),
             Command::ToggleNotify => {
                 self.config.notify = !self.config.notify;
                 self.persist_appearance();
@@ -809,6 +887,13 @@ impl Widget {
         }
         if next.status_font_px != self.config.status_font_px {
             text::set_px_per_cell(next.status_font_px);
+        }
+        // 字形后端也能就地换（`text::init` 换 face + 清栅格缓存），所以热加载改
+        // `text_font` 立刻生效
+        if next.text_font != self.config.text_font
+            && let Some(w) = text::init(&next.text_font)
+        {
+            eprintln!("{w}");
         }
         if next.language != self.config.language {
             crate::lang::set(next.language);
@@ -1153,19 +1238,16 @@ impl Widget {
         self.set_edit(!self.edit);
     }
 
-    /// 挂件上按右键：输入行开着先收行（键盘还抓在手里，此时"退出程序"是事故），
-    /// 编辑态下再退编辑态，否则按原来的语义退出程序。
-    /// 返回 `true` 表示后端应当收尾退出。
-    pub fn right_click(&mut self) -> bool {
+    /// 挂件上按右键：输入行开着先收行，编辑态下退编辑态，其余情况不做事。
+    ///
+    /// 早先这里"普通态右键 = 退出程序"，实际用起来太容易误触：想退编辑态、想开菜单
+    /// 都会顺手右键，一点就把正在跑的倒计时丢了。现在退出只走托盘「✕ 退出」那条路。
+    pub fn right_click(&mut self) {
         if self.input.is_some() {
             self.close_input();
-            return false;
-        }
-        if self.edit {
+        } else if self.edit {
             self.set_edit(false);
-            return false;
         }
-        true
     }
 
     /// 退出前把当前模式、倒计时总时长、缩放和窗口位置写回配置。
@@ -1352,8 +1434,8 @@ mod tests {
         assert_eq!(last_status(&w), "EDIT", "状态行要占住一格说明自己在编辑态");
         assert_eq!(f.input_rect(1.0), None, "编辑态整窗可点");
 
-        // 编辑态的右键是"退出编辑态"，不是把挂件关掉
-        assert!(!w.right_click(), "编辑态下右键不该退出程序");
+        // 编辑态的右键是"退出编辑态"，任何情况下都不关挂件
+        w.right_click();
         assert!(!w.edit);
         let f = w.build_frame(200, 100, 2).expect("退回普通态也要重画");
         assert_eq!(
@@ -1362,7 +1444,9 @@ mod tests {
             "退回普通态就该把状态行还给计时器"
         );
         assert_eq!(f.input_rect(1.0), Some((36, 22, 128, 56)));
-        assert!(w.right_click(), "普通态的右键仍然是关掉挂件");
+        // 普通态右键不再关程序：退出只走托盘菜单
+        w.right_click();
+        assert!(!w.edit, "普通态右键什么都不做");
     }
 
     /// 中键与托盘 / 套接字那条命令走的是同一份状态；设定值命令要幂等，
@@ -1823,12 +1907,12 @@ mod tests {
         assert!(!w.input_open());
         assert_eq!(w.take_kb_want(), Some(false));
         assert!(!w.timer.running, "焦点丢了不等于要开始计时");
-        // 再开一次：右键收行而不是关挂件
+        // 再开一次：右键收行，且永远不关挂件
         w.handle_cmd(Command::InputTime);
-        assert!(!w.right_click(), "输入行开着时右键绝不能退出程序");
+        w.right_click();
         assert!(!w.input_open());
-        // 普通态的右键语义原样
-        assert!(w.right_click(), "没有输入行没有编辑态，右键仍是关挂件");
+        // 普通态的右键同样什么都不做
+        w.right_click();
     }
 
     /// 重复引擎：按 repeat_info 的 delay/period 补发按住的键，松键立刻停；
@@ -1968,6 +2052,8 @@ mod tests {
             Command::InputColor,
             Command::InputPomo,
             Command::InputPresets,
+            Command::InputUrl,
+            Command::InputPath,
         ] {
             let mut w = Widget::new(Config::default(), false);
             w.handle_cmd(cmd.clone());
@@ -1976,5 +2062,21 @@ mod tests {
             assert!(w.input_open(), "{cmd:?}：空回车该把行留着");
             assert_eq!(w.take_kb_want(), None, "没关行就不该还键盘");
         }
+    }
+
+    /// `shell_open_command`：单引号按 POSIX 规则转义，空串 / 控制字符拒绝。
+    #[test]
+    fn shell_open_command_quotes_and_rejects() {
+        assert_eq!(
+            shell_open_command(" https://example.com/a b ").as_deref(),
+            Some("xdg-open 'https://example.com/a b'")
+        );
+        assert_eq!(
+            shell_open_command("/tmp/a'b.txt").as_deref(),
+            Some("xdg-open '/tmp/a'\\''b.txt'"),
+            "内嵌单引号要闭合-转义-重开"
+        );
+        assert_eq!(shell_open_command("   "), None, "空串不生成命令");
+        assert_eq!(shell_open_command("a\nb"), None, "控制字符拒绝");
     }
 }

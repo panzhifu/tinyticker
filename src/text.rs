@@ -54,50 +54,66 @@ struct Shared(FreeType);
 unsafe impl Sync for Shared {}
 unsafe impl Send for Shared {}
 
-/// `None` = 试过且没有可用字体。记下来就不会每帧重试一遍目录扫描。
-static FACE: OnceLock<Option<Shared>> = OnceLock::new();
+/// 当前字体后端。`None` = 没有可用字体（`text_font = off`，或自动发现也没找到）。
+/// 外层 `OnceLock` 只保证容器建一次；里面的 `Mutex` 允许运行时就地换字体
+/// （托盘「字体」子菜单会改策略，再走一遍这里）。
+static FACE: OnceLock<Mutex<Option<Shared>>> = OnceLock::new();
 
 /// (码位, 像素高) → 栅格结果；值是 `Option<Ink>`，`None` 是"这个字体画不出这个码位"的负缓存。
 type GlyphCache = Mutex<HashMap<(u32, u32), Option<Ink>>>;
 
 static CACHE: OnceLock<GlyphCache> = OnceLock::new();
 
-/// 按策略打开字体后端。只在启动时调一次（`OnceLock`，重复调用只生效一次）。
+/// 按策略打开字体后端。启动时调一次；托盘「字体」改了之后再调会把旧 face 换掉，
+/// 并清空栅格缓存（缓存键里只有码位与像素高，不含字体身份）。
 ///
 /// 返回一句要转达给用户的警告；没话说就返回 `None`。
 pub fn init(policy: &TextFont) -> Option<String> {
-    let mut warning: Option<String> = None;
-    FACE.get_or_init(|| {
-        let face = match policy {
-            TextFont::Off => None,
-            TextFont::Auto => discover().and_then(|p| FreeType::open(&p)),
-            TextFont::Path(p) => {
-                let expanded = expand_tilde(p);
-                match FreeType::open(&expanded.to_string_lossy()) {
-                    Some(ft) => Some(ft),
-                    None => {
-                        warning = Some(format!("⚠️ text_font = {p} 打不开，改用自动发现的字体"));
-                        discover().and_then(|q| FreeType::open(&q))
-                    }
-                }
-            }
-        };
-        match (face, policy) {
-            (None, TextFont::Auto) => None,
-            // 明确要了字体却没有后端：说清楚，免得当成"支持中文"来用。
-            (None, TextFont::Path(p)) => {
-                if warning.is_none() {
-                    warning = Some(format!(
-                        "⚠️ text_font = {p} 与自动发现都不可用，非 ASCII 将留空位"
-                    ));
-                }
-                None
-            }
-            (None, TextFont::Off) => None,
-            (Some(ft), _) => Some(Shared(ft)),
-        }
-    });
+    let (face, warning) = open_face(policy);
+    let slot = FACE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = face;
+    }
+    // 字体换了，旧字形的栅格必须作废
+    if let Some(cache) = CACHE.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.clear();
+    }
     warning
+}
+
+/// 打开 face 并算好要转达的警告；不碰全局状态，单测可直接调。
+fn open_face(policy: &TextFont) -> (Option<Shared>, Option<String>) {
+    let mut warning: Option<String> = None;
+    let face = match policy {
+        TextFont::Off => None,
+        TextFont::Auto => discover().and_then(|p| FreeType::open(&p)),
+        TextFont::Path(p) => {
+            let expanded = expand_tilde(p);
+            match FreeType::open(&expanded.to_string_lossy()) {
+                Some(ft) => Some(ft),
+                None => {
+                    warning = Some(format!("⚠️ text_font = {p} 打不开，改用自动发现的字体"));
+                    discover().and_then(|q| FreeType::open(&q))
+                }
+            }
+        }
+    };
+    match (face, policy) {
+        (None, TextFont::Auto) => (None, warning),
+        // 明确要了字体却没有后端：说清楚，免得当成"支持中文"来用。
+        (None, TextFont::Path(p)) => {
+            if warning.is_none() {
+                warning = Some(format!(
+                    "⚠️ text_font = {p} 与自动发现都不可用，非 ASCII 将留空位"
+                ));
+            }
+            (None, warning)
+        }
+        (None, TextFont::Off) => (None, warning),
+        (Some(ft), _) => (Some(Shared(ft)), warning),
+    }
 }
 
 // —— 字体发现 ——————————————————————————————————————————————
@@ -358,7 +374,9 @@ fn glyph(ch: char, cell: u32) -> Option<(u32, GlyphBody)> {
 
 /// 带缓存的栅格。`None` = 没有 TTF 后端，或这个字体画不出这个码位。
 fn rasterize(ch: char, px: u32) -> Option<Ink> {
-    let face = FACE.get_or_init(|| None).as_ref()?;
+    let slot = FACE.get_or_init(|| Mutex::new(None));
+    let guard = slot.lock().ok()?;
+    let face = guard.as_ref()?;
     let key = (ch as u32, px);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().ok()?;

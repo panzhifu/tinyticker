@@ -32,8 +32,8 @@ use dbusmenu::{
 use icon::{icon_pixmap, play_speed, tooltip_text};
 use menu::{Kind, Node, State, build_nodes};
 use sni::{
-    ITEM_XML, emit_signal, on_filter, register_with_watcher, reply_props_get, send_notification,
-    write_props_all,
+    ITEM_XML, emit_signal, on_filter, put_u32, register_with_watcher, reply_props_get,
+    send_notification, write_props_all,
 };
 use wire::{
     close, cstr, open, put_bool, put_i32, put_str, read_i32, read_str, reply, reply_error,
@@ -41,7 +41,7 @@ use wire::{
 };
 
 use crate::anim;
-use crate::config::Config;
+use crate::config::{Config, TextFont};
 use crate::effect::Effect;
 use crate::lang::Language;
 use crate::render::Pad;
@@ -88,6 +88,18 @@ pub enum Command {
     ToggleNumbers,
     /// 换动图限速看的指标（写回 `tray_throttle`）。
     SetThrottle(Throttle),
+    /// 换常驻的结束动作（写回 `on_finish`；`FinishAction::Notify` = 清空）。
+    SetFinish(FinishAction),
+    /// 状态行字形后端（写回 `text_font`）；运行时就地换 face。
+    SetTextFont(FontChoice),
+    /// 状态行字号（写回 `status_font_px`，夹在 `STATUS_FONT_PX_RANGE` 内）。
+    SetStatusFontPx(u32),
+    /// 菜单里的置灰表头：不做事，只借 `enabled()` 把它压成一条说明。
+    Noop,
+    /// 显示「关于」：发一条带版本号的桌面通知。
+    About,
+    /// 打开项目主页（使用指南）：`xdg-open <repo>`。
+    OpenGuide,
     /// 切换数字行的百分之一秒（写回 `centiseconds`）。
     ToggleCentiseconds,
     /// 把百分之一秒设成给定值——`tinyticker --centis` / `--no-centis`，可重复执行。
@@ -119,6 +131,12 @@ pub enum Command {
     /// 输入行换预设模式（「时长预设」子菜单的编辑项）：`90,1500,5400` 整条替换，
     /// 档位列表经 SyncConfig 当场重建。
     InputPresets,
+    /// 输入行换网址模式（「超时动作 ▸ 打开网址…」）：键入 URL，回车落成
+    /// `on_finish = xdg-open <url>`。
+    InputUrl,
+    /// 输入行换文件模式（「超时动作 ▸ 打开文件…」）：键入路径，回车落成
+    /// `on_finish = xdg-open <path>`。
+    InputPath,
     /// 切换计时结束时发不发桌面通知（写回 `notify`）。
     ToggleNotify,
     /// 登记 / 取消开机自启（写删 `~/.config/autostart/` 里那份同名条目）。
@@ -214,6 +232,85 @@ impl Throttle {
             Throttle::Memory => "memory",
             Throttle::Timer => "timer",
             Throttle::Fixed => "fixed",
+        }
+    }
+}
+
+/// 锁屏命令：systemd 的 `loginctl` 最通用；没有 systemd 的桌面上这条会静默失败，
+/// 用户可以在配置文件里把 `on_finish` 改成自己那套。
+pub const LOCK_CMD: &str = "loginctl lock-session";
+
+/// 常驻「超时动作」的单选档（对应 Catime 右键菜单里的 Timeout Action 常驻那半边）。
+/// 只有两档是通用且无需额外交互的；打开网址/文件走输入行，是一次性的编辑动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishAction {
+    /// 只发通知，不执行命令（写回 `on_finish = None`）。
+    Notify,
+    /// 锁屏（写回 `on_finish = loginctl lock-session`）。
+    Lock,
+}
+
+impl FinishAction {
+    /// 这一档要写进 `on_finish` 的命令；`Notify` 是 `None`。
+    pub fn command(self) -> Option<&'static str> {
+        match self {
+            FinishAction::Notify => None,
+            FinishAction::Lock => Some(LOCK_CMD),
+        }
+    }
+
+    /// 从 `on_finish` 反推当前是哪一档；自定义命令（对不上任何一档）返回 `None`，
+    /// 于是单选组一个勾都不亮——这比硬指派一档诚实。
+    pub fn from_on_finish(on_finish: Option<&str>) -> Option<FinishAction> {
+        match on_finish {
+            None => Some(FinishAction::Notify),
+            Some(cmd) if cmd == LOCK_CMD => Some(FinishAction::Lock),
+            Some(_) => None,
+        }
+    }
+}
+
+/// 一次性结束动作：点下去只在内存里武装一条命令，倒计时真跑完才执行，之后自动回落
+/// （等价于命令行 `--and`）。对齐 Catime「以下动作仅一次性」那一组的语义。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnceAction {
+    Shutdown,
+    Restart,
+    Sleep,
+}
+
+impl OnceAction {
+    pub fn command(self) -> &'static str {
+        match self {
+            OnceAction::Shutdown => "systemctl poweroff",
+            OnceAction::Restart => "systemctl reboot",
+            OnceAction::Sleep => "systemctl suspend",
+        }
+    }
+}
+
+/// 「字体 ▸」里能选的字形后端档。配置里的 `TextFont::Path` 不在菜单里列出——
+/// 自定义字体路径只能手改配置，菜单里那一档于是两个勾都不亮。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontChoice {
+    Auto,
+    Off,
+}
+
+impl FontChoice {
+    pub fn font(self) -> TextFont {
+        match self {
+            FontChoice::Auto => TextFont::Auto,
+            FontChoice::Off => TextFont::Off,
+        }
+    }
+
+    /// 从配置值反推是哪一档；`Path` 返回 `None`。
+    pub fn of(font: &TextFont) -> Option<FontChoice> {
+        match font {
+            TextFont::Auto => Some(FontChoice::Auto),
+            TextFont::Off => Some(FontChoice::Off),
+            TextFont::Path(_) => None,
         }
     }
 }
@@ -463,6 +560,11 @@ fn run(
     // 派发循环：200ms 醒一次，顺带把待发通知送出去、按秒刷新托盘图标
     let mut icon_at = Instant::now();
     let mut sources = sampler.sample();
+    // 上一次真正把悬停提示推给宿主（NewToolTip）的时刻。提示正文里的 CPU / 内存 /
+    // 速率每秒都在变，但宿主（noctalia）把 SNI 项的任何变化都当成"整条托盘重建"：
+    // 重建会销毁悬停中那块 InputArea，提示就闪一下没了。所以内容虽每秒重算，对外
+    // 推送按 `TOOLTIP_EVERY` 限频——`None` = 还没推过，第一次采样后立刻推一次。
+    let mut tip_at: Option<Instant> = None;
     loop {
         while let Ok(msg) = msg_rx.try_recv() {
             match msg {
@@ -511,7 +613,8 @@ fn run(
             icon_at = Instant::now();
             sources = sampler.sample();
             // 悬停提示跟着采样走：宿主只在收到 NewToolTip 时才回读 ToolTip 属性。
-            // 动图档且限速开着时多一行当前倍率（Catime 的 tooltip 有这一行）
+            // 动图档且限速开着时多一行当前倍率（Catime 的 tooltip 有这一行）。
+            // 但推送要限频——见 `tip_at`：推得太勤，宿主的托盘重建会把悬停提示打断。
             let (tip_mode, tip_throttle) = {
                 let st = unsafe { (*server).state.borrow() };
                 (st.icon, st.throttle)
@@ -526,10 +629,12 @@ fn run(
                     )
                 });
             let tip = tooltip_text(&sources, anim_speed);
+            // 内容变了还要到点才推：`*slot` 存的是上次推出去的那份，宿主缓存的也是它
+            let due = tip_at.is_none_or(|t| t.elapsed() >= TOOLTIP_EVERY);
             let changed = unsafe {
                 let cell = &mut *server;
                 let mut slot = cell.tooltip.borrow_mut();
-                if *slot == tip {
+                if *slot == tip || !due {
                     false
                 } else {
                     *slot = tip;
@@ -537,6 +642,7 @@ fn run(
                 }
             };
             if changed {
+                tip_at = Some(Instant::now());
                 unsafe { emit_signal(dbus, conn, c"NewToolTip") };
             }
         }
@@ -650,8 +756,15 @@ unsafe extern "C" fn on_message(
         }
         "GetLayout" if path == menu_p && iface == menu_i => {
             let (root, depth) = read_layout_request(dbus, args);
+            // dbusmenu 的 parentId 有两种"要根"的写法：0 是规范写法，**-1** 是不少
+            // 客户端的实际写法（noctalia 就是）。节点表里没有负 id，不归一化就会回一棵
+            // 空树——宿主那边表现为"托盘菜单里什么都没有"，而且只显示一条置灰占位行。
+            let root = menu_root_id(root);
             reply(dbus, conn, msg, |db, it| {
-                put_i32(db, it, 1); // revision
+                // revision 是 `u`（uint32）——写成 i32 的话签名变成 `i(ia{sv}av)`，
+                // 用 sdbus-c++ 的宿主（noctalia）会 "Failed to deserialize a uint32_t"
+                // 直接丢弃整棵菜单；busctl/gdbus 不挑类型，所以本地测不出来。
+                put_u32(db, it, 1);
                 write_layout(db, it, server, root, depth);
             })
         }
@@ -691,8 +804,25 @@ unsafe extern "C" fn on_message(
     }
 }
 
+/// dbusmenu 的 `GetLayout(parentId)` → 节点表下标。
+///
+/// 0 是规范里的"根"，但不少客户端发 **-1**（noctalia 就是）。节点表里没有负 id，
+/// 不归一化就会回一棵空树，宿主那边只显示一条置灰占位行——看起来就是"菜单没项"。
+fn menu_root_id(id: i32) -> i32 {
+    if id < 0 { 0 } else { id }
+}
+
 /// 图标刷新间隔：分针一秒走 6 度，1 秒足够；再快只是多读 /proc。
 const ICON_EVERY: Duration = Duration::from_secs(1);
+
+/// 悬停提示真正推给宿主（`NewToolTip`）的最小间隔。
+///
+/// 提示正文是活的（CPU / 内存 / 上下行 / 电池），但宿主 noctalia 把 SNI 项的**任何**
+/// 变化都当成"托盘整条重建"：`TrayItemInfo` 含 `statusNotifierDescription` 且比较是
+/// 全字段 `= default`，重建会销毁悬停中那块 `InputArea`，提示随之闪没（指针不移开
+/// 时新 InputArea 也不会重新触发 enter，于是要挪开再悬停才回来）。把对外推送降到
+/// 低频，一次悬停就大概率完整；指标本身每秒采样不受影响，推出去的那份仍是新鲜的。
+const TOOLTIP_EVERY: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 mod tests {
@@ -712,5 +842,14 @@ mod tests {
             assert_eq!(IconMode::from_name(m.name()), Some(m));
         }
         assert_eq!(IconMode::from_name("disk"), None);
+    }
+
+    /// dbusmenu 的 parentId：-1（客户端惯用写法）与 0 都指向根节点。
+    #[test]
+    fn menu_root_id_maps_minus_one_to_root() {
+        assert_eq!(menu_root_id(-1), 0, "noctalia 用 -1 表示根");
+        assert_eq!(menu_root_id(0), 0);
+        assert_eq!(menu_root_id(i32::MIN), 0, "任何负数都当根");
+        assert_eq!(menu_root_id(7), 7, "正的 id 原样");
     }
 }

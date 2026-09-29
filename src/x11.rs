@@ -342,8 +342,8 @@ impl Client {
                     // 中键是挂件上唯一空闲的按键：翻编辑态。按下不触发任何粘贴，
                     // 因为这个窗口从来不是 PRIMARY selection 的目标
                     x::BTN_2 => self.widget.toggle_edit(),
-                    // 编辑态下右键是"退出编辑态"，只有普通态才是关掉挂件
-                    x::BTN_3 => self.quit = self.widget.right_click(),
+                    // 右键只收输入行 / 退编辑态，不再关挂件（退出走托盘「✕ 退出」）
+                    x::BTN_3 => self.widget.right_click(),
                     x::BTN_WHEEL_UP => self.zoom(1.0),
                     x::BTN_WHEEL_DOWN => self.zoom(-1.0),
                     _ => {}
@@ -687,12 +687,11 @@ mod tests {
     }
 
     /// 输入行开着时点哪儿都是"不输了"：事件处理走取消分支，不落进拖动 /
-    /// 编辑态 / 关挂件那几条原语义。这里钉住守卫的存在——守卫丢了的话，
-    /// 抓着键盘的时候一条右键就能把挂件关掉。
+    /// 编辑态那几条原语义。这里钉住守卫的存在。
     #[test]
     fn button_press_while_input_open_cancels_the_line() {
         // 守卫挂在 `handle_event` 的 BUTTON_PRESS 分支首行（见上）；
-        // 挂件侧的对应保证由 `right_click_cancels_input` 那条测试钉住。
+        // 挂件侧的对应保证由 `focus_loss_and_right_click_cancel_the_line` 钉住。
         assert_eq!(x::KEY_PRESS_MASK & x::BUTTON_PRESS_MASK, 0, "两个掩码位不撞");
     }
 }

@@ -284,7 +284,7 @@ impl TextFont {
 /// 状态行字号的默认与边界：12px/cell 是字形层一直在用的值；下限不低于 8 才与
 /// 点阵同量级，上限 24 再大两行就挤不进气隙里了。
 pub const DEFAULT_STATUS_FONT_PX: u32 = 12;
-const STATUS_FONT_PX_RANGE: (u32, u32) = (8, 24);
+pub const STATUS_FONT_PX_RANGE: (u32, u32) = (8, 24);
 
 // zoom 为 f32（非 Eq），整体只做 PartialEq 比较
 #[derive(Clone, Debug, PartialEq)]
@@ -590,12 +590,18 @@ impl Config {
     }
 
     /// 写回配置；失败只打印警告（不影响运行）。
+    ///
+    /// **单测里不落盘**：托盘菜单那些"点一下就写回"的命令被单测点到时，绝不能把手改过
+    /// 的真实 `config.conf` 覆盖掉（同一台机器上跑着的挂件还在用它）。测试只断言内存。
     pub fn save(&self) {
-        let Some(path) = config_path() else {
-            return;
-        };
-        if let Err(e) = write_atomic(&path, &self.serialize()) {
-            eprintln!("⚠️ 无法保存配置 {}: {e}", path.display());
+        #[cfg(not(test))]
+        {
+            let Some(path) = config_path() else {
+                return;
+            };
+            if let Err(e) = write_atomic(&path, &self.serialize()) {
+                eprintln!("⚠️ 无法保存配置 {}: {e}", path.display());
+            }
         }
     }
 

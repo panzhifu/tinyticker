@@ -685,8 +685,8 @@ impl Client {
             self.widget.toggle_edit();
         }
         if e.right_pressed.replace(false) {
-            // 编辑态下右键是"退出编辑态"，只有普通态才是关掉挂件
-            self.quit = self.widget.right_click();
+            // 右键只收输入行 / 退编辑态，不再关挂件（退出走托盘「✕ 退出」）
+            self.widget.right_click();
         }
         // 键盘：焦点丢了 = 不输了；按键送进输入行（没开输入行时挂件自己忽略）。
         // 队列排空不挑时机：翻译发生在回调里，这里只是搬运。

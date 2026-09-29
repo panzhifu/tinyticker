@@ -206,7 +206,8 @@ pub(super) unsafe fn write_sni_property(dbus: &DBus, it: *mut DBusMessageIter, s
             put_str(dbus, &mut st, "");
             write_pixmap(dbus, &mut st, server);
             put_str(dbus, &mut st, "TinyTicker");
-            // 正文是活的：CPU / 内存 / 上下行 / 电池，每秒随采样换一次
+            // 正文是活的：CPU / 内存 / 上下行 / 电池。内容每秒重算，但推送限频，
+            // 免得宿主频繁重建托盘把悬停提示打断（见 `tray::TOOLTIP_EVERY`）。
             put_str(dbus, &mut st, &server.tooltip.borrow());
             close(dbus, &mut v, &mut st);
             close(dbus, it, &mut v);

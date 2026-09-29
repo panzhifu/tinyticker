@@ -42,6 +42,9 @@ impl Command {
             Command::SetIcon(m) => Some(Check::Icon(m)),
             Command::ToggleNumbers => Some(Check::Numbers),
             Command::SetThrottle(t) => Some(Check::Throttle(t)),
+            Command::SetFinish(a) => Some(Check::Finish(a)),
+            Command::SetTextFont(f) => Some(Check::TextFont(f)),
+            Command::SetStatusFontPx(px) => Some(Check::StatusFontPx(px)),
             Command::ToggleCentiseconds => Some(Check::Centiseconds),
             Command::SetCentiseconds(v) => Some(Check::Centi(v)),
             Command::SetTimePad(p) => Some(Check::TimePad(p)),
@@ -68,6 +71,12 @@ pub(super) enum Check {
     Effect(Effect),
     Icon(IconMode),
     Throttle(Throttle),
+    /// 常驻结束动作（`超时动作` 子菜单前两项；自定义 `on_finish` 时一个都不勾）。
+    Finish(FinishAction),
+    /// 状态行字形后端（`None` = 配置里是自定义路径，两档都不勾）。
+    TextFont(FontChoice),
+    /// 状态行字号。
+    StatusFontPx(u32),
     /// 数字还是水位（`图标内容` 子菜单末尾那一项）。
     Numbers,
     /// 下面三个是勾选框（各自独立），上面五个是单选组。勾选框只有一项，不必带值。
@@ -115,6 +124,12 @@ pub(super) struct State {
     pub(super) numbers: bool,
     /// 动图限速看哪个指标。
     pub(super) throttle: Throttle,
+    /// 常驻结束动作（从 `on_finish` 反推；自定义命令时一个勾都不亮）。
+    pub(super) finish: Option<FinishAction>,
+    /// 状态行字形后端（`text_font`）。
+    pub(super) text_font: Option<FontChoice>,
+    /// 状态行字号（`status_font_px`）。
+    pub(super) status_font_px: u32,
     /// 到点发不发桌面通知。
     pub(super) notify: bool,
     /// 是否已登记开机自启。这一格不进 Config：磁盘上那个文件本身就是状态。
@@ -159,6 +174,9 @@ impl State {
             edit: false,
             numbers: cfg.tray_numbers,
             throttle: cfg.tray_throttle,
+            finish: FinishAction::from_on_finish(cfg.on_finish.as_deref()),
+            text_font: FontChoice::of(&cfg.text_font),
+            status_font_px: cfg.status_font_px,
             notify: cfg.notify,
             autostart: crate::config::autostart_enabled(),
             gif: cfg
@@ -200,7 +218,11 @@ impl State {
             Command::InputTime
             | Command::InputColor
             | Command::InputPomo
-            | Command::InputPresets => self.kb_ok,
+            | Command::InputPresets
+            | Command::InputUrl
+            | Command::InputPath => self.kb_ok,
+            // 置灰表头：不是可点项，只借这条通道把它画成说明文字
+            Command::Noop => false,
             _ => true,
         }
     }
@@ -221,6 +243,9 @@ impl State {
             Check::Edit => self.edit,
             Check::Numbers => self.numbers,
             Check::Throttle(t) => self.throttle == t,
+            Check::Finish(a) => self.finish == Some(a),
+            Check::TextFont(f) => self.text_font == Some(f),
+            Check::StatusFontPx(px) => self.status_font_px == px,
             Check::Notify => self.notify,
             Check::Autostart => self.autostart,
             Check::Language(l) => self.language == l,
@@ -253,6 +278,9 @@ impl State {
             Command::SetIcon(m) => self.icon = m,
             Command::ToggleNumbers => self.numbers = !self.numbers,
             Command::SetThrottle(t) => self.throttle = t,
+            Command::SetFinish(a) => self.finish = Some(a),
+            Command::SetTextFont(f) => self.text_font = Some(f),
+            Command::SetStatusFontPx(px) => self.status_font_px = px,
             Command::ToggleCentiseconds => self.centis = !self.centis,
             Command::SetCentiseconds(v) => self.centis = v,
             Command::SetTimePad(p) => self.pad = p,
@@ -308,6 +336,14 @@ pub(super) fn build_nodes(
         children: Vec::new(),
     };
 
+    // 往某个子菜单挂一个节点，返回新节点 id
+    fn attach(n: &mut Vec<Node>, parent: usize, node: Node) -> i32 {
+        let id = n.len() as i32;
+        n.push(node);
+        n[parent].children.push(id);
+        id
+    }
+
     let mut n = vec![Node {
         kind: Kind::Root,
         label: String::new(),
@@ -361,37 +397,8 @@ pub(super) fn build_nodes(
             Command::InputTime,
         ),
     );
-    push_top(
-        &mut n,
-        &mut root,
-        button(tr_in(lang, "🔔 弹通知", "🔔 Notify"), Command::ToggleNotify),
-    );
-    // 试听：没配提示音就置灰并把原因写进标签（与 GIF 那一档同一规矩）
-    push_top(
-        &mut n,
-        &mut root,
-        button(
-            if sound_configured {
-                tr_in(lang, "🔊 试听音效", "🔊 Test sound")
-            } else {
-                tr_in(
-                    lang,
-                    "🔊 试听音效（未配 alarm_sound）",
-                    "🔊 Test sound (no alarm_sound)",
-                )
-            },
-            Command::PreviewSound,
-        ),
-    );
-    push_top(
-        &mut n,
-        &mut root,
-        button(
-            tr_in(lang, "🚀 开机自启", "🚀 Autostart"),
-            Command::ToggleAutostart,
-        ),
-    );
     push_top(&mut n, &mut root, separator());
+    // 时长预设：这里只放档位列表（点一下就开始）；「修改快速倒计时选项」在预设管理里
     let presets_menu = push_top(
         &mut n,
         &mut root,
@@ -408,20 +415,6 @@ pub(super) fn build_nodes(
             tr_in(lang, zh_off, en_off)
         }
     };
-    // 就地编辑：输入行换预设模式（`90,1500,5400` 整条替换），排在档位列表之前
-    {
-        let id = n.len() as i32;
-        n.push(button(
-            edit_label(
-                "✏ 编辑预设…",
-                "✏ 编辑预设（无键盘）",
-                "✏ Edit presets…",
-                "✏ Edit presets (no keyboard)",
-            ),
-            Command::InputPresets,
-        ));
-        n[presets_menu as usize].children.push(id);
-    }
     // 番茄钟分段：序列为空时也建——「编辑分段」正是从经典配方到任意序列的那扇门，
     // 藏进"配了才出现"的话，序列永远只能从配置文件里长出来
     let pomo_menu = push_top(
@@ -429,7 +422,6 @@ pub(super) fn build_nodes(
         &mut root,
         submenu(tr_in(lang, "🍅 番茄分段", "🍅 Pomodoro steps")),
     );
-    // 就地编辑：输入行换分段模式（`25m,5m,15m` 整条替换），排在段列表之前
     {
         let id = n.len() as i32;
         n.push(button(
@@ -443,30 +435,122 @@ pub(super) fn build_nodes(
         ));
         n[pomo_menu as usize].children.push(id);
     }
+    // 超时动作 ▸：对齐 Catime 右键菜单的 Timeout Action。
+    // 常驻两档写回 `on_finish`；打开网址/文件是编辑动作（走输入行）；关机/重启/休眠
+    // 只在内存里武装一次（`ArmFinish`），倒计时真跑完才执行、之后自动回落。
+    let timeout_menu = push_top(
+        &mut n,
+        &mut root,
+        submenu(tr_in(lang, "⏳ 超时动作", "⏳ Timeout action")),
+    );
+    {
+        let menu = timeout_menu as usize;
+        let mut add = |node: Node| {
+            let id = n.len() as i32;
+            n.push(node);
+            n[menu].children.push(id);
+        };
+        add(button(
+            tr_in(lang, "🔔 仅通知", "🔔 Notify only"),
+            Command::SetFinish(FinishAction::Notify),
+        ));
+        add(button(
+            tr_in(lang, "🔒 锁屏", "🔒 Lock screen"),
+            Command::SetFinish(FinishAction::Lock),
+        ));
+        add(button(
+            edit_label(
+                "🌐 打开网址…",
+                "🌐 打开网址（无键盘）",
+                "🌐 Open website…",
+                "🌐 Open website (no keyboard)",
+            ),
+            Command::InputUrl,
+        ));
+        add(button(
+            edit_label(
+                "📂 打开文件…",
+                "📂 打开文件（无键盘）",
+                "📂 Open file…",
+                "📂 Open file (no keyboard)",
+            ),
+            Command::InputPath,
+        ));
+        add(separator());
+        // 置灰表头：借 `Command::Noop` 的 `enabled() == false` 画成一条说明
+        add(button(
+            tr_in(lang, "以下动作仅一次性", "The following are one-time only"),
+            Command::Noop,
+        ));
+        add(button(
+            tr_in(lang, "⏻ 关机", "⏻ Shutdown"),
+            Command::ArmFinish(OnceAction::Shutdown.command().to_string()),
+        ));
+        add(button(
+            tr_in(lang, "↻ 重启", "↻ Restart"),
+            Command::ArmFinish(OnceAction::Restart.command().to_string()),
+        ));
+        add(button(
+            tr_in(lang, "🌙 休眠", "🌙 Sleep"),
+            Command::ArmFinish(OnceAction::Sleep.command().to_string()),
+        ));
+    }
+    // 预设管理 ▸：对齐 Catime 的 Preset Management（快速选项 / 自启 / 通知）
+    let preset_admin = push_top(
+        &mut n,
+        &mut root,
+        submenu(tr_in(lang, "⚙ 预设管理", "⚙ Presets & startup")),
+    );
+    {
+        let menu = preset_admin as usize;
+        let mut add = |node: Node| {
+            let id = n.len() as i32;
+            n.push(node);
+            n[menu].children.push(id);
+        };
+        add(button(
+            edit_label(
+                "✏ 修改快速倒计时选项…",
+                "✏ 修改快速倒计时选项（无键盘）",
+                "✏ Modify quick options…",
+                "✏ Modify quick options (no keyboard)",
+            ),
+            Command::InputPresets,
+        ));
+        add(button(
+            tr_in(lang, "🚀 开机自启", "🚀 Autostart"),
+            Command::ToggleAutostart,
+        ));
+        add(separator());
+        add(button(
+            tr_in(lang, "🔔 弹通知", "🔔 Notify"),
+            Command::ToggleNotify,
+        ));
+        // 试听：没配提示音就置灰并把原因写进标签（与 GIF 那一档同一规矩）
+        add(button(
+            if sound_configured {
+                tr_in(lang, "🔊 试听音效", "🔊 Test sound")
+            } else {
+                tr_in(
+                    lang,
+                    "🔊 试听音效（未配 alarm_sound）",
+                    "🔊 Test sound (no alarm_sound)",
+                )
+            },
+            Command::PreviewSound,
+        ));
+    }
     let modes = push_top(&mut n, &mut root, submenu(tr_in(lang, "模式", "Mode")));
     let look = push_top(
         &mut n,
         &mut root,
         submenu(tr_in(lang, "外观", "Appearance")),
     );
+    // 字体 ▸：字形后端（自动/关闭）+ 状态行字号档
+    let font = push_top(&mut n, &mut root, submenu(tr_in(lang, "字体", "Font")));
     push_top(&mut n, &mut root, separator());
-    push_top(
-        &mut n,
-        &mut root,
-        button(
-            tr_in(lang, "↺ 恢复默认设置", "↺ Restore defaults"),
-            Command::ResetConfig,
-        ),
-    );
-    push_top(
-        &mut n,
-        &mut root,
-        button(
-            tr_in(lang, "⌂ 重置窗口位置", "⌂ Reset position"),
-            Command::ResetPosition,
-        ),
-    );
-    let language = push_top(&mut n, &mut root, submenu(tr_in(lang, "语言", "Language")));
+    // 帮助 ▸：把「关于 / 使用指南 / 语言 / 重置位置 / 恢复默认」收进来（Catime 归在 Help 下）
+    let help = push_top(&mut n, &mut root, submenu(tr_in(lang, "帮助", "Help")));
     push_top(
         &mut n,
         &mut root,
@@ -641,12 +725,86 @@ pub(super) fn build_nodes(
         n.push(button(tr_in(lang, zh, en), cmd));
         n[fmt as usize].children.push(id);
     }
-    // 语言：三档单选，标签恒用母语名（"简体中文" 就该写成 "简体中文"，
-    // 这正是 Catime 每行用自己语言写的用意——选错了也认得回去的那一行）
-    for l in [Language::Auto, Language::Zh, Language::En] {
+    // 字体：字形后端（自动/关闭）
+    {
+        let menu = font as usize;
+        let mut add = |node: Node| {
+            let id = n.len() as i32;
+            n.push(node);
+            n[menu].children.push(id);
+        };
+        add(button(
+            tr_in(lang, "🔤 自动（系统字体）", "🔤 Auto (system font)"),
+            Command::SetTextFont(FontChoice::Auto),
+        ));
+        add(button(
+            tr_in(lang, "🚫 关闭（非 ASCII 留空）", "🚫 Off (blank non-ASCII)"),
+            Command::SetTextFont(FontChoice::Off),
+        ));
+    }
+    // 状态行字号：单选几档（8-24 里的常用值），默认 12 由勾选态标出
+    let size_menu = {
         let id = n.len() as i32;
-        n.push(button(l.label(), Command::SetLanguage(l)));
-        n[language as usize].children.push(id);
+        n.push(submenu(tr_in(lang, "状态行字号", "Status line size")));
+        n[font as usize].children.push(id);
+        id as usize
+    };
+    for px in [10u32, 12, 14, 16, 18, 20, 24] {
+        let id = n.len() as i32;
+        n.push(button(&format!("{px} px"), Command::SetStatusFontPx(px)));
+        n[size_menu].children.push(id);
+    }
+    // 帮助：关于（带版本号）/ 使用指南 / 语言 ▸ / 重置位置 / 恢复默认
+    {
+        let menu = help as usize;
+        attach(
+            &mut n,
+            menu,
+            button(
+                &format!(
+                    "{} {}",
+                    tr_in(lang, "ℹ 关于", "ℹ About"),
+                    env!("CARGO_PKG_VERSION")
+                ),
+                Command::About,
+            ),
+        );
+        attach(
+            &mut n,
+            menu,
+            button(
+                tr_in(lang, "📖 使用指南", "📖 User guide"),
+                Command::OpenGuide,
+            ),
+        );
+        attach(&mut n, menu, separator());
+        // 语言：二级子菜单，三档单选，标签恒用母语名（"简体中文" 就该写成 "简体中文"，
+        // 这正是 Catime 每行用自己语言写的用意——选错了也认得回去的那一行）
+        let lang_menu = attach(
+            &mut n,
+            menu,
+            submenu(tr_in(lang, "语言", "Language")),
+        ) as usize;
+        for l in [Language::Auto, Language::Zh, Language::En] {
+            attach(&mut n, lang_menu, button(l.label(), Command::SetLanguage(l)));
+        }
+        attach(&mut n, menu, separator());
+        attach(
+            &mut n,
+            menu,
+            button(
+                tr_in(lang, "⌂ 重置窗口位置", "⌂ Reset position"),
+                Command::ResetPosition,
+            ),
+        );
+        attach(
+            &mut n,
+            menu,
+            button(
+                tr_in(lang, "↺ 恢复默认设置", "↺ Restore defaults"),
+                Command::ResetConfig,
+            ),
+        );
     }
     // 根节点的子项顺序即菜单顺序
     n[0].children = root;
@@ -858,11 +1016,7 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                // 头一项是输入行的编辑入口，档位列表跟在后面
-                (
-                    "✏ 编辑预设…".to_string(),
-                    Some(Command::InputPresets)
-                ),
+                // 只有档位列表；「修改快速倒计时选项」在「预设管理」子菜单里
                 ("⏱ 1 分 30 秒".to_string(), Some(Command::Preset(90))),
                 ("⏱ 25 分".to_string(), Some(Command::Preset(1500))),
                 ("⏱ 1 小时 30 分".to_string(), Some(Command::Preset(5400))),
@@ -882,10 +1036,10 @@ mod tests {
             .expect("没有「时长预设」子菜单");
         assert_eq!(
             n[submenu_idx].children.len(),
-            PRESET_PAGE + 2,
-            "编辑入口 + 平铺 20 项 + 一个「更多 ▸」"
+            PRESET_PAGE + 1,
+            "平铺 20 项 + 一个「更多 ▸」"
         );
-        let more_idx = n[submenu_idx].children[PRESET_PAGE + 1] as usize;
+        let more_idx = n[submenu_idx].children[PRESET_PAGE] as usize;
         assert_eq!(n[more_idx].label, "更多 ▸");
         assert_eq!(n[more_idx].kind, Kind::Submenu);
         assert_eq!(n[more_idx].children.len(), many.len() - PRESET_PAGE);
@@ -902,7 +1056,7 @@ mod tests {
         // 没超限就一个子菜单都不该造出来
         let few = nodes(&many[..PRESET_PAGE], true);
         let sub = few.iter().find(|x| x.label == "时长预设").unwrap();
-        assert_eq!(sub.children.len(), PRESET_PAGE + 1, "编辑入口 + 一页档位");
+        assert_eq!(sub.children.len(), PRESET_PAGE, "一页档位，没有编辑入口");
         assert!(!few.iter().any(|x| x.label == "更多 ▸"));
     }
 
@@ -1112,6 +1266,9 @@ mod tests {
                     | Command::SetEffect(_)
                     | Command::SetIcon(_)
                     | Command::SetThrottle(_)
+                    | Command::SetFinish(_)
+                    | Command::SetTextFont(_)
+                    | Command::SetStatusFontPx(_)
                     | Command::SetTimePad(_)
                     | Command::SetLanguage(_)
                     | Command::SetPomoStep(_)
@@ -1262,5 +1419,140 @@ mod tests {
         let mut st = st;
         st.note(&Command::SetPalette(4));
         assert!(st.checked(Check::Palette(4)) && !st.checked(Check::Palette(2)));
+    }
+
+    /// 超时动作子菜单：常驻两档 + 两个输入行入口 + 置灰表头 + 三个一次性动作。
+    #[test]
+    fn timeout_action_submenu_has_persistent_and_one_time_entries() {
+        let n = nodes(&[60], true);
+        let menu = n
+            .iter()
+            .find(|x| x.label == "⏳ 超时动作")
+            .expect("没有「超时动作」子菜单");
+        let has = |cmd: &Command| {
+            menu.children
+                .iter()
+                .any(|i| n[*i as usize].command.as_ref() == Some(cmd))
+        };
+        assert!(has(&Command::SetFinish(FinishAction::Notify)));
+        assert!(has(&Command::SetFinish(FinishAction::Lock)));
+        assert!(has(&Command::InputUrl));
+        assert!(has(&Command::InputPath));
+        // 一次性三件：文案命令与 `OnceAction::command()` 对齐
+        assert!(has(&Command::ArmFinish(
+            OnceAction::Shutdown.command().to_string()
+        )));
+        assert!(has(&Command::ArmFinish(
+            OnceAction::Restart.command().to_string()
+        )));
+        assert!(has(&Command::ArmFinish(OnceAction::Sleep.command().to_string())));
+        // 置灰表头：借 Noop 的 enabled()==false
+        assert!(has(&Command::Noop));
+        let s = State::from_config(&Config::default());
+        assert!(!s.enabled(&Command::Noop), "表头该置灰");
+    }
+
+    /// 常驻结束动作是单选：从 `on_finish` 反推，自定义命令时一个勾都不亮。
+    #[test]
+    fn finish_radio_follows_on_finish() {
+        let mut s = State::from_config(&Config::default());
+        assert!(
+            s.checked(Check::Finish(FinishAction::Notify)),
+            "没配 on_finish 就是「仅通知」"
+        );
+        s.note(&Command::SetFinish(FinishAction::Lock));
+        assert!(s.checked(Check::Finish(FinishAction::Lock)));
+        assert!(!s.checked(Check::Finish(FinishAction::Notify)));
+
+        let custom = Config {
+            on_finish: Some("echo hi".into()),
+            ..Config::default()
+        };
+        let s = State::from_config(&custom);
+        assert!(
+            !s.checked(Check::Finish(FinishAction::Notify))
+                && !s.checked(Check::Finish(FinishAction::Lock)),
+            "自定义命令不该硬指派到某一档"
+        );
+    }
+
+    /// 字体子菜单：后端两档 + 字号子菜单；自定义路径则两档都不勾。
+    #[test]
+    fn font_submenu_has_backend_and_size() {
+        let n = nodes(&[60], true);
+        let font = n.iter().find(|x| x.label == "字体").expect("没有字体子菜单");
+        let has = |cmd: &Command| {
+            font.children
+                .iter()
+                .any(|i| n[*i as usize].command.as_ref() == Some(cmd))
+        };
+        assert!(has(&Command::SetTextFont(FontChoice::Auto)));
+        assert!(has(&Command::SetTextFont(FontChoice::Off)));
+        let size = font
+            .children
+            .iter()
+            .map(|i| &n[*i as usize])
+            .find(|x| x.label == "状态行字号")
+            .expect("没有字号子菜单");
+        assert!(size.children.iter().any(|i| matches!(
+            n[*i as usize].command,
+            Some(Command::SetStatusFontPx(12))
+        )));
+
+        let s = State::from_config(&Config::default());
+        assert!(s.checked(Check::TextFont(FontChoice::Auto)), "默认自动");
+        assert!(s.checked(Check::StatusFontPx(12)), "默认 12px");
+        let custom = Config {
+            text_font: crate::config::TextFont::Path("/x.ttf".into()),
+            ..Config::default()
+        };
+        let s = State::from_config(&custom);
+        assert!(
+            !s.checked(Check::TextFont(FontChoice::Auto))
+                && !s.checked(Check::TextFont(FontChoice::Off)),
+            "自定义路径时两档都不该勾"
+        );
+    }
+
+    /// 帮助子菜单：关于 / 使用指南 / 语言 ▸ / 重置位置 / 恢复默认都在它下面。
+    #[test]
+    fn help_submenu_groups_language_and_resets() {
+        let n = nodes(&[60], true);
+        let help = n.iter().find(|x| x.label == "帮助").expect("没有帮助子菜单");
+        let has = |cmd: &Command| {
+            help.children
+                .iter()
+                .any(|i| n[*i as usize].command.as_ref() == Some(cmd))
+        };
+        assert!(has(&Command::About));
+        assert!(has(&Command::OpenGuide));
+        assert!(has(&Command::ResetPosition));
+        assert!(has(&Command::ResetConfig));
+        let lang = help
+            .children
+            .iter()
+            .map(|i| &n[*i as usize])
+            .find(|x| x.label == "语言")
+            .expect("帮助下没有语言子菜单");
+        assert_eq!(lang.children.len(), 3, "auto / 中文 / English");
+    }
+
+    /// 预设管理子菜单：修改快速选项 / 开机自启 / 弹通知 / 试听音效。
+    #[test]
+    fn preset_admin_submenu_groups_options_and_notifications() {
+        let n = nodes(&[60], true);
+        let menu = n
+            .iter()
+            .find(|x| x.label == "⚙ 预设管理")
+            .expect("没有「预设管理」子菜单");
+        let has = |cmd: &Command| {
+            menu.children
+                .iter()
+                .any(|i| n[*i as usize].command.as_ref() == Some(cmd))
+        };
+        assert!(has(&Command::InputPresets));
+        assert!(has(&Command::ToggleAutostart));
+        assert!(has(&Command::ToggleNotify));
+        assert!(has(&Command::PreviewSound));
     }
 }
